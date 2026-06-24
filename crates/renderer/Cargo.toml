@@ -1,0 +1,12 @@
+[package]
+name = "renderer"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+term-core = { workspace = true }
+text = { workspace = true }

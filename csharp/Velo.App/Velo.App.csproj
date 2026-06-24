@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>Velo.App</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Unpackaged desktop app; no MSIX. -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>true</EnableMsixTooling>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.*" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.*" />
+  </ItemGroup>
+
+  <!-- Copy the Rust cdylib next to the C# exe. ponytail: assumes a release
+       (msvc) core build at target\release; switch to target\debug for a debug
+       core build, or a per-target path if you cross-compile. -->
+  <Target Name="CopyVeloCore" BeforeTargets="Build">
+    <PropertyGroup>
+      <VeloCoreDll>$(MSBuildThisFileDirectory)..\..\target\release\velo_core.dll</VeloCoreDll>
+    </PropertyGroup>
+    <Warning Text="velo_core.dll not found at $(VeloCoreDll); run cargo build --release -p velo_core first."
+             Condition="!Exists('$(VeloCoreDll)')" />
+    <Copy SourceFiles="$(VeloCoreDll)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(VeloCoreDll)')" />
+  </Target>
+
+</Project>

@@ -1,0 +1,18 @@
+[package]
+name = "pty-win"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+log = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_System_Threading",
+  "Win32_System_Pipes",
+  "Win32_Security",
+  "Win32_System_Memory",
+] }

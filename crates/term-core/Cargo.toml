@@ -1,0 +1,10 @@
+[package]
+name = "term-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+alacritty_terminal = { workspace = true }
+vte = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }

@@ -1,0 +1,1652 @@
+//! velo_core: C ABI over the Rust terminal core (term-core + pty-win + wgpu
+//! renderer) for the C# WinUI 3 shell.
+//!
+//! The C# side owns the window, the custom title bar and the vertical-tab pane.
+//! It hosts the terminal in a WinUI `SwapChainPanel`: `velo_attach` builds a
+//! DX12 device + a composition swapchain, `velo_get_swapchain` hands the
+//! swapchain to the panel (`ISwapChainPanelNative.SetSwapChain`), and C# forwards
+//! input / size via `velo_key` / `velo_char` / `velo_mouse` / `velo_resize`.
+//! Render is synchronous (`velo_render` + self-render on PTY data). PTY reader
+//! threads wake the UI thread through an internal message-only window owned by
+//! the engine. We call back into C# for tab events the terminal originates (OSC
+//! titles, shell exit, tab keybinds).
+//!
+//! Split view (Phase 1): a `Pane` owns its own composition swapchain, renderer,
+//! back buffers and cell grid, plus the id of the `Session` it currently shows.
+//! `Engine` holds `Vec<Option<Pane>>`; many sessions, several panes, each pane
+//! rendering one session. Pane 0 is created at `velo_attach` and reuses the
+//! original swapchain, so the single-pane C# host keeps working unchanged. The
+//! C# split UI (Phase 2) creates extra panes via `velo_pane_new`, binds tabs to
+//! them with `velo_pane_bind`, and sizes/focuses them per panel.
+//!
+//! Non-Windows builds expose no symbols (ConPTY/wgpu-on-HWND are Windows-only);
+//! the crate still compiles for the Linux dev workspace.
+
+/// Default cell font size, in points (mirrors the old `app::FONT_SIZE_PT`).
+/// Multiplied by the per-monitor DPI scale before building the font.
+#[cfg(windows)]
+const FONT_SIZE_PT: f32 = 13.0;
+
+/// Inner padding (logical px) between the surface edge and the cell grid. Scaled
+/// by DPI at use. Gives the terminal breathing room inside its own surface
+/// instead of a margin around it.
+const PAD_LOGICAL_PX: f32 = 10.0;
+
+#[cfg(windows)]
+mod imp {
+    use std::ffi::c_void;
+    use std::sync::Arc;
+
+    use anyhow::{anyhow, Result};
+    use parking_lot::Mutex;
+
+    use windows::Win32::Foundation::{
+        HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    };
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+        VK_TAB, VK_UP,
+    };
+    use windows::Win32::UI::Shell::{
+        DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
+    };
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+        DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, IDXGIFactory2, IDXGISwapChain3, DXGI_CREATE_FACTORY_FLAGS,
+        DXGI_MATRIX_3X2_F,
+        DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+        DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassW, HMENU,
+        HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    };
+
+    use super::{FONT_SIZE_PT, PAD_LOGICAL_PX};
+
+    /// Reader-thread -> message-loop wakeups (above `WM_APP`). `wParam` carries
+    /// the stable session id. We post these to the engine's internal message-only
+    /// window; its wndproc drains the inbox + renders on the UI thread.
+    const WM_APP: u32 = 0x8000;
+    const MSG_PTY_DATA: u32 = WM_APP + 1;
+    const MSG_PTY_EOF: u32 = WM_APP + 2;
+
+    /// Subclass id for the wakeup-window hook (any stable per-proc constant).
+    const SUBCLASS_ID: usize = 1;
+
+    /// Window class for the engine's message-only wakeup window.
+    const WAKEUP_CLASS: PCWSTR = windows::core::w!("VeloWakeupWindow");
+
+    /// `CF_UNICODETEXT` clipboard format (UTF-16).
+    const CF_UNICODETEXT: u32 = 13;
+
+    /// Sentinel for "this pane shows no session".
+    const NO_SESSION: usize = usize::MAX;
+
+    /// Function pointers the Rust core calls to notify the C# shell. All optional;
+    /// `ctx` is the C# side's opaque handle (passed back unchanged). Invoked only
+    /// on the UI thread (inside the subclass proc), never from a PTY reader thread.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct VeloCallbacks {
+        pub ctx: *mut c_void,
+        /// (ctx, session_id, utf16_ptr, utf16_len) — live OSC tab title changed.
+        pub on_title_changed: Option<extern "C" fn(*mut c_void, u32, *const u16, usize)>,
+        /// (ctx, session_id) — the shell exited (EOF); C# should remove the row.
+        pub on_tab_closed: Option<extern "C" fn(*mut c_void, u32)>,
+        /// (ctx, session_id) — the core changed the active session (e.g. after a
+        /// close); C# should sync its pane selection.
+        pub on_active_changed: Option<extern "C" fn(*mut c_void, u32)>,
+        /// (ctx) — Ctrl+Shift+T from the focused terminal.
+        pub on_new_tab_requested: Option<extern "C" fn(*mut c_void)>,
+        /// (ctx, session_id) — Ctrl+Shift+W from the focused terminal.
+        pub on_close_tab_requested: Option<extern "C" fn(*mut c_void, u32)>,
+        /// (ctx, forward) — Ctrl+Tab / Ctrl+Shift+Tab from the focused terminal.
+        pub on_switch_tab_requested: Option<extern "C" fn(*mut c_void, bool)>,
+        /// (ctx, session_id, utf16_ptr, utf16_len) — OSC 7 working directory.
+        pub on_cwd_changed: Option<extern "C" fn(*mut c_void, u32, *const u16, usize)>,
+        /// (ctx, session_id, phase, exit, dur_ms, utf16_ptr, utf16_len) — OSC 133
+        /// command mark. phase: 0 prompt, 1 command-start (text), 2 command-end.
+        pub on_command:
+            Option<extern "C" fn(*mut c_void, u32, u8, i32, u64, *const u16, usize)>,
+    }
+
+    impl Default for VeloCallbacks {
+        fn default() -> Self {
+            Self {
+                ctx: std::ptr::null_mut(),
+                on_title_changed: None,
+                on_tab_closed: None,
+                on_active_changed: None,
+                on_new_tab_requested: None,
+                on_close_tab_requested: None,
+                on_switch_tab_requested: None,
+                on_cwd_changed: None,
+                on_command: None,
+            }
+        }
+    }
+
+    /// One terminal tab: an independent shell + parser, plus the inbox the reader
+    /// thread fills and the message loop drains.
+    struct Session {
+        terminal: term_core::Terminal,
+        pty: pty_win::Pty,
+        /// Reader appends, the loop drains via `mem::take`.
+        inbox: Arc<Mutex<Vec<u8>>>,
+        /// Live tab label (from OSC title), to debounce title callbacks.
+        tab_title: String,
+    }
+
+    /// Double-buffered flip swapchain.
+    const BACKBUFFER_COUNT: u32 = 2;
+    /// wgpu view format over the `R8G8B8A8_UNORM` swapchain buffers (sRGB RTV
+    /// over a UNORM flip-model buffer — the one sRGB-over-UNORM case DXGI allows).
+    const SWAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+    /// One on-screen surface. Owns a transparent composition swapchain (bound to
+    /// a WinUI SwapChainPanel on the C# side), its back buffers, an independent
+    /// renderer (so per-grid damage tracking stays correct across panes), its cell
+    /// grid, and the id of the session it currently displays (`NO_SESSION` if
+    /// empty).
+    struct Pane {
+        swapchain: IDXGISwapChain3,
+        backbuffers: Vec<(wgpu::Texture, wgpu::TextureView)>,
+        renderer: renderer::Renderer,
+        width: u32,
+        height: u32,
+        cols: u16,
+        rows: u16,
+        /// Session this pane shows (`NO_SESSION` = none).
+        session: usize,
+        /// Force a full repaint next frame (set on bind / resize / theme change).
+        force_full: bool,
+    }
+
+    impl Pane {
+        /// Wrap the swapchain's back buffers as wgpu textures + render-target
+        /// views. Call after create + every `ResizeBuffers`.
+        fn wrap_backbuffers(&mut self, device: &wgpu::Device) {
+            self.backbuffers.clear();
+            for i in 0..BACKBUFFER_COUNT {
+                let res: ID3D12Resource = match unsafe { self.swapchain.GetBuffer(i) } {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("swapchain GetBuffer({i}) failed: {e}");
+                        return;
+                    }
+                };
+                let hal_tex = unsafe {
+                    wgpu::hal::dx12::Device::texture_from_raw(
+                        res,
+                        SWAP_FORMAT,
+                        wgpu::TextureDimension::D2,
+                        wgpu::Extent3d {
+                            width: self.width,
+                            height: self.height,
+                            depth_or_array_layers: 1,
+                        },
+                        1,
+                        1,
+                    )
+                };
+                let tex = unsafe {
+                    device.create_texture_from_hal::<wgpu::hal::api::Dx12>(
+                        hal_tex,
+                        &wgpu::TextureDescriptor {
+                            label: Some("backbuffer"),
+                            size: wgpu::Extent3d {
+                                width: self.width,
+                                height: self.height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: SWAP_FORMAT,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                        },
+                    )
+                };
+                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+                self.backbuffers.push((tex, view));
+            }
+        }
+
+        /// The SwapChainPanel lays out in DIPs, but our back buffers are physical
+        /// pixels (DIP * dpi_scale). The inverse-scale matrix tells DXGI the buffer
+        /// is already at native res, so it composites 1:1 (crisp at fractional DPI).
+        fn apply_transform(&self, dpi_scale: f32) {
+            let inv = if dpi_scale > 0.0 { 1.0 / dpi_scale } else { 1.0 };
+            let m = DXGI_MATRIX_3X2_F {
+                _11: inv,
+                _22: inv,
+                ..Default::default()
+            };
+            if let Err(e) = unsafe { self.swapchain.SetMatrixTransform(&m) } {
+                log::error!("SetMatrixTransform failed: {e}");
+            }
+        }
+
+        /// Resize the swapchain to `w`x`h` physical px and re-wrap. No-op if
+        /// unchanged and the back buffers already exist.
+        fn apply_size(&mut self, device: &wgpu::Device, w: u32, h: u32, dpi_scale: f32) {
+            let rw = w.max(1);
+            let rh = h.max(1);
+            if rw != self.width || rh != self.height || self.backbuffers.is_empty() {
+                self.width = rw;
+                self.height = rh;
+                // Release the wgpu textures referencing the old buffers, flush the
+                // GPU, then resize and re-wrap. Only wait when there were textures to
+                // release — a freshly created pane has none, and an indefinite wait on
+                // the shared device there risks a hang.
+                let had_buffers = !self.backbuffers.is_empty();
+                self.backbuffers.clear();
+                if had_buffers {
+                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                }
+                if let Err(e) = unsafe {
+                    self.swapchain.ResizeBuffers(
+                        BACKBUFFER_COUNT,
+                        rw,
+                        rh,
+                        DXGI_FORMAT_UNKNOWN,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                } {
+                    log::error!("swapchain ResizeBuffers failed: {e}");
+                }
+                self.wrap_backbuffers(device);
+                self.apply_transform(dpi_scale);
+            }
+        }
+
+        /// Recompute this pane's cell grid for its current pixel size + the given
+        /// font/DPI, updating the renderer padding. Returns the new (cols, rows).
+        fn recompute_grid(&mut self, font: &text::Font, dpi_scale: f32) -> (u16, u16) {
+            // Inset the grid by DPI-scaled padding; the renderer offsets cells by
+            // the same amount so the bg clear fills the padding (inner, not margin).
+            let pad = (PAD_LOGICAL_PX * dpi_scale).round();
+            self.renderer.set_pad(pad, pad);
+            let grid_w = (self.width as f32 - 2.0 * pad).max(font.cell_w);
+            let grid_h = (self.height as f32 - 2.0 * pad).max(font.cell_h);
+            let (cols, rows) = grid_size(grid_w as u32, grid_h as u32, font.cell_w, font.cell_h);
+            self.cols = cols;
+            self.rows = rows;
+            self.force_full = true;
+            (cols, rows)
+        }
+    }
+
+    /// All core state. Lives behind a raw pointer carried as the subclass
+    /// `dwRefData`; the subclass proc is single-threaded on the UI message loop.
+    pub struct Engine {
+        /// Internal message-only window: PTY reader threads `PostMessage` wakeups
+        /// here; its wndproc drains + renders on the UI thread. Also the clipboard
+        /// owner. Not the render surface (the SwapChainPanel composites that).
+        wakeup_hwnd: HWND,
+
+        // GPU + render state shared across all panes/sessions.
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        font: text::Font,
+        dpi_scale: f32,
+        /// Base font size in points (pre-DPI). Settable at runtime.
+        font_pt: f32,
+        /// Shell command line new tabs spawn (default `powershell.exe`).
+        shell: String,
+        /// Terminal background (surface clear) color.
+        bg: [u8; 3],
+        /// Terminal background alpha (0 = transparent → blur-through, 1 = opaque).
+        bg_a: f32,
+
+        // Panes keyed by stable id (index); `None` = freed slot so ids stay stable.
+        // Pane 0 is the primary surface created at `velo_attach`.
+        panes: Vec<Option<Pane>>,
+        /// Pane that receives keyboard input / legacy mouse + resize.
+        focused_pane: usize,
+
+        // Sessions keyed by stable id (index); `None` = freed slot so ids never
+        // shift under in-flight posted messages.
+        sessions: Vec<Option<Box<Session>>>,
+        /// render order -> session id (for neighbor pick on close).
+        tab_order: Vec<usize>,
+
+        mouse_down: bool,
+        /// Drop the `WM_CHAR` that follows an app keybind so it never reaches a PTY.
+        swallow_next_char: bool,
+        /// Buffered lone high surrogate awaiting its low surrogate.
+        pending_high: Option<u16>,
+
+        cb: VeloCallbacks,
+    }
+
+    /// Composition presentation handles, created once per attach.
+    struct Composition {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        swapchain: IDXGISwapChain3,
+    }
+
+    /// Create a transparent (premultiplied-alpha) composition swapchain on the
+    /// D3D12 command queue backing `queue`. Each pane gets one of these.
+    unsafe fn create_comp_swapchain(queue: &wgpu::Queue) -> Result<IDXGISwapChain3> {
+        // The D3D12 command queue backing wgpu's queue is the "device" arg to
+        // CreateSwapChainForComposition.
+        let cmd_queue = {
+            let hal_queue = queue
+                .as_hal::<wgpu::hal::api::Dx12>()
+                .ok_or_else(|| anyhow!("wgpu queue is not DX12"))?;
+            hal_queue.as_raw().clone()
+        };
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: 1,
+            Height: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: BACKBUFFER_COUNT,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            Flags: 0,
+        };
+        let swapchain1 = factory.CreateSwapChainForComposition(&cmd_queue, &desc, None)?;
+        Ok(swapchain1.cast()?)
+    }
+
+    /// DX12 device/queue + the primary composition swapchain. Vulkan is
+    /// intentionally excluded — the composition swapchain needs the underlying
+    /// D3D12 command queue.
+    fn init_composition() -> Result<Composition> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .map_err(|e| anyhow!("no DX12 adapter: {e:?}"))?;
+        println!("backend: {:?}", adapter.get_info().backend);
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+
+        let swapchain = unsafe { create_comp_swapchain(&queue)? };
+        Ok(Composition {
+            device,
+            queue,
+            swapchain,
+        })
+    }
+
+    /// Build a renderer pre-configured with the current font + background.
+    fn build_renderer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        font: &text::Font,
+        bg: [u8; 3],
+        bg_a: f32,
+    ) -> renderer::Renderer {
+        let mut r = renderer::Renderer::new(
+            device,
+            queue,
+            SWAP_FORMAT,
+            font.cell_w,
+            font.cell_h,
+            font.ascent,
+        );
+        r.set_bg(bg);
+        r.set_bg_alpha(bg_a);
+        r
+    }
+
+    /// Bare class wndproc for the wakeup window (just defers to `DefWindowProcW`);
+    /// the real handling is installed via `SetWindowSubclass(wakeup_proc)`.
+    unsafe extern "system" fn wakeup_class_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// Create the engine's message-only wakeup window. PTY reader threads post
+    /// `MSG_PTY_DATA`/`MSG_PTY_EOF` here; the C# WinUI dispatcher pumps them to
+    /// `wakeup_proc` on the UI thread. Returns `HWND(null)` on failure.
+    unsafe fn create_wakeup_window() -> HWND {
+        let hmodule = match GetModuleHandleW(None) {
+            Ok(h) => h,
+            Err(_) => return HWND(std::ptr::null_mut()),
+        };
+        let hinst = HINSTANCE(hmodule.0);
+        // Idempotent: RegisterClassW fails harmlessly if already registered.
+        let cls = WNDCLASSW {
+            lpfnWndProc: Some(wakeup_class_proc),
+            hInstance: hinst,
+            lpszClassName: WAKEUP_CLASS,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&cls);
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            WAKEUP_CLASS,
+            PCWSTR::null(),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None::<HMENU>,
+            Some(hinst),
+            None,
+        )
+        .unwrap_or(HWND(std::ptr::null_mut()))
+    }
+
+    /// Grid columns/rows that fit a surface of `width`x`height` px.
+    fn grid_size(width: u32, height: u32, cell_w: f32, cell_h: f32) -> (u16, u16) {
+        let cols = (width as f32 / cell_w).floor().max(1.0) as u16;
+        let rows = (height as f32 / cell_h).floor().max(1.0) as u16;
+        (cols, rows)
+    }
+
+    impl Engine {
+        // ---- Pane / session lookup helpers --------------------------------
+
+        /// Session id shown by the focused pane (`NO_SESSION` if none).
+        fn focused_session(&self) -> usize {
+            self.panes
+                .get(self.focused_pane)
+                .and_then(|o| o.as_ref())
+                .map(|p| p.session)
+                .unwrap_or(NO_SESSION)
+        }
+
+        /// Focused pane's session, mutably.
+        fn active_session(&mut self) -> Option<&mut Session> {
+            let sid = self.focused_session();
+            if sid == NO_SESSION {
+                return None;
+            }
+            self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut())
+        }
+
+        fn pane_cols_rows(&self, idx: usize) -> Option<(u16, u16)> {
+            self.panes
+                .get(idx)
+                .and_then(|o| o.as_ref())
+                .map(|p| (p.cols, p.rows))
+        }
+
+        // ---- Rendering -----------------------------------------------------
+
+        /// Draw the session bound to pane `idx` into that pane's swapchain and
+        /// present it. No-op for an empty/unsized pane.
+        fn render_pane(&mut self, idx: usize) {
+            let sid = match self.panes.get(idx) {
+                Some(Some(p)) => p.session,
+                _ => return,
+            };
+            if sid == NO_SESSION {
+                return;
+            }
+            // Snapshot the frame first (ends the session borrow before the pane's
+            // mutable borrow + back-buffer view borrow below).
+            let mut frame = match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                Some(s) => s.terminal.frame(),
+                None => return,
+            };
+            // Disjoint field borrows: `self.panes` (mut) vs `self.device`,
+            // `self.queue`, `self.font` (the renderer draw args).
+            let Some(Some(pane)) = self.panes.get_mut(idx) else {
+                return;
+            };
+            if pane.backbuffers.is_empty() {
+                return;
+            }
+            if pane.force_full {
+                frame.damage = term_core::FrameDamage::Full;
+                pane.force_full = false;
+            }
+            let bb = unsafe { pane.swapchain.GetCurrentBackBufferIndex() } as usize;
+            let Some((_, view)) = pane.backbuffers.get(bb) else {
+                return;
+            };
+            if let Err(e) = pane.renderer.draw(
+                &self.device,
+                &self.queue,
+                view,
+                pane.width as f32,
+                pane.height as f32,
+                &frame,
+                &mut self.font,
+            ) {
+                log::error!("render error: {e}");
+                dbglog(&format!("render error: {e}"));
+            }
+            unsafe {
+                let _ = pane.swapchain.Present(0, DXGI_PRESENT(0)).ok();
+            }
+        }
+
+        /// Render every pane (used for initial paint + theme changes).
+        fn render_all(&mut self) {
+            for i in 0..self.panes.len() {
+                self.render_pane(i);
+            }
+        }
+
+        /// Render every pane currently showing session `sid`.
+        fn render_session(&mut self, sid: usize) {
+            for i in 0..self.panes.len() {
+                if matches!(self.panes.get(i), Some(Some(p)) if p.session == sid) {
+                    self.render_pane(i);
+                }
+            }
+        }
+
+        // ---- Sizing / DPI / theme -----------------------------------------
+
+        /// Resize the bound session's terminal + PTY to a new grid.
+        fn reflow_session(&mut self, sid: usize, cols: u16, rows: u16) {
+            if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                s.terminal.resize(cols, rows);
+                if let Err(e) = s.pty.resize(cols, rows) {
+                    log::error!("pty resize failed: {e}");
+                }
+            }
+        }
+
+        /// Resize pane `idx` to `w`x`h` physical px, recompute its grid, reflow the
+        /// session it shows, and repaint it.
+        fn resize_pane(&mut self, idx: usize, w: u32, h: u32) {
+            let dpi = self.dpi_scale;
+            let bound = {
+                let Some(Some(p)) = self.panes.get_mut(idx) else {
+                    return;
+                };
+                p.apply_size(&self.device, w, h, dpi);
+                let (cols, rows) = p.recompute_grid(&self.font, dpi);
+                (p.session, cols, rows)
+            };
+            let (sid, cols, rows) = bound;
+            if sid != NO_SESSION {
+                self.reflow_session(sid, cols, rows);
+            }
+            self.render_pane(idx);
+        }
+
+        /// Bind session `sid` to pane `idx` and reflow it to the pane's grid.
+        fn bind(&mut self, idx: usize, sid: usize) {
+            let dims = {
+                let Some(Some(p)) = self.panes.get_mut(idx) else {
+                    return;
+                };
+                p.session = sid;
+                p.force_full = true;
+                (p.cols, p.rows)
+            };
+            if sid != NO_SESSION {
+                self.reflow_session(sid, dims.0, dims.1);
+            }
+        }
+
+        /// Rebuild the font + every pane's renderer for the current
+        /// `font_pt` * `dpi_scale`, then recompute grids and reflow + repaint.
+        fn rebuild_font(&mut self) {
+            self.font = text::Font::new(self.font_pt * self.dpi_scale);
+            let (bg, bg_a, dpi) = (self.bg, self.bg_a, self.dpi_scale);
+            for i in 0..self.panes.len() {
+                if let Some(Some(p)) = self.panes.get_mut(i) {
+                    p.renderer = build_renderer(&self.device, &self.queue, &self.font, bg, bg_a);
+                    p.recompute_grid(&self.font, dpi);
+                }
+            }
+            // Reflow each pane's bound session, then repaint all.
+            let binds: Vec<(usize, u16, u16)> = self
+                .panes
+                .iter()
+                .flatten()
+                .filter(|p| p.session != NO_SESSION)
+                .map(|p| (p.session, p.cols, p.rows))
+                .collect();
+            for (sid, cols, rows) in binds {
+                self.reflow_session(sid, cols, rows);
+            }
+            self.render_all();
+        }
+
+        /// Rebuild for a new DPI scale.
+        fn set_scale(&mut self, scale: f32) {
+            self.dpi_scale = if scale <= 0.0 { 1.0 } else { scale };
+            self.rebuild_font();
+        }
+
+        /// Set the base font size in points.
+        fn set_font_size(&mut self, pt: f32) {
+            if (4.0..=200.0).contains(&pt) {
+                self.font_pt = pt;
+                self.rebuild_font();
+            }
+        }
+
+        /// Set the terminal background (surface clear) color on every pane.
+        fn set_bg(&mut self, bg: [u8; 3]) {
+            self.bg = bg;
+            for p in self.panes.iter_mut().flatten() {
+                p.renderer.set_bg(bg);
+                p.force_full = true;
+            }
+            self.render_all();
+        }
+
+        /// Set the terminal background alpha (0 = transparent for blur-through).
+        fn set_bg_alpha(&mut self, a: f32) {
+            self.bg_a = a.clamp(0.0, 1.0);
+            for p in self.panes.iter_mut().flatten() {
+                p.renderer.set_bg_alpha(self.bg_a);
+                p.force_full = true;
+            }
+            self.render_all();
+        }
+
+        /// Apply a color theme: 16 ANSI colors + fg + cursor + selection. The
+        /// background is set separately via `set_bg` (it owns the clear color so
+        /// blur-through keeps working). Forces a full redraw of every pane.
+        fn set_palette(
+            &mut self,
+            ansi: [[u8; 3]; 16],
+            fg: [u8; 3],
+            cursor: [u8; 3],
+            selection: [u8; 3],
+        ) {
+            term_core::palette::set_theme(ansi, fg, cursor, selection);
+            for p in self.panes.iter_mut().flatten() {
+                p.force_full = true;
+            }
+            self.render_all();
+        }
+
+        // ---- Panes (split view) -------------------------------------------
+
+        /// Create a new pane with its own composition swapchain. Returns the stable
+        /// pane id and the swapchain pointer (borrowed — the engine keeps it alive)
+        /// for C# to bind to a fresh SwapChainPanel.
+        fn add_pane(&mut self) -> Result<(usize, *mut c_void)> {
+            let swapchain = unsafe { create_comp_swapchain(&self.queue)? };
+            let raw = swapchain.as_raw();
+            let renderer = build_renderer(&self.device, &self.queue, &self.font, self.bg, self.bg_a);
+            let pane = Pane {
+                swapchain,
+                backbuffers: Vec::new(),
+                renderer,
+                width: 0,
+                height: 0,
+                cols: 80,
+                rows: 24,
+                session: NO_SESSION,
+                force_full: true,
+            };
+            let id = self
+                .panes
+                .iter()
+                .position(|p| p.is_none())
+                .unwrap_or(self.panes.len());
+            if id == self.panes.len() {
+                self.panes.push(Some(pane));
+            } else {
+                self.panes[id] = Some(pane);
+            }
+            dbglog(&format!("add_pane: id={id}"));
+            Ok((id, raw))
+        }
+
+        /// Bind a session to a pane and repaint it (C#-driven, e.g. drop a tab).
+        fn pane_bind(&mut self, idx: usize, sid: usize) {
+            if self.sessions.get(sid).and_then(|o| o.as_ref()).is_some() {
+                self.bind(idx, sid);
+                self.render_pane(idx);
+            }
+        }
+
+        /// Destroy pane `idx` (releases its swapchain). Pane 0 is the primary
+        /// surface and is never destroyed. The session it showed stays alive as a
+        /// background tab.
+        fn close_pane(&mut self, idx: usize) {
+            if idx == 0 {
+                return;
+            }
+            if let Some(slot) = self.panes.get_mut(idx) {
+                *slot = None;
+            }
+            if self.focused_pane == idx {
+                self.focused_pane = 0;
+                self.notify_active_changed();
+            }
+        }
+
+        /// Set the pane that receives keyboard input + legacy mouse/resize.
+        fn set_focused_pane(&mut self, idx: usize) {
+            if matches!(self.panes.get(idx), Some(Some(_))) && self.focused_pane != idx {
+                self.focused_pane = idx;
+                self.notify_active_changed();
+            }
+        }
+
+        // ---- Session lifecycle --------------------------------------------
+
+        /// Spawn a new PowerShell tab. Does not bind it to a pane — C# follows with
+        /// `velo_tab_set_active` (single-pane) or `velo_pane_bind` (split).
+        fn spawn_session(&mut self) -> Result<u32> {
+            let id = self
+                .sessions
+                .iter()
+                .position(|s| s.is_none())
+                .unwrap_or(self.sessions.len());
+
+            // New shells size to the focused pane's grid (fallback 80x24).
+            let (cols, rows) = self.pane_cols_rows(self.focused_pane).unwrap_or((80, 24));
+
+            let inbox = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let reader_inbox = inbox.clone();
+            let hwnd_val = self.wakeup_hwnd.0 as isize;
+            let on_event = move |ev: pty_win::PtyEvent| {
+                let hwnd = HWND(hwnd_val as *mut c_void);
+                match ev {
+                    pty_win::PtyEvent::Data(b) => {
+                        reader_inbox.lock().extend_from_slice(&b);
+                        unsafe {
+                            let _ = PostMessageW(Some(hwnd), MSG_PTY_DATA, WPARAM(id), LPARAM(0));
+                        }
+                    }
+                    pty_win::PtyEvent::Eof => unsafe {
+                        let _ = PostMessageW(Some(hwnd), MSG_PTY_EOF, WPARAM(id), LPARAM(0));
+                    },
+                }
+            };
+            dbglog(&format!("spawn_session: id={id}, shell={}, {cols}x{rows}", self.shell));
+            let pty = match pty_win::spawn(&self.shell, cols, rows, on_event) {
+                Ok(p) => p,
+                Err(e) => {
+                    dbglog(&format!("spawn_session: pty spawn FAILED: {e}"));
+                    return Err(e);
+                }
+            };
+            let writer = pty.writer();
+            let terminal = term_core::Terminal::new(
+                cols,
+                rows,
+                Arc::new(move |b: &[u8]| {
+                    let _ = writer.write_all(b);
+                }),
+            );
+            let session = Box::new(Session {
+                terminal,
+                pty,
+                inbox,
+                tab_title: "PowerShell".to_string(),
+            });
+            if id == self.sessions.len() {
+                self.sessions.push(Some(session));
+            } else {
+                self.sessions[id] = Some(session);
+            }
+            self.tab_order.push(id);
+            Ok(id as u32)
+        }
+
+        /// Close a session: drop it (its `Pty::drop` joins the reader), remove its
+        /// tab, and unbind any pane showing it. The C# shell owns pane layout, so it
+        /// rebinds panes / reflows after this. Returns true when no tabs remain.
+        fn close_session(&mut self, id: usize) -> bool {
+            let Some(index) = self.tab_order.iter().position(|&x| x == id) else {
+                return self.tab_order.is_empty();
+            };
+            if let Some(slot) = self.sessions.get_mut(id) {
+                *slot = None;
+            }
+            self.tab_order.remove(index);
+            for p in self.panes.iter_mut().flatten() {
+                if p.session == id {
+                    p.session = NO_SESSION;
+                    p.force_full = true;
+                }
+            }
+            self.tab_order.is_empty()
+        }
+
+        /// Switch the focused pane to a session by stable id.
+        fn set_active(&mut self, id: usize) {
+            if self.sessions.get(id).and_then(|o| o.as_ref()).is_some() {
+                let idx = self.focused_pane;
+                self.bind(idx, id);
+                self.render_pane(idx);
+            }
+        }
+
+        /// Push session `id`'s live OSC title to C# if it changed.
+        fn refresh_title(&mut self, id: usize) {
+            let title = match self.sessions.get(id).and_then(|o| o.as_ref()) {
+                Some(s) => s
+                    .terminal
+                    .title()
+                    .unwrap_or_else(|| "PowerShell".to_string()),
+                None => return,
+            };
+            if let Some(s) = self.sessions.get_mut(id).and_then(|o| o.as_deref_mut()) {
+                if s.tab_title != title {
+                    s.tab_title = title.clone();
+                    if let Some(f) = self.cb.on_title_changed {
+                        let utf16: Vec<u16> = title.encode_utf16().collect();
+                        f(self.cb.ctx, id as u32, utf16.as_ptr(), utf16.len());
+                    }
+                }
+            }
+        }
+
+        fn notify_active_changed(&self) {
+            if let Some(f) = self.cb.on_active_changed {
+                f(self.cb.ctx, self.focused_session() as u32);
+            }
+        }
+
+        /// Map focused-pane physical px to a grid cell + which half (selection side).
+        fn pixel_to_cell(&self, x: f32, y: f32, cols: u16, rows: u16) -> (u16, u16, bool) {
+            // Subtract the inner padding so clicks map to the right cell.
+            let pad = (PAD_LOGICAL_PX * self.dpi_scale).round();
+            let x = x - pad;
+            let y = y - pad;
+            let col = (x / self.font.cell_w).max(0.0) as u16;
+            let row = (y / self.font.cell_h).max(0.0) as u16;
+            let col = col.min(cols.saturating_sub(1));
+            let row = row.min(rows.saturating_sub(1));
+            let left_half = (x - col as f32 * self.font.cell_w) < self.font.cell_w * 0.5;
+            (col, row, left_half)
+        }
+
+        /// Drain a session's inbox, parse it, refresh its title, repaint any pane
+        /// that shows it.
+        fn on_pty_data(&mut self, id: usize) {
+            let bytes = match self.sessions.get(id).and_then(|o| o.as_ref()) {
+                Some(s) => std::mem::take(&mut *s.inbox.lock()),
+                None => return,
+            };
+            let events = if let Some(s) = self.sessions.get_mut(id).and_then(|o| o.as_deref_mut()) {
+                s.terminal.advance(&bytes);
+                s.terminal.take_shell_events()
+            } else {
+                Vec::new()
+            };
+            for ev in events {
+                self.notify_shell_event(id, ev);
+            }
+            self.refresh_title(id);
+            self.render_session(id);
+        }
+
+        /// Forward a decoded OSC 7 / 133 event to the C# shell.
+        fn notify_shell_event(&self, id: usize, ev: term_core::ShellEvent) {
+            match ev {
+                term_core::ShellEvent::Cwd(cwd) => {
+                    if let Some(f) = self.cb.on_cwd_changed {
+                        let u: Vec<u16> = cwd.encode_utf16().collect();
+                        f(self.cb.ctx, id as u32, u.as_ptr(), u.len());
+                    }
+                }
+                term_core::ShellEvent::Command {
+                    phase,
+                    exit,
+                    dur_ms,
+                    text,
+                } => {
+                    if let Some(f) = self.cb.on_command {
+                        let u: Vec<u16> = text.encode_utf16().collect();
+                        f(self.cb.ctx, id as u32, phase, exit, dur_ms, u.as_ptr(), u.len());
+                    }
+                }
+            }
+        }
+
+        /// App keybinds + navigation keys. Returns `true` = handled (C# sets
+        /// `e.Handled` and the matching `velo_char` is swallowed). Tab-management
+        /// chords call back into C# (it owns the tab list); terminal-local actions
+        /// (copy/paste, nav keys) are handled here. `ctrl`/`shift` are the live
+        /// modifier states C# reads from the keyboard source.
+        fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> bool {
+            if ctrl && shift {
+                match vk {
+                    0x54 => {
+                        if let Some(f) = self.cb.on_new_tab_requested {
+                            f(self.cb.ctx);
+                        }
+                        self.swallow_next_char = true;
+                        return true;
+                    }
+                    0x57 => {
+                        if let Some(f) = self.cb.on_close_tab_requested {
+                            f(self.cb.ctx, self.focused_session() as u32);
+                        }
+                        self.swallow_next_char = true;
+                        return true;
+                    }
+                    0x43 => {
+                        self.copy();
+                        self.swallow_next_char = true;
+                        return true;
+                    }
+                    0x56 => {
+                        self.paste();
+                        self.swallow_next_char = true;
+                        return true;
+                    }
+                    _ if vk == VK_TAB.0 => {
+                        if let Some(f) = self.cb.on_switch_tab_requested {
+                            f(self.cb.ctx, false);
+                        }
+                        self.swallow_next_char = true;
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            if ctrl && !shift && vk == VK_TAB.0 {
+                if let Some(f) = self.cb.on_switch_tab_requested {
+                    f(self.cb.ctx, true);
+                }
+                self.swallow_next_char = true;
+                return true;
+            }
+            if ctrl && !shift && vk == 0x56 {
+                self.paste();
+                self.swallow_next_char = true;
+                return true;
+            }
+
+            if let Some(seq) = nav_seq(vk) {
+                if let Some(s) = self.active_session() {
+                    let _ = s.pty.writer().write_all(seq);
+                }
+                return true;
+            }
+            false
+        }
+
+        /// Text + control chars -> focused PTY (UTF-16 -> UTF-8, surrogate-aware).
+        fn on_char(&mut self, cu: u16) {
+            if self.swallow_next_char {
+                self.swallow_next_char = false;
+                return;
+            }
+            if cu == 0x08 {
+                if let Some(s) = self.active_session() {
+                    let _ = s.pty.writer().write_all(b"\x7f");
+                }
+                return;
+            }
+            let units: Vec<u16> = match self.pending_high.take() {
+                Some(hi) => vec![hi, cu],
+                None => {
+                    if (0xD800..0xDC00).contains(&cu) {
+                        self.pending_high = Some(cu);
+                        return;
+                    }
+                    vec![cu]
+                }
+            };
+            let s = String::from_utf16_lossy(&units);
+            if let Some(sess) = self.active_session() {
+                let _ = sess.pty.writer().write_all(s.as_bytes());
+            }
+        }
+
+        /// Pointer events for pane `idx`. `kind`: 0 = down, 1 = move, 2 = up.
+        /// `(x, y)` are physical px inside that pane. Drives text selection; XAML
+        /// owns pointer capture + focus.
+        fn on_mouse_pane(&mut self, idx: usize, kind: u32, x: f32, y: f32) {
+            let (cols, rows) = match self.pane_cols_rows(idx) {
+                Some(cr) => cr,
+                None => return,
+            };
+            let sid = match self.panes.get(idx) {
+                Some(Some(p)) => p.session,
+                _ => return,
+            };
+            if sid == NO_SESSION {
+                return;
+            }
+            match kind {
+                0 => {
+                    let (c, r, l) = self.pixel_to_cell(x, y, cols, rows);
+                    if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                        s.terminal.start_selection(c, r, l);
+                    }
+                    self.mouse_down = true;
+                    self.render_pane(idx);
+                }
+                1 => {
+                    if self.mouse_down {
+                        let (c, r, l) = self.pixel_to_cell(x, y, cols, rows);
+                        if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                            s.terminal.update_selection(c, r, l);
+                        }
+                        self.render_pane(idx);
+                    }
+                }
+                _ => {
+                    self.mouse_down = false;
+                }
+            }
+        }
+
+        /// Paste clipboard text into the focused PTY (CR-normalized; bracketed wrap).
+        fn paste(&mut self) {
+            let Some(text) = clipboard_get_text(self.wakeup_hwnd) else {
+                return;
+            };
+            if text.is_empty() {
+                return;
+            }
+            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+            if let Some(s) = self.active_session() {
+                let bracketed = s.terminal.bracketed_paste();
+                let w = s.pty.writer();
+                if bracketed {
+                    let _ = w.write_all(b"\x1b[200~");
+                }
+                let _ = w.write_all(normalized.as_bytes());
+                if bracketed {
+                    let _ = w.write_all(b"\x1b[201~");
+                }
+            }
+        }
+
+        /// Paste a UTF-16 string handed in by C# (bypasses the OS clipboard).
+        fn paste_text(&mut self, text: &str) {
+            if text.is_empty() {
+                return;
+            }
+            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+            if let Some(s) = self.active_session() {
+                let bracketed = s.terminal.bracketed_paste();
+                let w = s.pty.writer();
+                if bracketed {
+                    let _ = w.write_all(b"\x1b[200~");
+                }
+                let _ = w.write_all(normalized.as_bytes());
+                if bracketed {
+                    let _ = w.write_all(b"\x1b[201~");
+                }
+            }
+        }
+
+        /// Copy the focused session's selection to the clipboard.
+        fn copy(&mut self) {
+            let text = self
+                .active_session()
+                .and_then(|s| s.terminal.selection_text());
+            if let Some(t) = text {
+                if !t.is_empty() {
+                    clipboard_set_text(self.wakeup_hwnd, &t);
+                }
+            }
+        }
+    }
+
+    /// Navigation/function keys -> exact byte sequences (these emit no `WM_CHAR`).
+    fn nav_seq(vk: u16) -> Option<&'static [u8]> {
+        let seq: &[u8] = if vk == VK_UP.0 {
+            b"\x1b[A"
+        } else if vk == VK_DOWN.0 {
+            b"\x1b[B"
+        } else if vk == VK_RIGHT.0 {
+            b"\x1b[C"
+        } else if vk == VK_LEFT.0 {
+            b"\x1b[D"
+        } else if vk == VK_HOME.0 {
+            b"\x1b[H"
+        } else if vk == VK_END.0 {
+            b"\x1b[F"
+        } else if vk == VK_PRIOR.0 {
+            b"\x1b[5~"
+        } else if vk == VK_NEXT.0 {
+            b"\x1b[6~"
+        } else if vk == VK_DELETE.0 {
+            b"\x1b[3~"
+        } else if vk == VK_INSERT.0 {
+            b"\x1b[2~"
+        } else {
+            return None;
+        };
+        Some(seq)
+    }
+
+    /// Subclass proc for the engine's message-only wakeup window. `dwref` carries
+    /// `*mut Engine`. Handles only the PTY reader-thread wakeups; all input and
+    /// sizing now arrive through the C ABI from the SwapChainPanel host.
+    unsafe extern "system" fn wakeup_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        dwref: usize,
+    ) -> LRESULT {
+        let ptr = dwref as *mut Engine;
+        if ptr.is_null() {
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+        let eng = &mut *ptr;
+        match msg {
+            MSG_PTY_DATA => {
+                eng.on_pty_data(wparam.0);
+                LRESULT(0)
+            }
+            MSG_PTY_EOF => {
+                let id = wparam.0 as u32;
+                dbglog(&format!("MSG_PTY_EOF: session {id} ended (shell exited)"));
+                eng.close_session(wparam.0);
+                if let Some(f) = eng.cb.on_tab_closed {
+                    f(eng.cb.ctx, id);
+                }
+                LRESULT(0)
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Read clipboard text (`CF_UNICODETEXT`) as a `String`, if present.
+    fn clipboard_get_text(hwnd: HWND) -> Option<String> {
+        unsafe {
+            OpenClipboard(Some(hwnd)).ok()?;
+            let result = (|| {
+                let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+                let hglobal = HGLOBAL(handle.0);
+                let ptr = GlobalLock(hglobal) as *const u16;
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut len = 0isize;
+                while *ptr.offset(len) != 0 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len as usize);
+                let s = String::from_utf16_lossy(slice);
+                let _ = GlobalUnlock(hglobal);
+                Some(s)
+            })();
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
+    /// Put text on the clipboard as `CF_UNICODETEXT`.
+    fn clipboard_set_text(hwnd: HWND, text: &str) {
+        let utf16: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        unsafe {
+            if OpenClipboard(Some(hwnd)).is_err() {
+                return;
+            }
+            let _ = EmptyClipboard();
+            if let Ok(hglobal) = GlobalAlloc(GMEM_MOVEABLE, utf16.len() * 2) {
+                let dst = GlobalLock(hglobal) as *mut u16;
+                if !dst.is_null() {
+                    std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
+                    let _ = GlobalUnlock(hglobal);
+                    let _ = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hglobal.0)));
+                }
+            }
+            let _ = CloseClipboard();
+        }
+    }
+
+    // ---- C ABI ------------------------------------------------------------
+
+    /// ponytail: temp-file logger to debug the black-screen/self-close bug (a
+    /// WinExe has no console, so println!/log:: are invisible). Shares
+    /// %TEMP%\velo-debug.log with the C# side. Drop once the bug is found.
+    fn dbglog(msg: &str) {
+        use std::io::Write;
+        // Same file as the C# side: process working dir (repo root under
+        // `dotnet run`), falling back to %TEMP%.
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("velo-debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "[rust] {msg}");
+        }
+    }
+
+    fn install_panic_hook() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                dbglog(&format!("PANIC: {info}"));
+                prev(info);
+            }));
+        });
+    }
+
+    /// Init the GPU + composition swapchain and the engine's internal wakeup
+    /// window. Returns an opaque engine handle (null on failure). `dpi_scale` is
+    /// the panel's rasterization scale. After this, call `velo_get_swapchain` to
+    /// bind the swapchain to a `SwapChainPanel`, then `velo_resize` once the panel
+    /// has a size.
+    ///
+    /// # Safety
+    /// Must be called on the UI thread (the wakeup window's messages are pumped
+    /// there). The returned handle is freed by `velo_shutdown`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_attach(dpi_scale: f32) -> *mut Engine {
+        install_panic_hook();
+        dbglog(&format!("velo_attach: enter, scale={dpi_scale}"));
+        let comp = match init_composition() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("velo_attach init_composition failed: {e}");
+                dbglog(&format!("velo_attach: init_composition FAILED: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        dbglog("velo_attach: init_composition ok");
+        let Composition {
+            device,
+            queue,
+            swapchain,
+        } = comp;
+
+        let wakeup_hwnd = create_wakeup_window();
+        if wakeup_hwnd.0.is_null() {
+            log::error!("velo_attach: create_wakeup_window failed");
+            dbglog("velo_attach: create_wakeup_window FAILED");
+            return std::ptr::null_mut();
+        }
+        dbglog("velo_attach: wakeup window ok, building renderer");
+
+        let scale = if dpi_scale <= 0.0 { 1.0 } else { dpi_scale };
+        let font = text::Font::new(FONT_SIZE_PT * scale);
+        let bg = [0x1e, 0x1e, 0x1e];
+        let bg_a = 1.0;
+        let renderer = build_renderer(&device, &queue, &font, bg, bg_a);
+
+        // Pane 0 reuses the primary swapchain so the single-pane host is unchanged.
+        let pane0 = Pane {
+            swapchain,
+            backbuffers: Vec::new(),
+            renderer,
+            width: 0,
+            height: 0,
+            cols: 80,
+            rows: 24,
+            session: NO_SESSION,
+            force_full: true,
+        };
+
+        let engine = Box::new(Engine {
+            wakeup_hwnd,
+            device,
+            queue,
+            font,
+            dpi_scale: scale,
+            font_pt: FONT_SIZE_PT,
+            shell: "powershell.exe".to_string(),
+            bg,
+            bg_a,
+            panes: vec![Some(pane0)],
+            focused_pane: 0,
+            sessions: Vec::new(),
+            tab_order: Vec::new(),
+            mouse_down: false,
+            swallow_next_char: false,
+            pending_high: None,
+            cb: VeloCallbacks::default(),
+        });
+
+        let raw = Box::into_raw(engine);
+        let _ = SetWindowSubclass(wakeup_hwnd, Some(wakeup_proc), SUBCLASS_ID, raw as usize);
+        dbglog(&format!("velo_attach: success, engine={raw:?}"));
+        raw
+    }
+
+    /// Return the primary pane's swapchain pointer (borrowed — the engine keeps it
+    /// alive). C# casts the `SwapChainPanel` to `ISwapChainPanelNative` and calls
+    /// `SetSwapChain(this)`, which AddRefs it.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_get_swapchain(eng: *mut Engine) -> *mut c_void {
+        match eng.as_ref() {
+            Some(e) => match e.panes.first().and_then(|o| o.as_ref()) {
+                Some(p) => p.swapchain.as_raw(),
+                None => std::ptr::null_mut(),
+            },
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// Resize the primary pane (pane 0) to `w`x`h` physical px and reflow.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_resize(eng: *mut Engine, w: u32, h: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.resize_pane(0, w, h);
+        }
+    }
+
+    /// Draw + present every pane immediately.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_render(eng: *mut Engine) {
+        if let Some(e) = eng.as_mut() {
+            e.render_all();
+        }
+    }
+
+    /// Forward a key-down. `vk` is the Win32 virtual-key code; `mods` is a bitset
+    /// (bit0 = Ctrl, bit1 = Shift, bit2 = Alt). Returns 1 if the core handled it
+    /// (C# sets `e.Handled` and the matching `velo_char` is swallowed).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_key(eng: *mut Engine, vk: u32, mods: u32) -> u8 {
+        match eng.as_mut() {
+            Some(e) => e.on_key(vk as u16, mods & 1 != 0, mods & 2 != 0) as u8,
+            None => 0,
+        }
+    }
+
+    /// Forward a received character (one UTF-16 code unit, surrogate-aware).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_char(eng: *mut Engine, cu: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.on_char(cu as u16);
+        }
+    }
+
+    /// Forward a pointer event to the focused pane. `kind`: 0 = down, 1 = move,
+    /// 2 = up. `(x, y)` are physical px inside the panel.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_mouse(eng: *mut Engine, kind: u32, x: f32, y: f32) {
+        if let Some(e) = eng.as_mut() {
+            let idx = e.focused_pane;
+            e.on_mouse_pane(idx, kind, x, y);
+        }
+    }
+
+    /// Register C# callbacks. Call once after `velo_attach`, before the first tab.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_callbacks(eng: *mut Engine, cb: VeloCallbacks) {
+        if let Some(e) = eng.as_mut() {
+            e.cb = cb;
+        }
+    }
+
+    /// Spawn a new shell tab; returns its stable session id (u32::MAX on failure).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_tab_new(eng: *mut Engine) -> u32 {
+        match eng.as_mut() {
+            Some(e) => e.spawn_session().unwrap_or(u32::MAX),
+            None => u32::MAX,
+        }
+    }
+
+    /// Close the tab with stable id `id`. Returns 1 when no tabs remain.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_tab_close(eng: *mut Engine, id: u32) -> u32 {
+        match eng.as_mut() {
+            Some(e) => e.close_session(id as usize) as u32,
+            None => 1,
+        }
+    }
+
+    /// Bind the tab with stable id `id` into the focused pane (single-pane tab
+    /// switch). For split view use `velo_pane_bind`.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_tab_set_active(eng: *mut Engine, id: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.set_active(id as usize);
+        }
+    }
+
+    // ---- Panes (split view) ----------------------------------------------
+
+    /// Create a new pane with its own composition swapchain. Writes the swapchain
+    /// pointer to `*out_swapchain` (bind it to a fresh `SwapChainPanel` via
+    /// `ISwapChainPanelNative.SetSwapChain`) and returns the stable pane id, or
+    /// `u32::MAX` on failure. Call `velo_pane_resize` once the panel has a size and
+    /// `velo_pane_bind` to show a tab in it.
+    ///
+    /// # Safety
+    /// `eng` must be live; `out_swapchain` must be a valid writable pointer.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_new(eng: *mut Engine, out_swapchain: *mut *mut c_void) -> u32 {
+        let Some(e) = eng.as_mut() else {
+            return u32::MAX;
+        };
+        match e.add_pane() {
+            Ok((id, sc)) => {
+                if !out_swapchain.is_null() {
+                    *out_swapchain = sc;
+                }
+                id as u32
+            }
+            Err(err) => {
+                dbglog(&format!("velo_pane_new failed: {err}"));
+                u32::MAX
+            }
+        }
+    }
+
+    /// Show the tab with stable id `session` in pane `pane`.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_bind(eng: *mut Engine, pane: u32, session: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.pane_bind(pane as usize, session as usize);
+        }
+    }
+
+    /// Resize pane `pane` to `w`x`h` physical px and reflow its session.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_resize(eng: *mut Engine, pane: u32, w: u32, h: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.resize_pane(pane as usize, w, h);
+        }
+    }
+
+    /// Forward a pointer event to a specific pane. `kind`: 0 = down, 1 = move,
+    /// 2 = up. `(x, y)` are physical px inside that pane.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_mouse(eng: *mut Engine, pane: u32, kind: u32, x: f32, y: f32) {
+        if let Some(e) = eng.as_mut() {
+            e.on_mouse_pane(pane as usize, kind, x, y);
+        }
+    }
+
+    /// Make pane `pane` the focused pane (keyboard target). Notifies C# of the
+    /// session it shows via `on_active_changed`.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_focus(eng: *mut Engine, pane: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.set_focused_pane(pane as usize);
+        }
+    }
+
+    /// Destroy pane `pane` (releases its swapchain). Pane 0 cannot be destroyed.
+    /// The session it showed stays alive as a background tab.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_close(eng: *mut Engine, pane: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.close_pane(pane as usize);
+        }
+    }
+
+    /// Update the DPI scale (rebuilds font + every pane renderer, reflows).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_scale(eng: *mut Engine, scale: f32) {
+        if let Some(e) = eng.as_mut() {
+            e.set_scale(scale);
+        }
+    }
+
+    /// Set the base font size in points (rebuilds font + renderers, reflows).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_font_size(eng: *mut Engine, pt: f32) {
+        if let Some(e) = eng.as_mut() {
+            e.set_font_size(pt);
+        }
+    }
+
+    /// Set the shell command line that new tabs spawn. Affects future tabs only.
+    ///
+    /// # Safety
+    /// `eng` must be live; `ptr` must point to `len` valid UTF-16 code units.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_shell(eng: *mut Engine, ptr: *const u16, len: usize) {
+        let Some(e) = eng.as_mut() else { return };
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        e.shell = String::from_utf16_lossy(slice);
+    }
+
+    /// Set the terminal background color (RGB, 0..=255 each).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_bg(eng: *mut Engine, r: u8, g: u8, b: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.set_bg([r, g, b]);
+        }
+    }
+
+    /// Set the terminal background alpha: 0.0 = fully transparent (Mica/acrylic
+    /// behind the window blurs through), 1.0 = opaque.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_bg_alpha(eng: *mut Engine, a: f32) {
+        if let Some(e) = eng.as_mut() {
+            e.set_bg_alpha(a);
+        }
+    }
+
+    /// Apply a color theme. `ptr` points to `len` bytes laid out as RGB triples:
+    /// 16 ANSI colors, then foreground, cursor, and selection — 19 triples (57
+    /// bytes). The background is set separately via `velo_set_bg`. No-op on a
+    /// wrong length.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`; `ptr` must point to `len`
+    /// valid bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_palette(eng: *mut Engine, ptr: *const u8, len: usize) {
+        let Some(e) = eng.as_mut() else { return };
+        if ptr.is_null() || len != 19 * 3 {
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(ptr, len);
+        let mut ansi = [[0u8; 3]; 16];
+        for (i, c) in ansi.iter_mut().enumerate() {
+            *c = [bytes[i * 3], bytes[i * 3 + 1], bytes[i * 3 + 2]];
+        }
+        let trip = |n: usize| [bytes[n * 3], bytes[n * 3 + 1], bytes[n * 3 + 2]];
+        e.set_palette(ansi, trip(16), trip(17), trip(18));
+    }
+
+    /// Paste a UTF-16 string (len code units) into the focused session.
+    ///
+    /// # Safety
+    /// `eng` must be live; `ptr` must point to `len` valid UTF-16 code units.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_paste_utf16(eng: *mut Engine, ptr: *const u16, len: usize) {
+        let Some(e) = eng.as_mut() else { return };
+        if ptr.is_null() {
+            return;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let text = String::from_utf16_lossy(slice);
+        e.paste_text(&text);
+    }
+
+    /// Detach the wakeup hook, destroy its window, and drop the engine (joins all
+    /// PTY reader threads).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`; must not be used after.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_shutdown(eng: *mut Engine) {
+        if eng.is_null() {
+            return;
+        }
+        let e = Box::from_raw(eng);
+        let _ = RemoveWindowSubclass(e.wakeup_hwnd, Some(wakeup_proc), SUBCLASS_ID);
+        let _ = DestroyWindow(e.wakeup_hwnd);
+        drop(e);
+    }
+}

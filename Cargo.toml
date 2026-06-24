@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/term-core",
+  "crates/pty-win",
+  "crates/renderer",
+  "crates/text",
+  "crates/ui",
+  "crates/app",
+  "crates/ffi",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.0"
+
+[workspace.dependencies]
+# external — pinned version set
+winit = "0.30.13"
+wgpu = "29.0"
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = "0.34"
+alacritty_terminal = "0.26"
+vte = "0.15"
+cosmic-text = "0.18"
+windows = "0.62"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1.0"
+pollster = "0.4"
+bytemuck = "1"
+parking_lot = "0.12"
+# internal — path deps
+term-core = { path = "crates/term-core" }
+pty-win   = { path = "crates/pty-win" }
+renderer  = { path = "crates/renderer" }
+text      = { path = "crates/text" }
+ui        = { path = "crates/ui" }

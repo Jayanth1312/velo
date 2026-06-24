@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+
+# .NET / C#
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.pdb
+*.cache
+
+# Logs
+*.log
+velo-debug.log
+
+# Generated tooling output
+/graphify-out
+
+# Local agent / editor config
+/.claude
+/.vscode
+/.idea
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk

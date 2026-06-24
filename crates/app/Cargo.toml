@@ -1,0 +1,18 @@
+[package]
+name = "app"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "velo"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = { workspace = true }
+pollster = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+term-core = { workspace = true }
+renderer = { workspace = true }
+text = { workspace = true }

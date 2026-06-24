@@ -1,0 +1,11 @@
+[package]
+name = "text"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cosmic-text = { workspace = true }
+log = { workspace = true }
+# Ships a TTF (LUCIDE_FONT_BYTES) + Icon enum (each icon is a PUA char), so UI
+# icons rasterize through the normal glyph atlas — no SVG renderer needed.
+lucide-icons = "1.21"

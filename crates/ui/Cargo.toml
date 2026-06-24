@@ -1,0 +1,10 @@
+[package]
+name = "ui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+log = { workspace = true }
