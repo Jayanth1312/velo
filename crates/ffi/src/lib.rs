@@ -144,6 +144,10 @@ mod imp {
         pty: pty_win::Pty,
         /// Reader appends, the loop drains via `mem::take`.
         inbox: Arc<Mutex<Vec<u8>>>,
+        /// Coalesces PTY-flood wakeups: the reader only posts `MSG_PTY_DATA` on a
+        /// false->true flip, so hundreds of 4K/64K reads collapse into one drain
+        /// + render pass per pump instead of one per read.
+        wakeup_pending: Arc<std::sync::atomic::AtomicBool>,
         /// Live tab label (from OSC title), to debounce title callbacks.
         tab_title: String,
     }
@@ -766,14 +770,22 @@ mod imp {
 
             let inbox = Arc::new(Mutex::new(Vec::<u8>::new()));
             let reader_inbox = inbox.clone();
+            let wakeup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_wakeup_pending = wakeup_pending.clone();
             let hwnd_val = self.wakeup_hwnd.0 as isize;
             let on_event = move |ev: pty_win::PtyEvent| {
                 let hwnd = HWND(hwnd_val as *mut c_void);
                 match ev {
                     pty_win::PtyEvent::Data(b) => {
                         reader_inbox.lock().extend_from_slice(&b);
-                        unsafe {
-                            let _ = PostMessageW(Some(hwnd), MSG_PTY_DATA, WPARAM(id), LPARAM(0));
+                        // Only post if no wakeup is already in flight — a queued
+                        // MSG_PTY_DATA will drain everything appended before it's
+                        // handled, so extra posts during a flood are redundant.
+                        if !reader_wakeup_pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            unsafe {
+                                let _ =
+                                    PostMessageW(Some(hwnd), MSG_PTY_DATA, WPARAM(id), LPARAM(0));
+                            }
                         }
                     }
                     pty_win::PtyEvent::Eof => unsafe {
@@ -801,6 +813,7 @@ mod imp {
                 terminal,
                 pty,
                 inbox,
+                wakeup_pending,
                 tab_title: "PowerShell".to_string(),
             });
             if id == self.sessions.len() {
@@ -885,9 +898,20 @@ mod imp {
         /// that shows it.
         fn on_pty_data(&mut self, id: usize) {
             let bytes = match self.sessions.get(id).and_then(|o| o.as_ref()) {
-                Some(s) => std::mem::take(&mut *s.inbox.lock()),
+                Some(s) => {
+                    // Clear the pending flag before draining: if the reader appends
+                    // and flips false->true after we've read the (now-stale) flag
+                    // but before we drain, it re-posts a wakeup for that data. Clear
+                    // first, drain second — the reverse order could drop a wakeup for
+                    // data that arrives between drain and clear.
+                    s.wakeup_pending.store(false, std::sync::atomic::Ordering::Release);
+                    std::mem::take(&mut *s.inbox.lock())
+                }
                 None => return,
             };
+            if bytes.is_empty() {
+                return;
+            }
             let events = if let Some(s) = self.sessions.get_mut(id).and_then(|o| o.as_deref_mut()) {
                 s.terminal.advance(&bytes);
                 s.terminal.take_shell_events()
