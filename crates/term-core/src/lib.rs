@@ -167,13 +167,15 @@ fn percent_decode(s: &str) -> String {
 fn parse_osc7(rest: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(rest).ok()?;
     let path = match s.strip_prefix("file://") {
-        Some(after) => match after.find('/') {
+        // Split host from path on the first separator (`/`, or `\` if a shell
+        // emitted a raw Windows path). No separator => treat the whole thing as path.
+        Some(after) => match after.find(['/', '\\']) {
             Some(i) => &after[i..],
             None => after,
         },
         None => s,
     };
-    let p = percent_decode(path);
+    let p = percent_decode(path).replace('\\', "/");
     let bytes = p.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
         Some(p[1..].to_string())
@@ -580,6 +582,15 @@ mod tests {
         assert!(matches!(&ev[2], ShellEvent::Command { phase: 2, exit: 3, .. }));
         // Drained.
         assert!(t.take_shell_events().is_empty());
+    }
+
+    #[test]
+    fn osc7_powershell_style_backslash_path() {
+        // Real PowerShell emitter: file://HOST + /C:\Users\me (backslashes).
+        let mut t = term();
+        t.advance(b"\x1b]7;file://DESKTOP/C:\\Users\\me\x07");
+        let ev = t.take_shell_events();
+        assert!(matches!(&ev[0], ShellEvent::Cwd(p) if p == "C:/Users/me"));
     }
 
     #[test]

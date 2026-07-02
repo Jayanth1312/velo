@@ -1373,6 +1373,7 @@ mod imp {
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
     pub unsafe extern "C" fn velo_key(eng: *mut Engine, vk: u32, mods: u32) -> u8 {
+        dbglog(&format!("velo_key: vk={vk} mods={mods}")); // diag: bug1 input trace
         match eng.as_mut() {
             Some(e) => e.on_key(vk as u16, mods & 1 != 0, mods & 2 != 0) as u8,
             None => 0,
@@ -1385,6 +1386,8 @@ mod imp {
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
     pub unsafe extern "C" fn velo_char(eng: *mut Engine, cu: u32) {
+        dbglog(&format!("velo_char: cu={cu} focused_sess={}", // diag: bug1 input trace
+            eng.as_ref().map(|e| e.focused_session() as i64).unwrap_or(-1)));
         if let Some(e) = eng.as_mut() {
             e.on_char(cu as u16);
         }
