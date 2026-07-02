@@ -67,7 +67,17 @@ public sealed class TabVM : INotifyPropertyChanged
         set { if (_runningCommand != value) { _runningCommand = value; Raise(); } }
     }
 
+    public const int MaxCommandHistory = 500;
+
     public ObservableCollection<CommandEntry> CommandHistory { get; } = new();
+
+    /// <summary>Append a command, dropping the oldest entries past <see cref="MaxCommandHistory"/>.</summary>
+    public void AddCommand(CommandEntry entry)
+    {
+        CommandHistory.Add(entry);
+        while (CommandHistory.Count > MaxCommandHistory)
+            CommandHistory.RemoveAt(0);
+    }
 
     // ---- Grouping / selection / rename UI state (pure C#, see TabGroup) ----
 

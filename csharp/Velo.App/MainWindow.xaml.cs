@@ -107,9 +107,11 @@ public sealed partial class MainWindow : Window
         Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += OnFirstRender;
 
         // Inject shell integration before the first shell spawns so OSC 7/133
-        // emitters are live in tab 1's profile load.
-        ShellIntegration.Ensure(_settings);
-        Log.Write("ctor: ShellIntegration done");
+        // emitters are live in tab 1's profile load. Dispatched off-thread: it
+        // only touches profile files, injection is idempotent, and nothing in
+        // the ctor depends on it completing.
+        Task.Run(() => ShellIntegration.Ensure(_settings));
+        Log.Write("ctor: ShellIntegration dispatched");
         SelectDetailsTab(InfoTabButton);   // default section, shown when panel opens
         Log.Write("ctor: SelectDetailsTab done");
 
@@ -2555,7 +2557,7 @@ public sealed partial class MainWindow : Window
                 case 2:
                     var cmd = tab.RunningCommand;
                     if (cmd.Length > 0)
-                        tab.CommandHistory.Add(new CommandEntry { Command = cmd, Exit = exit, DurMs = (long)durMs, When = DateTime.Now });
+                        tab.AddCommand(new CommandEntry { Command = cmd, Exit = exit, DurMs = (long)durMs, When = DateTime.Now });
                     tab.RunningCommand = "";
                     Log.Write($"OnCommand: tab={id} cmd='{cmd}' exit={exit} dur={durMs}ms");
                     if (w._detailsOpen && w.CurrentTab()?.Id == id

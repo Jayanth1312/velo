@@ -14,6 +14,10 @@
 *.log
 velo-debug.log
 
+# Build artifacts / logs
+build.txt
+*.binlog
+
 # Generated tooling output
 /graphify-out
 
