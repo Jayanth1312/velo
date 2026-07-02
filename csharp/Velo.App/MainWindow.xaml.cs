@@ -994,15 +994,8 @@ public sealed partial class MainWindow : Window
                 // Background and isn't hit-test-visible, so Focus() returns false and no
                 // KeyDown/CharacterReceived ever fire (the "can't type" bug).
                 if (PaneHost is null)
-                {
-                    Log.Write("FocusTerminal: PaneHost null, skip");
                     return;
-                }
-                bool ok = PaneHost.Focus(FocusState.Programmatic);
-                var xr = Content?.XamlRoot;
-                var f = xr is null ? "no-xamlroot"
-                    : FocusManager.GetFocusedElement(xr)?.GetType().Name ?? "null";
-                Log.Write($"FocusTerminal: PaneHost Focus()={ok} focused={f}");
+                PaneHost.Focus(FocusState.Programmatic);
             }
             catch (Exception ex)
             {
@@ -1186,7 +1179,6 @@ public sealed partial class MainWindow : Window
     {
         if (e.Handled) return;
         if (!ShouldRouteKeysToTerminal()) return;
-        Log.Write($"Root_KeyDown: key={e.Key} focused={FocusedName()} -> refocus terminal"); // diag: dead-terminal
         // Pull focus back to PaneHost: a focused non-text control (e.g. the Info
         // ScrollViewer) forwards keydowns but never raises CharacterReceived, so
         // typed TEXT is lost. Refocusing makes this key's WM_CHAR land on PaneHost
@@ -1202,18 +1194,8 @@ public sealed partial class MainWindow : Window
             Panel_CharacterReceived(PaneHost, e);
     }
 
-    private string FocusedName()
-    {
-        var xr = Content?.XamlRoot;
-        if (xr is null) return "no-xamlroot";
-        var f = FocusManager.GetFocusedElement(xr);
-        return f is FrameworkElement fe && !string.IsNullOrEmpty(fe.Name)
-            ? fe.Name : f?.GetType().Name ?? "null";
-    }
-
     private void Panel_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        Log.Write($"Panel_KeyDown: key={e.Key} sender={(sender as FrameworkElement)?.Name}"); // diag: bug1
         if (_engine == IntPtr.Zero)
             return;
 
@@ -1283,7 +1265,6 @@ public sealed partial class MainWindow : Window
 
     private void Panel_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs e)
     {
-        Log.Write($"Panel_CharacterReceived: char={(int)e.Character}"); // diag: bug1
         if (_engine == IntPtr.Zero)
             return;
         Native.velo_pane_focus(_engine, PaneId(sender)); // route to the focused pane

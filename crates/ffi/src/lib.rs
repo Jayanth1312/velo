@@ -1225,9 +1225,12 @@ mod imp {
         use std::io::Write;
         // Same file as the C# side: process working dir (repo root under
         // `dotnet run`), falling back to %TEMP%.
-        let path = std::env::current_dir()
-            .unwrap_or_else(|_| std::env::temp_dir())
-            .join("velo-debug.log");
+        static LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let path = LOG_PATH.get_or_init(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::env::temp_dir())
+                .join("velo-debug.log")
+        });
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "[rust] {msg}");
         }
@@ -1373,7 +1376,6 @@ mod imp {
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
     pub unsafe extern "C" fn velo_key(eng: *mut Engine, vk: u32, mods: u32) -> u8 {
-        dbglog(&format!("velo_key: vk={vk} mods={mods}")); // diag: bug1 input trace
         match eng.as_mut() {
             Some(e) => e.on_key(vk as u16, mods & 1 != 0, mods & 2 != 0) as u8,
             None => 0,
@@ -1386,8 +1388,6 @@ mod imp {
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
     pub unsafe extern "C" fn velo_char(eng: *mut Engine, cu: u32) {
-        dbglog(&format!("velo_char: cu={cu} focused_sess={}", // diag: bug1 input trace
-            eng.as_ref().map(|e| e.focused_session() as i64).unwrap_or(-1)));
         if let Some(e) = eng.as_mut() {
             e.on_char(cu as u16);
         }

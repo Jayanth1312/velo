@@ -10,6 +10,11 @@ internal static class Log
 {
     private static readonly object Gate = new();
 
+    /// Debug logging is off unless VELO_DEBUG=1 (file appends on every call are
+    /// too costly for the input hot path).
+    internal static readonly bool Enabled =
+        Environment.GetEnvironmentVariable("VELO_DEBUG") == "1";
+
     /// velo-debug.log in the process working directory (= the folder you ran
     /// `dotnet run` from, normally the repo root D:\velo). Falls back to %TEMP%.
     public static string Path { get; } = ResolvePath();
@@ -22,6 +27,16 @@ internal static class Log
 
     public static void Write(string msg)
     {
+        if (!Enabled) return;
+        Append(msg);
+    }
+
+    /// Exceptions are rare and always worth logging, so this skips the gate.
+    public static void Ex(string where, Exception e) =>
+        Append($"EXCEPTION @ {where}: {e}");
+
+    private static void Append(string msg)
+    {
         try
         {
             lock (Gate)
@@ -29,7 +44,4 @@ internal static class Log
         }
         catch { /* logging must never throw */ }
     }
-
-    public static void Ex(string where, Exception e) =>
-        Write($"EXCEPTION @ {where}: {e}");
 }
