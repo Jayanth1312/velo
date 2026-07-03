@@ -767,4 +767,24 @@ mod tests {
             FrameDamage::Full => panic!("idle frame must not be fully damaged"),
         }
     }
+
+    #[test]
+    fn mouse_mode_tracks_decset() {
+        let mut t = term();
+        assert_eq!(t.mouse_mode(), MouseMode::default(), "everything off initially");
+
+        t.advance(b"\x1b[?1000h"); // click reporting
+        let mm = t.mouse_mode();
+        assert!(mm.reporting && !mm.drag && !mm.motion && !mm.sgr);
+
+        t.advance(b"\x1b[?1002h\x1b[?1006h"); // + drag tracking, SGR coords
+        let mm = t.mouse_mode();
+        assert!(mm.reporting && mm.drag && mm.sgr);
+
+        t.advance(b"\x1b[?1003h"); // any-motion tracking
+        assert!(t.mouse_mode().motion);
+
+        t.advance(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l");
+        assert_eq!(t.mouse_mode(), MouseMode::default(), "all DECSET bits reset");
+    }
 }

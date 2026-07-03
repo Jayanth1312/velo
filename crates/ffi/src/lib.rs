@@ -330,6 +330,12 @@ mod imp {
         tab_order: Vec<usize>,
 
         mouse_down: bool,
+        /// SGR button code of the pressed button (0/1/2) for the gesture in flight.
+        mouse_button: u8,
+        /// Whether the gesture in flight went to the SGR path. Decided once at
+        /// press so a mid-drag Shift change can't send the app a release it
+        /// never saw a press for (or vice versa).
+        sgr_gesture: bool,
         /// Drop the `WM_CHAR` that follows an app keybind so it never reaches a PTY.
         swallow_next_char: bool,
         /// Buffered lone high surrogate awaiting its low surrogate.
@@ -1082,13 +1088,15 @@ mod imp {
         }
 
         /// Pointer events for pane `idx`. `kind`: 0 = down, 1 = move, 2 = up.
-        /// `(x, y)` are physical px inside that pane. `shift`: shift key held,
+        /// `(x, y)` are physical px inside that pane; `button` is the SGR
+        /// button code (0 left, 1 middle, 2 right). `shift`: shift key held,
         /// the user's override to force local text selection even when the app
         /// has enabled mouse reporting. When the session's terminal reports
         /// mouse mode active and shift is not held, pointer events are encoded
         /// as SGR (1006) sequences and written to the PTY instead of driving
-        /// selection; XAML owns pointer capture + focus either way.
-        fn on_mouse_pane(&mut self, idx: usize, kind: u32, x: f32, y: f32, shift: bool) {
+        /// selection; XAML owns pointer capture + focus either way. Which path
+        /// a press takes is latched for the whole press→move→release gesture.
+        fn on_mouse_pane(&mut self, idx: usize, kind: u32, x: f32, y: f32, button: u8, shift: bool) {
             let (cols, rows) = match self.pane_cols_rows(idx) {
                 Some(cr) => cr,
                 None => return,
@@ -1101,42 +1109,57 @@ mod imp {
                 return;
             }
 
-            let mouse_mode = self
+            let mm = self
                 .sessions
                 .get(sid)
                 .and_then(|o| o.as_ref())
-                .map(|s| s.terminal.mouse_mode());
-            if let Some(mm) = mouse_mode {
-                if mm.reporting && !shift {
-                    let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
-                    let col = c + 1;
-                    let row = r + 1;
-                    match kind {
-                        0 => {
-                            self.mouse_down = true;
-                            let seq = term_core::keys::sgr_mouse_seq(0, col, row, true);
-                            if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
-                                let _ = s.pty.writer().write_all(&seq);
-                            }
-                        }
-                        1 => {
-                            if mm.motion || (mm.drag && self.mouse_down) {
-                                let seq = term_core::keys::sgr_mouse_seq(0 + 32, col, row, true);
-                                if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
-                                    let _ = s.pty.writer().write_all(&seq);
-                                }
-                            }
-                        }
-                        _ => {
-                            self.mouse_down = false;
-                            let seq = term_core::keys::sgr_mouse_seq(0, col, row, false);
-                            if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
-                                let _ = s.pty.writer().write_all(&seq);
-                            }
+                .map(|s| s.terminal.mouse_mode())
+                .unwrap_or_default();
+            let sgr = match kind {
+                0 => {
+                    let m = mm.reporting && !shift;
+                    self.sgr_gesture = m;
+                    m
+                }
+                // Mid-gesture events follow the press's decision, not live Shift.
+                _ if self.mouse_down => self.sgr_gesture,
+                // Hover motion (no gesture in flight): live check.
+                _ => mm.reporting && !shift,
+            };
+            if sgr {
+                let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                let col = c + 1;
+                let row = r + 1;
+                let seq = match kind {
+                    0 => {
+                        self.mouse_down = true;
+                        self.mouse_button = button;
+                        Some(term_core::keys::sgr_mouse_seq(button, col, row, true))
+                    }
+                    1 => {
+                        if mm.motion || (mm.drag && self.mouse_down) {
+                            // xterm: motion with no button held reports button 3.
+                            let b = if self.mouse_down { self.mouse_button } else { 3 };
+                            Some(term_core::keys::sgr_mouse_seq(b + 32, col, row, true))
+                        } else {
+                            None
                         }
                     }
-                    return;
+                    _ => {
+                        if !self.mouse_down {
+                            None // no press was sent; don't fabricate a release
+                        } else {
+                            self.mouse_down = false;
+                            Some(term_core::keys::sgr_mouse_seq(self.mouse_button, col, row, false))
+                        }
+                    }
+                };
+                if let Some(seq) = seq {
+                    if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                        let _ = s.pty.writer().write_all(&seq);
+                    }
                 }
+                return;
             }
 
             match kind {
@@ -1236,7 +1259,7 @@ mod imp {
                         let row = r + 1;
                         // `delta_lines` carries the caller's lines-per-notch scale
                         // (3); one wheel event per notch, not per line.
-                        let notches = (delta_lines.unsigned_abs() / NOTCH_LINES as u32).max(1);
+                        let notches = delta_lines.unsigned_abs().div_ceil(NOTCH_LINES as u32).max(1);
                         let button = if delta_lines > 0 { 64 } else { 65 };
                         let seq = term_core::keys::sgr_mouse_seq(button, col, row, true);
                         if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
@@ -1464,6 +1487,8 @@ mod imp {
             sessions: Vec::new(),
             tab_order: Vec::new(),
             mouse_down: false,
+            mouse_button: 0,
+            sgr_gesture: false,
             swallow_next_char: false,
             pending_high: None,
             cb: VeloCallbacks::default(),
@@ -1543,17 +1568,18 @@ mod imp {
     }
 
     /// Forward a pointer event to the focused pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside the panel. `mods` is the same
-    /// live bitset as `velo_key` (bit1 = Shift; shift overrides app mouse
-    /// reporting to force local text selection).
+    /// 2 = up. `(x, y)` are physical px inside the panel. `button` is 0 left,
+    /// 1 middle, 2 right. `mods` is the same live bitset as `velo_key`
+    /// (bit1 = Shift; shift overrides app mouse reporting to force local
+    /// text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
-    pub unsafe extern "C" fn velo_mouse(eng: *mut Engine, kind: u32, x: f32, y: f32, mods: u32) {
+    pub unsafe extern "C" fn velo_mouse(eng: *mut Engine, kind: u32, x: f32, y: f32, button: u32, mods: u32) {
         if let Some(e) = eng.as_mut() {
             let idx = e.focused_pane;
-            e.on_mouse_pane(idx, kind, x, y, mods & 2 != 0);
+            e.on_mouse_pane(idx, kind, x, y, button.min(2) as u8, mods & 2 != 0);
         }
     }
 
@@ -1656,16 +1682,17 @@ mod imp {
     }
 
     /// Forward a pointer event to a specific pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside that pane. `mods` is the same
-    /// live bitset as `velo_key` (bit1 = Shift; shift overrides app mouse
-    /// reporting to force local text selection).
+    /// 2 = up. `(x, y)` are physical px inside that pane. `button` is 0 left,
+    /// 1 middle, 2 right. `mods` is the same live bitset as `velo_key`
+    /// (bit1 = Shift; shift overrides app mouse reporting to force local
+    /// text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
-    pub unsafe extern "C" fn velo_pane_mouse(eng: *mut Engine, pane: u32, kind: u32, x: f32, y: f32, mods: u32) {
+    pub unsafe extern "C" fn velo_pane_mouse(eng: *mut Engine, pane: u32, kind: u32, x: f32, y: f32, button: u32, mods: u32) {
         if let Some(e) = eng.as_mut() {
-            e.on_mouse_pane(pane as usize, kind, x, y, mods & 2 != 0);
+            e.on_mouse_pane(pane as usize, kind, x, y, button.min(2) as u8, mods & 2 != 0);
         }
     }
 

@@ -1273,23 +1273,15 @@ public sealed partial class MainWindow : Window
         Native.velo_char(_engine, e.Character, Modifiers());
     }
 
-    private void Panel_PointerPressed(object sender, PointerRoutedEventArgs e)
-    {
-        if (_engine == IntPtr.Zero)
-            return;
-        var panel = (SwapChainPanel)sender;
-        uint id = PaneId(panel);
-        _focusedPane = (int)id;
-        PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus; keep it on the host
-        panel.CapturePointer(e.Pointer);
-        Native.velo_pane_focus(_engine, id);
-        ForwardMouse(panel, 0, e);
-    }
+    /// Pane index a press captured, so move/release during a drag keep going
+    /// to that pane even when the pointer leaves its bounds. -1 = no drag.
+    private int _mousePane = -1;
 
-    /// Click anywhere in the pane area focuses the pane under the pointer. The
-    /// SwapChainPanels composite their swapchain via DComp (no XAML brush), so they
-    /// are not hit-test-visible and their own PointerPressed never fires — without
-    /// this, clicking the terminal can't focus it and the user can't type.
+    /// All pointer input for the pane area lands on PaneHost: the SwapChainPanels
+    /// composite their swapchain via DComp (no XAML brush), so they are not
+    /// hit-test-visible and their own pointer events never fire. A press focuses
+    /// the pane under the pointer and starts forwarding mouse events to it
+    /// (selection, or SGR mouse reporting when an app enabled it).
     private void PaneHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)
@@ -1300,6 +1292,31 @@ public sealed partial class MainWindow : Window
         _focusedPane = i;
         PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
         Native.velo_pane_focus(_engine, PaneId(_panels[i]));
+        _mousePane = i;
+        PaneHost.CapturePointer(e.Pointer);
+        ForwardMouse(_panels[i], 0, e);
+    }
+
+    private void PaneHost_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        if (i < 0)
+            return;
+        ForwardMouse(_panels[i], 1, e);
+    }
+
+    private void PaneHost_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        _mousePane = -1;
+        PaneHost.ReleasePointerCapture(e.Pointer);
+        if (i < 0)
+            return;
+        ForwardMouse(_panels[i], 2, e);
     }
 
     /// Index of the visible pane under `pos` (PaneHost coordinates), or -1.
@@ -1342,25 +1359,30 @@ public sealed partial class MainWindow : Window
             (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
     }
 
-    private void Panel_PointerMoved(object sender, PointerRoutedEventArgs e)
-        => ForwardMouse((SwapChainPanel)sender, 1, e);
-
-    private void Panel_PointerReleased(object sender, PointerRoutedEventArgs e)
-    {
-        var panel = (SwapChainPanel)sender;
-        ForwardMouse(panel, 2, e);
-        panel.ReleasePointerCapture(e.Pointer);
-    }
-
     private void ForwardMouse(SwapChainPanel panel, uint kind, PointerRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)
             return;
         double sx = panel.CompositionScaleX > 0 ? panel.CompositionScaleX : _lastScale;
         double sy = panel.CompositionScaleY > 0 ? panel.CompositionScaleY : _lastScale;
-        var p = e.GetCurrentPoint(panel).Position;
-        Native.velo_pane_mouse(_engine, PaneId(panel), kind, (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
+        var pt = e.GetCurrentPoint(panel);
+        var p = pt.Position;
+        Native.velo_pane_mouse(_engine, PaneId(panel), kind,
+            (float)(p.X * sx), (float)(p.Y * sy), MouseButton(pt.Properties), Modifiers());
     }
+
+    /// SGR button code (0=left, 1=middle, 2=right) for a pointer event. Uses
+    /// PointerUpdateKind so releases (where the pressed flags are already
+    /// false) still identify the button.
+    private static uint MouseButton(Microsoft.UI.Input.PointerPointProperties p)
+        => p.PointerUpdateKind switch
+        {
+            Microsoft.UI.Input.PointerUpdateKind.MiddleButtonPressed or
+            Microsoft.UI.Input.PointerUpdateKind.MiddleButtonReleased => 1u,
+            Microsoft.UI.Input.PointerUpdateKind.RightButtonPressed or
+            Microsoft.UI.Input.PointerUpdateKind.RightButtonReleased => 2u,
+            _ => p.IsMiddleButtonPressed ? 1u : p.IsRightButtonPressed ? 2u : 0u,
+        };
 
     // ---- Tab actions ------------------------------------------------------
 

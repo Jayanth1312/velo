@@ -216,6 +216,8 @@
                   RowSpacing="1"
                   Loaded="PaneHost_Loaded"
                   PointerPressed="PaneHost_PointerPressed"
+                  PointerMoved="PaneHost_PointerMoved"
+                  PointerReleased="PaneHost_PointerReleased"
                   PointerWheelChanged="PaneHost_PointerWheelChanged">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" />
@@ -232,38 +234,26 @@
                                 SizeChanged="Panel_SizeChanged"
                                 Loaded="TerminalPanel_Loaded"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
 
                 <SwapChainPanel x:Name="TerminalPanel1"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
                                 SizeChanged="Panel_SizeChanged"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
                 <SwapChainPanel x:Name="TerminalPanel2"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
                                 SizeChanged="Panel_SizeChanged"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
                 <SwapChainPanel x:Name="TerminalPanel3"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
                                 SizeChanged="Panel_SizeChanged"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
 
                 <!-- Drop-zone overlay (a single highlight repositioned per edge). -->
                 <Grid x:Name="SplitOverlay"

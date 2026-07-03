@@ -56,10 +56,11 @@ internal static unsafe partial class Native
     internal static partial void velo_char(IntPtr eng, uint cu, uint mods);
 
     /// Forward a pointer event. kind 0=down,1=move,2=up; (x,y) physical px.
-    /// mods is the velo_key bitset (bit1 = Shift; shift forces local selection
-    /// even when the app has enabled mouse reporting).
+    /// button: 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
+    /// Shift; shift forces local selection even when the app has enabled
+    /// mouse reporting).
     [LibraryImport(Core)]
-    internal static partial void velo_mouse(IntPtr eng, uint kind, float x, float y, uint mods);
+    internal static partial void velo_mouse(IntPtr eng, uint kind, float x, float y, uint button, uint mods);
 
     [LibraryImport(Core)]
     internal static partial void velo_set_callbacks(IntPtr eng, VeloCallbacks cb);
@@ -90,10 +91,11 @@ internal static unsafe partial class Native
     internal static partial void velo_pane_resize(IntPtr eng, uint pane, uint w, uint h);
 
     /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up.
-    /// mods is the velo_key bitset (bit1 = Shift; shift forces local selection
-    /// even when the app has enabled mouse reporting).
+    /// button: 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
+    /// Shift; shift forces local selection even when the app has enabled
+    /// mouse reporting).
     [LibraryImport(Core)]
-    internal static partial void velo_pane_mouse(IntPtr eng, uint pane, uint kind, float x, float y, uint mods);
+    internal static partial void velo_pane_mouse(IntPtr eng, uint pane, uint kind, float x, float y, uint button, uint mods);
 
     /// Make `pane` the keyboard-focused pane.
     [LibraryImport(Core)]
