@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use term_core::{palette, CursorShape, Frame, FrameDamage};
+use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell};
 
 const ATLAS_SIZE: u32 = 2048;
 /// Instances per cell: 0 = background/selection/cursor-block fill, 1 = glyph,
@@ -112,6 +112,38 @@ fn srgb_to_linear(s: f64) -> f64 {
     } else {
         ((s + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Per-row `[start, end)` ranges into a row-major-sorted `cells` slice, one
+/// pass, indexed by row number. Rows with no cells get an empty `(i, i)`
+/// range. `cells` must already be sorted by `row` ascending (true of
+/// [`Frame::cells`], which comes from alacritty's row-ordered
+/// `renderable_content`).
+fn row_ranges(cells: &[RenderCell], rows: u16) -> Vec<(usize, usize)> {
+    let mut ranges = vec![(0usize, 0usize); rows as usize];
+    let mut current_row: u16 = 0;
+    let mut i = 0;
+    while i < cells.len() {
+        let row = cells[i].row;
+        if row as usize >= rows as usize {
+            break;
+        }
+        while current_row < row {
+            ranges[current_row as usize] = (i, i);
+            current_row += 1;
+        }
+        let start = i;
+        while i < cells.len() && cells[i].row == row {
+            i += 1;
+        }
+        ranges[row as usize] = (start, i);
+        current_row = row + 1;
+    }
+    while (current_row as usize) < rows as usize {
+        ranges[current_row as usize] = (cells.len(), cells.len());
+        current_row += 1;
+    }
+    ranges
 }
 
 impl Renderer {
@@ -441,14 +473,15 @@ impl Renderer {
         }
     }
 
-    /// Rebuild every slot of `row` from the cells belonging to it (and the
-    /// cursor, if it sits on this row).
+    /// Rebuild every slot of `row` from `cells` (just this row's slice, per
+    /// `row_ranges`) and the cursor, if it sits on this row.
     fn rebuild_row(
         &mut self,
         queue: &wgpu::Queue,
         font: &mut text::Font,
         frame: &Frame,
         row: u16,
+        cells: &[RenderCell],
     ) {
         // Clear the row's slots.
         let start = self.slot_base(row, 0);
@@ -459,7 +492,7 @@ impl Renderer {
 
         let cursor_here = frame.cursor_shape != CursorShape::Hidden && frame.cursor_row == row;
 
-        for cell in frame.cells.iter().filter(|c| c.row == row) {
+        for cell in cells {
             if cell.col >= self.grid_cols {
                 continue;
             }
@@ -501,12 +534,19 @@ impl Renderer {
         }
 
         if cursor_here {
-            self.apply_cursor(queue, font, frame);
+            self.apply_cursor(queue, font, frame, cells);
         }
     }
 
     /// Write the cursor into its cell's slots (already-cleared/rebuilt row).
-    fn apply_cursor(&mut self, queue: &wgpu::Queue, font: &mut text::Font, frame: &Frame) {
+    /// `row_cells` is the cursor row's slice (from `row_ranges`).
+    fn apply_cursor(
+        &mut self,
+        queue: &wgpu::Queue,
+        font: &mut text::Font,
+        frame: &Frame,
+        row_cells: &[RenderCell],
+    ) {
         let col = frame.cursor_col;
         let row = frame.cursor_row;
         if col >= self.grid_cols || row >= self.grid_rows {
@@ -516,11 +556,7 @@ impl Renderer {
         let x = self.pad_x + col as f32 * self.cell_w;
         let y = self.pad_y + row as f32 * self.cell_h;
         let cursor_color = palette::cursor();
-        let cell = frame
-            .cells
-            .iter()
-            .find(|c| c.row == row && c.col == col)
-            .copied();
+        let cell = row_cells.iter().find(|c| c.col == col).copied();
 
         match frame.cursor_shape {
             CursorShape::Block => {
@@ -609,8 +645,10 @@ impl Renderer {
             Vec::new()
         };
 
+        let ranges = row_ranges(&frame.cells, self.grid_rows);
         for &row in &dirty {
-            self.rebuild_row(queue, font, frame, row);
+            let (start, end) = ranges[row as usize];
+            self.rebuild_row(queue, font, frame, row, &frame.cells[start..end]);
         }
 
         // Upload only dirty rows, coalescing contiguous runs into one write.
@@ -754,3 +792,55 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s2l(in.color.rgb) * a, a);
 }
 "#;
+
+#[cfg(test)]
+mod row_ranges_tests {
+    use super::*;
+
+    fn cell(row: u16, col: u16) -> RenderCell {
+        RenderCell {
+            col,
+            row,
+            c: 'x',
+            fg: [0, 0, 0],
+            bg: [0, 0, 0],
+            bold: false,
+            italic: false,
+            underline: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_all_empty_ranges() {
+        let ranges = row_ranges(&[], 3);
+        assert_eq!(ranges, vec![(0, 0), (0, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn rows_with_cells_and_empty_rows_mixed() {
+        // Row 0: 2 cells, row 1: none, row 2: 1 cell.
+        let cells = vec![cell(0, 0), cell(0, 1), cell(2, 0)];
+        let ranges = row_ranges(&cells, 3);
+        assert_eq!(ranges, vec![(0, 2), (2, 2), (2, 3)]);
+        assert!(ranges[1].0 == ranges[1].1);
+    }
+
+    #[test]
+    fn all_rows_populated() {
+        let cells = vec![cell(0, 0), cell(1, 0), cell(1, 1), cell(2, 0)];
+        let ranges = row_ranges(&cells, 3);
+        assert_eq!(ranges, vec![(0, 1), (1, 3), (3, 4)]);
+        for (start, end) in &ranges {
+            assert!(start <= end);
+        }
+    }
+
+    #[test]
+    fn trailing_rows_beyond_last_cell_are_empty() {
+        let cells = vec![cell(0, 0)];
+        let ranges = row_ranges(&cells, 4);
+        assert_eq!(ranges, vec![(0, 1), (1, 1), (1, 1), (1, 1)]);
+    }
+}
+
