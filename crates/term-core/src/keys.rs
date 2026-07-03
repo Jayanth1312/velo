@@ -84,6 +84,17 @@ pub fn key_seq(vk: u16, ctrl: bool, shift: bool, alt: bool, app_cursor: bool) ->
     })
 }
 
+/// Encode a mouse event as an SGR (1006) mouse-report sequence:
+/// `CSI < b ; col ; row M` on press/motion, `CSI < b ; col ; row m` on release.
+/// `col`/`row` are 1-based (viewport cell coordinates + 1). `button` follows
+/// xterm's SGR encoding: 0=left, 1=middle, 2=right; callers add 32 for a
+/// motion event (button held or motion-tracking) and use 64/65 for wheel
+/// up/down (always sent with `pressed = true` — wheel events have no release).
+pub fn sgr_mouse_seq(button: u8, col: u16, row: u16, pressed: bool) -> Vec<u8> {
+    let suffix = if pressed { 'M' } else { 'm' };
+    format!("\x1b[<{button};{col};{row}{suffix}").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +202,37 @@ mod tests {
         assert_eq!(mod_param(false, true, false), 2);
         assert_eq!(mod_param(false, false, true), 3);
         assert_eq!(mod_param(true, true, true), 8);
+    }
+
+    #[test]
+    fn sgr_mouse_left_press() {
+        assert_eq!(sgr_mouse_seq(0, 1, 1, true), b"\x1b[<0;1;1M".to_vec());
+    }
+
+    #[test]
+    fn sgr_mouse_left_release() {
+        assert_eq!(sgr_mouse_seq(0, 1, 1, false), b"\x1b[<0;1;1m".to_vec());
+    }
+
+    #[test]
+    fn sgr_mouse_coords_are_one_based() {
+        // Grid cell (col=9, row=23) 0-based -> reported as 10;24.
+        assert_eq!(sgr_mouse_seq(0, 10, 24, true), b"\x1b[<0;10;24M".to_vec());
+    }
+
+    #[test]
+    fn sgr_mouse_motion_adds_32() {
+        // Left-button drag: button 0 + 32 motion flag = 32.
+        assert_eq!(sgr_mouse_seq(0 + 32, 5, 5, true), b"\x1b[<32;5;5M".to_vec());
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_up() {
+        assert_eq!(sgr_mouse_seq(64, 3, 4, true), b"\x1b[<64;3;4M".to_vec());
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_down() {
+        assert_eq!(sgr_mouse_seq(65, 3, 4, true), b"\x1b[<65;3;4M".to_vec());
     }
 }

@@ -90,6 +90,11 @@ mod imp {
     /// Sentinel for "this pane shows no session".
     const NO_SESSION: usize = usize::MAX;
 
+    /// Lines-per-wheel-notch the C# side scales `delta_lines` by (matches
+    /// `PaneHost_PointerWheelChanged`'s `delta * 3 / 120`). Used to convert a
+    /// `delta_lines` batch back into one SGR wheel event per physical notch.
+    const NOTCH_LINES: i32 = 3;
+
     /// Function pointers the Rust core calls to notify the C# shell. All optional;
     /// `ctx` is the C# side's opaque handle (passed back unchanged). Invoked only
     /// on the UI thread (inside the subclass proc), never from a PTY reader thread.
@@ -1077,9 +1082,13 @@ mod imp {
         }
 
         /// Pointer events for pane `idx`. `kind`: 0 = down, 1 = move, 2 = up.
-        /// `(x, y)` are physical px inside that pane. Drives text selection; XAML
-        /// owns pointer capture + focus.
-        fn on_mouse_pane(&mut self, idx: usize, kind: u32, x: f32, y: f32) {
+        /// `(x, y)` are physical px inside that pane. `shift`: shift key held,
+        /// the user's override to force local text selection even when the app
+        /// has enabled mouse reporting. When the session's terminal reports
+        /// mouse mode active and shift is not held, pointer events are encoded
+        /// as SGR (1006) sequences and written to the PTY instead of driving
+        /// selection; XAML owns pointer capture + focus either way.
+        fn on_mouse_pane(&mut self, idx: usize, kind: u32, x: f32, y: f32, shift: bool) {
             let (cols, rows) = match self.pane_cols_rows(idx) {
                 Some(cr) => cr,
                 None => return,
@@ -1091,6 +1100,45 @@ mod imp {
             if sid == NO_SESSION {
                 return;
             }
+
+            let mouse_mode = self
+                .sessions
+                .get(sid)
+                .and_then(|o| o.as_ref())
+                .map(|s| s.terminal.mouse_mode());
+            if let Some(mm) = mouse_mode {
+                if mm.reporting && !shift {
+                    let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                    let col = c + 1;
+                    let row = r + 1;
+                    match kind {
+                        0 => {
+                            self.mouse_down = true;
+                            let seq = term_core::keys::sgr_mouse_seq(0, col, row, true);
+                            if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                                let _ = s.pty.writer().write_all(&seq);
+                            }
+                        }
+                        1 => {
+                            if mm.motion || (mm.drag && self.mouse_down) {
+                                let seq = term_core::keys::sgr_mouse_seq(0 + 32, col, row, true);
+                                if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                                    let _ = s.pty.writer().write_all(&seq);
+                                }
+                            }
+                        }
+                        _ => {
+                            self.mouse_down = false;
+                            let seq = term_core::keys::sgr_mouse_seq(0, col, row, false);
+                            if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                                let _ = s.pty.writer().write_all(&seq);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+
             match kind {
                 0 => {
                     let (c, r, l) = self.pixel_to_cell(x, y, cols, rows);
@@ -1158,10 +1206,15 @@ mod imp {
             }
         }
 
-        /// Mouse wheel over pane `idx`. When the session's alt screen is active
-        /// (e.g. vim, less — no scrollback there), translate the wheel into
-        /// arrow-key sequences instead; otherwise scroll the pane's scrollback.
-        fn pane_scroll(&mut self, idx: usize, delta_lines: i32) {
+        /// Mouse wheel over pane `idx`. `(x, y)` are physical px inside the pane
+        /// (used to place the SGR wheel event when mouse reporting is active).
+        /// `shift`: shift key held, the user's override to force scrollback/
+        /// arrow-key behavior even when the app has enabled mouse reporting.
+        /// Priority: (1) app mouse reporting (not shift) sends SGR wheel button
+        /// 64/65, one event per notch; (2) alt screen (e.g. vim, less — no
+        /// scrollback there) translates the wheel into arrow-key sequences;
+        /// (3) otherwise scroll the pane's scrollback.
+        fn pane_scroll(&mut self, idx: usize, delta_lines: i32, x: f32, y: f32, shift: bool) {
             let sid = match self.panes.get(idx) {
                 Some(Some(p)) => p.session,
                 _ => return,
@@ -1169,6 +1222,34 @@ mod imp {
             if sid == NO_SESSION || delta_lines == 0 {
                 return;
             }
+
+            let mouse_mode = self
+                .sessions
+                .get(sid)
+                .and_then(|o| o.as_ref())
+                .map(|s| s.terminal.mouse_mode());
+            if let Some(mm) = mouse_mode {
+                if mm.reporting && !shift {
+                    if let Some((cols, rows)) = self.pane_cols_rows(idx) {
+                        let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                        let col = c + 1;
+                        let row = r + 1;
+                        // `delta_lines` carries the caller's lines-per-notch scale
+                        // (3); one wheel event per notch, not per line.
+                        let notches = (delta_lines.unsigned_abs() / NOTCH_LINES as u32).max(1);
+                        let button = if delta_lines > 0 { 64 } else { 65 };
+                        let seq = term_core::keys::sgr_mouse_seq(button, col, row, true);
+                        if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                            let w = s.pty.writer();
+                            for _ in 0..notches {
+                                let _ = w.write_all(&seq);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+
             let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) else {
                 return;
             };
@@ -1462,15 +1543,17 @@ mod imp {
     }
 
     /// Forward a pointer event to the focused pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside the panel.
+    /// 2 = up. `(x, y)` are physical px inside the panel. `mods` is the same
+    /// live bitset as `velo_key` (bit1 = Shift; shift overrides app mouse
+    /// reporting to force local text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
-    pub unsafe extern "C" fn velo_mouse(eng: *mut Engine, kind: u32, x: f32, y: f32) {
+    pub unsafe extern "C" fn velo_mouse(eng: *mut Engine, kind: u32, x: f32, y: f32, mods: u32) {
         if let Some(e) = eng.as_mut() {
             let idx = e.focused_pane;
-            e.on_mouse_pane(idx, kind, x, y);
+            e.on_mouse_pane(idx, kind, x, y, mods & 2 != 0);
         }
     }
 
@@ -1573,28 +1656,41 @@ mod imp {
     }
 
     /// Forward a pointer event to a specific pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside that pane.
+    /// 2 = up. `(x, y)` are physical px inside that pane. `mods` is the same
+    /// live bitset as `velo_key` (bit1 = Shift; shift overrides app mouse
+    /// reporting to force local text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
-    pub unsafe extern "C" fn velo_pane_mouse(eng: *mut Engine, pane: u32, kind: u32, x: f32, y: f32) {
+    pub unsafe extern "C" fn velo_pane_mouse(eng: *mut Engine, pane: u32, kind: u32, x: f32, y: f32, mods: u32) {
         if let Some(e) = eng.as_mut() {
-            e.on_mouse_pane(pane as usize, kind, x, y);
+            e.on_mouse_pane(pane as usize, kind, x, y, mods & 2 != 0);
         }
     }
 
     /// Mouse wheel over pane `pane`. `delta_lines` is signed lines-to-scroll
     /// (positive = up/toward history, negative = down/toward the present).
-    /// When the pane's session has its alt screen active (vim, less, ...),
-    /// this is translated into arrow-key presses instead of scrollback.
+    /// `(x, y)` are physical px inside the pane (used to place the SGR wheel
+    /// event when mouse reporting is active). `mods` is the same live bitset
+    /// as `velo_key` (bit1 = Shift; shift overrides app mouse reporting). When
+    /// the pane's session has mouse reporting enabled (and shift is not
+    /// held), this sends SGR wheel button 64/65 instead; otherwise it falls
+    /// back to scrollback, or (alt screen active) arrow-key translation.
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
-    pub unsafe extern "C" fn velo_pane_scroll(eng: *mut Engine, pane: u32, delta_lines: i32) {
+    pub unsafe extern "C" fn velo_pane_scroll(
+        eng: *mut Engine,
+        pane: u32,
+        delta_lines: i32,
+        x: f32,
+        y: f32,
+        mods: u32,
+    ) {
         if let Some(e) = eng.as_mut() {
-            e.pane_scroll(pane as usize, delta_lines);
+            e.pane_scroll(pane as usize, delta_lines, x, y, mods & 2 != 0);
         }
     }
 

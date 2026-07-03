@@ -1334,7 +1334,12 @@ public sealed partial class MainWindow : Window
         int lines = delta * 3 / 120;
         if (lines == 0)
             return;
-        Native.velo_pane_scroll(_engine, PaneId(_panels[i]), lines);
+        var panel = _panels[i];
+        double sx = panel.CompositionScaleX > 0 ? panel.CompositionScaleX : _lastScale;
+        double sy = panel.CompositionScaleY > 0 ? panel.CompositionScaleY : _lastScale;
+        var p = e.GetCurrentPoint(panel).Position;
+        Native.velo_pane_scroll(_engine, PaneId(panel), lines,
+            (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
     }
 
     private void Panel_PointerMoved(object sender, PointerRoutedEventArgs e)
@@ -1354,7 +1359,7 @@ public sealed partial class MainWindow : Window
         double sx = panel.CompositionScaleX > 0 ? panel.CompositionScaleX : _lastScale;
         double sy = panel.CompositionScaleY > 0 ? panel.CompositionScaleY : _lastScale;
         var p = e.GetCurrentPoint(panel).Position;
-        Native.velo_pane_mouse(_engine, PaneId(panel), kind, (float)(p.X * sx), (float)(p.Y * sy));
+        Native.velo_pane_mouse(_engine, PaneId(panel), kind, (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
     }
 
     // ---- Tab actions ------------------------------------------------------

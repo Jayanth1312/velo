@@ -186,6 +186,18 @@ fn parse_osc7(rest: &[u8]) -> Option<String> {
     }
 }
 
+/// Snapshot of the app-controlled mouse-reporting DECSET bits. `reporting` is
+/// true when any report mode (click/drag/motion) is on; `motion`/`drag` say
+/// which move events to forward; `sgr` says whether the app asked for SGR
+/// (1006) extended coordinates (col/row > 223) as opposed to legacy X10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseMode {
+    pub reporting: bool,
+    pub motion: bool,
+    pub drag: bool,
+    pub sgr: bool,
+}
+
 pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
@@ -375,6 +387,21 @@ impl Terminal {
     /// host must wrap pasted text in `ESC[200~` / `ESC[201~`.
     pub fn bracketed_paste(&self) -> bool {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Which mouse-reporting modes the app has enabled via DECSET, so the host
+    /// knows whether raw pointer events should be encoded to the PTY (SGR 1006)
+    /// instead of driving local text selection.
+    pub fn mouse_mode(&self) -> MouseMode {
+        let mode = self.term.mode();
+        MouseMode {
+            reporting: mode.intersects(
+                TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+            ),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            drag: mode.contains(TermMode::MOUSE_DRAG),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+        }
     }
 
     /// Map a viewport (col, row) to a grid point. When scrolled back into

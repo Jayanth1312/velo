@@ -56,8 +56,10 @@ internal static unsafe partial class Native
     internal static partial void velo_char(IntPtr eng, uint cu, uint mods);
 
     /// Forward a pointer event. kind 0=down,1=move,2=up; (x,y) physical px.
+    /// mods is the velo_key bitset (bit1 = Shift; shift forces local selection
+    /// even when the app has enabled mouse reporting).
     [LibraryImport(Core)]
-    internal static partial void velo_mouse(IntPtr eng, uint kind, float x, float y);
+    internal static partial void velo_mouse(IntPtr eng, uint kind, float x, float y, uint mods);
 
     [LibraryImport(Core)]
     internal static partial void velo_set_callbacks(IntPtr eng, VeloCallbacks cb);
@@ -88,18 +90,22 @@ internal static unsafe partial class Native
     internal static partial void velo_pane_resize(IntPtr eng, uint pane, uint w, uint h);
 
     /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up.
+    /// mods is the velo_key bitset (bit1 = Shift; shift forces local selection
+    /// even when the app has enabled mouse reporting).
     [LibraryImport(Core)]
-    internal static partial void velo_pane_mouse(IntPtr eng, uint pane, uint kind, float x, float y);
+    internal static partial void velo_pane_mouse(IntPtr eng, uint pane, uint kind, float x, float y, uint mods);
 
     /// Make `pane` the keyboard-focused pane.
     [LibraryImport(Core)]
     internal static partial void velo_pane_focus(IntPtr eng, uint pane);
 
     /// Mouse wheel over `pane`. deltaLines is signed (positive = up/history,
-    /// negative = down/present). Translated to arrow keys when the pane's
-    /// session has its alt screen active (vim, less, ...).
+    /// negative = down/present). (x,y) are physical px inside the pane (places
+    /// the SGR wheel event when the app has mouse reporting on); mods is the
+    /// velo_key bitset (bit1 = Shift overrides mouse reporting). Falls back to
+    /// arrow keys on the alt screen (vim, less, ...) or scrollback otherwise.
     [LibraryImport(Core)]
-    internal static partial void velo_pane_scroll(IntPtr eng, uint pane, int deltaLines);
+    internal static partial void velo_pane_scroll(IntPtr eng, uint pane, int deltaLines, float x, float y, uint mods);
 
     /// Destroy `pane` (pane 0 cannot be destroyed); its tab survives.
     [LibraryImport(Core)]
