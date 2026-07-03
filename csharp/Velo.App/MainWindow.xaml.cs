@@ -1270,7 +1270,7 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         Native.velo_pane_focus(_engine, PaneId(sender)); // route to the focused pane
-        Native.velo_char(_engine, e.Character);
+        Native.velo_char(_engine, e.Character, Modifiers());
     }
 
     private void Panel_PointerPressed(object sender, PointerRoutedEventArgs e)

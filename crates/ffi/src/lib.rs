@@ -147,10 +147,6 @@ mod imp {
         wakeup_pending: Arc<std::sync::atomic::AtomicBool>,
         /// Live tab label (from OSC title), to debounce title callbacks.
         tab_title: String,
-        /// Set by `on_key` when Alt is held (without Ctrl) for a key that will
-        /// arrive as a char next; `on_char` prefixes the char with `ESC` and
-        /// clears it. Cleared on any other key event so it can't go stale.
-        pending_alt: bool,
     }
 
     /// Double-buffered flip swapchain.
@@ -817,7 +813,6 @@ mod imp {
                 inbox,
                 wakeup_pending,
                 tab_title: "PowerShell".to_string(),
-                pending_alt: false,
             });
             if id == self.sessions.len() {
                 self.sessions.push(Some(session));
@@ -957,13 +952,6 @@ mod imp {
         /// (copy/paste, nav keys) are handled here. `ctrl`/`shift`/`alt` are the
         /// live modifier states C# reads from the keyboard source.
         fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
-            // Cleared unconditionally on every key event; the one path that
-            // wants it set (Alt+printable falling through to on_char) re-sets
-            // it below, right before returning. Keeps the flag from going
-            // stale across unrelated keystrokes.
-            if let Some(s) = self.active_session() {
-                s.pending_alt = false;
-            }
             if ctrl && shift {
                 match vk {
                     0x54 => {
@@ -1043,30 +1031,21 @@ mod imp {
                 }
             }
 
-            // Not a nav/F-key: if Alt is held (without Ctrl), the key will
-            // arrive next as a WM_CHAR; flag it so `on_char` prefixes the
-            // UTF-8 bytes with ESC (the classic "meta" encoding).
-            if alt && !ctrl {
-                if let Some(s) = self.active_session() {
-                    s.pending_alt = true;
-                }
-            }
             false
         }
 
         /// Text + control chars -> focused PTY (UTF-16 -> UTF-8, surrogate-aware).
-        /// When `on_key` flagged Alt held for this key (`pending_alt`), the
-        /// bytes are prefixed with `ESC` (classic Alt/meta encoding) and the
-        /// flag is consumed.
-        fn on_char(&mut self, cu: u16) {
+        /// `alt` is the live Alt-without-Ctrl state C# reads at char time; when
+        /// set, the bytes are prefixed with `ESC` (classic Alt/meta encoding).
+        /// Live state (not a flag carried over from `on_key`) so a swallowed
+        /// WM_CHAR or IME commit can never inherit a stale prefix.
+        fn on_char(&mut self, cu: u16, alt: bool) {
             if self.swallow_next_char {
                 self.swallow_next_char = false;
                 return;
             }
             if cu == 0x08 {
                 if let Some(s) = self.active_session() {
-                    let alt = s.pending_alt;
-                    s.pending_alt = false;
                     s.terminal.scroll_to_bottom();
                     let w = s.pty.writer();
                     if alt {
@@ -1088,8 +1067,6 @@ mod imp {
             };
             let s = String::from_utf16_lossy(&units);
             if let Some(sess) = self.active_session() {
-                let alt = sess.pending_alt;
-                sess.pending_alt = false;
                 sess.terminal.scroll_to_bottom();
                 let w = sess.pty.writer();
                 if alt {
@@ -1471,13 +1448,16 @@ mod imp {
     }
 
     /// Forward a received character (one UTF-16 code unit, surrogate-aware).
+    /// `mods` is the same live bitset as `velo_key` (bit0 = Ctrl, bit2 = Alt),
+    /// read at char time; Alt-without-Ctrl gets the ESC/meta prefix (the Ctrl
+    /// exclusion keeps AltGr layouts clean).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
     #[no_mangle]
-    pub unsafe extern "C" fn velo_char(eng: *mut Engine, cu: u32) {
+    pub unsafe extern "C" fn velo_char(eng: *mut Engine, cu: u32, mods: u32) {
         if let Some(e) = eng.as_mut() {
-            e.on_char(cu as u16);
+            e.on_char(cu as u16, mods & 4 != 0 && mods & 1 == 0);
         }
     }
 

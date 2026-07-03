@@ -50,9 +50,10 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial byte velo_key(IntPtr eng, uint vk, uint mods);
 
-    /// Forward a received character (one UTF-16 code unit).
+    /// Forward a received character (one UTF-16 code unit). mods is the same
+    /// live modifier bitset as velo_key (bit0=Ctrl, bit1=Shift, bit2=Alt).
     [LibraryImport(Core)]
-    internal static partial void velo_char(IntPtr eng, uint cu);
+    internal static partial void velo_char(IntPtr eng, uint cu, uint mods);
 
     /// Forward a pointer event. kind 0=down,1=move,2=up; (x,y) physical px.
     [LibraryImport(Core)]
