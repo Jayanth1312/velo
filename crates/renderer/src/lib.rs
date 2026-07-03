@@ -645,7 +645,12 @@ impl Renderer {
             Vec::new()
         };
 
-        let ranges = row_ranges(&frame.cells, self.grid_rows);
+        // Skip the range pass entirely on no-damage frames.
+        let ranges = if dirty.is_empty() {
+            Vec::new()
+        } else {
+            row_ranges(&frame.cells, self.grid_rows)
+        };
         for &row in &dirty {
             let (start, end) = ranges[row as usize];
             self.rebuild_row(queue, font, frame, row, &frame.cells[start..end]);
