@@ -1329,7 +1329,9 @@ public sealed partial class MainWindow : Window
         if (i < 0)
             return;
         int delta = e.GetCurrentPoint(PaneHost).Properties.MouseWheelDelta;
-        int lines = delta / 120 * 3;
+        // Multiply first: precision touchpads report sub-120 deltas that
+        // delta/120*3 would truncate to zero.
+        int lines = delta * 3 / 120;
         if (lines == 0)
             return;
         Native.velo_pane_scroll(_engine, PaneId(_panels[i]), lines);
