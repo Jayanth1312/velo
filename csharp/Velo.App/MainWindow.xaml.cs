@@ -1294,7 +1294,17 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
-        var pos = e.GetCurrentPoint(PaneHost).Position;
+        int i = PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        if (i < 0)
+            return;
+        _focusedPane = i;
+        PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
+        Native.velo_pane_focus(_engine, PaneId(_panels[i]));
+    }
+
+    /// Index of the visible pane under `pos` (PaneHost coordinates), or -1.
+    private int PaneAt(Windows.Foundation.Point pos)
+    {
         for (int i = 0; i < _paneCount && i < _panels.Length; i++)
         {
             var p = _panels[i];
@@ -1303,13 +1313,26 @@ public sealed partial class MainWindow : Window
             var r = p.TransformToVisual(PaneHost)
                      .TransformBounds(new Windows.Foundation.Rect(0, 0, p.ActualWidth, p.ActualHeight));
             if (pos.X >= r.X && pos.X <= r.X + r.Width && pos.Y >= r.Y && pos.Y <= r.Y + r.Height)
-            {
-                _focusedPane = i;
-                PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
-                Native.velo_pane_focus(_engine, PaneId(p));
-                break;
-            }
+                return i;
         }
+        return -1;
+    }
+
+    /// Wheel over the pane area. Handled on PaneHost, not the SwapChainPanels —
+    /// like PointerPressed above, the panels are not hit-test-visible, so their
+    /// own wheel events never fire.
+    private void PaneHost_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        int i = PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        if (i < 0)
+            return;
+        int delta = e.GetCurrentPoint(PaneHost).Properties.MouseWheelDelta;
+        int lines = delta / 120 * 3;
+        if (lines == 0)
+            return;
+        Native.velo_pane_scroll(_engine, PaneId(_panels[i]), lines);
     }
 
     private void Panel_PointerMoved(object sender, PointerRoutedEventArgs e)
@@ -1320,20 +1343,6 @@ public sealed partial class MainWindow : Window
         var panel = (SwapChainPanel)sender;
         ForwardMouse(panel, 2, e);
         panel.ReleasePointerCapture(e.Pointer);
-    }
-
-    /// Mouse wheel over a pane: scroll its scrollback (or, in the alt screen,
-    /// send arrow keys) by 3 lines per notch (WinUI reports 120 units/notch).
-    private void Panel_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
-    {
-        if (_engine == IntPtr.Zero)
-            return;
-        var panel = (SwapChainPanel)sender;
-        int delta = e.GetCurrentPoint(panel).Properties.MouseWheelDelta;
-        int lines = delta / 120 * 3;
-        if (lines == 0)
-            return;
-        Native.velo_pane_scroll(_engine, PaneId(panel), lines);
     }
 
     private void ForwardMouse(SwapChainPanel panel, uint kind, PointerRoutedEventArgs e)
