@@ -1006,6 +1006,7 @@ mod imp {
 
             if let Some(seq) = nav_seq(vk) {
                 if let Some(s) = self.active_session() {
+                    s.terminal.scroll_to_bottom();
                     let _ = s.pty.writer().write_all(seq);
                 }
                 return true;
@@ -1021,6 +1022,7 @@ mod imp {
             }
             if cu == 0x08 {
                 if let Some(s) = self.active_session() {
+                    s.terminal.scroll_to_bottom();
                     let _ = s.pty.writer().write_all(b"\x7f");
                 }
                 return;
@@ -1037,6 +1039,7 @@ mod imp {
             };
             let s = String::from_utf16_lossy(&units);
             if let Some(sess) = self.active_session() {
+                sess.terminal.scroll_to_bottom();
                 let _ = sess.pty.writer().write_all(s.as_bytes());
             }
         }
@@ -1090,6 +1093,7 @@ mod imp {
             }
             let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
             if let Some(s) = self.active_session() {
+                s.terminal.scroll_to_bottom();
                 let bracketed = s.terminal.bracketed_paste();
                 let w = s.pty.writer();
                 if bracketed {
@@ -1109,6 +1113,7 @@ mod imp {
             }
             let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
             if let Some(s) = self.active_session() {
+                s.terminal.scroll_to_bottom();
                 let bracketed = s.terminal.bracketed_paste();
                 let w = s.pty.writer();
                 if bracketed {
@@ -1118,6 +1123,37 @@ mod imp {
                 if bracketed {
                     let _ = w.write_all(b"\x1b[201~");
                 }
+            }
+        }
+
+        /// Mouse wheel over pane `idx`. When the session's alt screen is active
+        /// (e.g. vim, less — no scrollback there), translate the wheel into
+        /// arrow-key sequences instead; otherwise scroll the pane's scrollback.
+        fn pane_scroll(&mut self, idx: usize, delta_lines: i32) {
+            let sid = match self.panes.get(idx) {
+                Some(Some(p)) => p.session,
+                _ => return,
+            };
+            if sid == NO_SESSION || delta_lines == 0 {
+                return;
+            }
+            let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) else {
+                return;
+            };
+            if s.terminal.alt_screen_active() {
+                // `delta_lines` already carries the caller's lines-per-notch
+                // scale (3, matching the non-alt-screen scroll amount); one
+                // arrow key per line keeps wheel "speed" consistent between
+                // the two modes.
+                let seq: &[u8] = if delta_lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                let mut bytes = Vec::with_capacity(seq.len() * delta_lines.unsigned_abs() as usize);
+                for _ in 0..delta_lines.unsigned_abs() {
+                    bytes.extend_from_slice(seq);
+                }
+                let _ = s.pty.writer().write_all(&bytes);
+            } else {
+                s.terminal.scroll_display(delta_lines);
+                self.render_pane(idx);
             }
         }
 
@@ -1538,6 +1574,20 @@ mod imp {
     pub unsafe extern "C" fn velo_pane_mouse(eng: *mut Engine, pane: u32, kind: u32, x: f32, y: f32) {
         if let Some(e) = eng.as_mut() {
             e.on_mouse_pane(pane as usize, kind, x, y);
+        }
+    }
+
+    /// Mouse wheel over pane `pane`. `delta_lines` is signed lines-to-scroll
+    /// (positive = up/toward history, negative = down/toward the present).
+    /// When the pane's session has its alt screen active (vim, less, ...),
+    /// this is translated into arrow-key presses instead of scrollback.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_pane_scroll(eng: *mut Engine, pane: u32, delta_lines: i32) {
+        if let Some(e) = eng.as_mut() {
+            e.pane_scroll(pane as usize, delta_lines);
         }
     }
 

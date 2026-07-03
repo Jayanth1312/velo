@@ -1322,6 +1322,20 @@ public sealed partial class MainWindow : Window
         panel.ReleasePointerCapture(e.Pointer);
     }
 
+    /// Mouse wheel over a pane: scroll its scrollback (or, in the alt screen,
+    /// send arrow keys) by 3 lines per notch (WinUI reports 120 units/notch).
+    private void Panel_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        var panel = (SwapChainPanel)sender;
+        int delta = e.GetCurrentPoint(panel).Properties.MouseWheelDelta;
+        int lines = delta / 120 * 3;
+        if (lines == 0)
+            return;
+        Native.velo_pane_scroll(_engine, PaneId(panel), lines);
+    }
+
     private void ForwardMouse(SwapChainPanel panel, uint kind, PointerRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)

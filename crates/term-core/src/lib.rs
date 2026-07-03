@@ -7,7 +7,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
@@ -17,8 +17,9 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape as AnsiCursorShape, Proce
 pub mod palette;
 
 /// Grid dimensions passed to alacritty's `Term`. `TermSize` lives in a test-only
-/// submodule upstream, so we supply our own `Dimensions` impl (no scrollback:
-/// total_lines == screen_lines).
+/// submodule upstream, so we supply our own `Dimensions` impl. Scrollback
+/// history is separately sized via `Config::scrolling_history`; alacritty's
+/// grid tracks total_lines (screen + history) internally.
 struct WinSize {
     columns: usize,
     screen_lines: usize,
@@ -190,6 +191,9 @@ pub struct Terminal {
     /// Last selection range observed; a change forces a full redraw since
     /// alacritty's damage tracking deliberately excludes selection.
     last_selection: Option<SelectionRange>,
+    /// Last display offset observed; a change (scrollback) forces a full
+    /// redraw since viewport row->grid line mapping shifts entirely.
+    last_display_offset: usize,
     /// Latest OSC window title (shared with the `EventProxy`; `None` = default).
     title: Arc<Mutex<Option<String>>>,
     /// Shell-integration scanner + decoded-event queue (drained by the host).
@@ -205,8 +209,12 @@ impl Terminal {
             screen_lines: rows.max(1) as usize,
         };
         let title = Arc::new(Mutex::new(None));
+        let config = Config {
+            scrolling_history: 10_000,
+            ..Config::default()
+        };
         let term = Term::new(
-            Config::default(),
+            config,
             &size,
             EventProxy {
                 on_write,
@@ -217,6 +225,7 @@ impl Terminal {
             term,
             parser: Processor::new(),
             last_selection: None,
+            last_display_offset: 0,
             title,
             osc: OscTee::default(),
             pending_shell: Vec::new(),
@@ -322,6 +331,33 @@ impl Terminal {
         self.term.selection = None;
     }
 
+    /// Scroll the viewport into scrollback history by `delta_lines` (positive
+    /// = toward history / up, negative = toward the present / down).
+    pub fn scroll_display(&mut self, delta_lines: i32) {
+        self.term.scroll_display(Scroll::Delta(delta_lines));
+    }
+
+    /// How many lines the viewport is currently scrolled back into history
+    /// (0 = viewport shows the live bottom of the screen).
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Snap the viewport back to the live bottom of the screen. Alacritty
+    /// doesn't do this automatically for bytes written straight to the PTY
+    /// (only for its own input path), so callers should invoke this before
+    /// forwarding keystrokes/paste while scrolled back.
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Whether the alternate screen (e.g. vim, less) is active. Callers use
+    /// this to decide whether mouse wheel input should scroll history or be
+    /// translated into arrow-key sequences.
+    pub fn alt_screen_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// Selected text, if any (for clipboard copy).
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
@@ -333,13 +369,16 @@ impl Terminal {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// Map a viewport (col, row) to a grid point. No scrollback => display
-    /// offset is zero, so the viewport row is the grid line directly.
+    /// Map a viewport (col, row) to a grid point. When scrolled back into
+    /// history (`display_offset > 0`), viewport row 0 is grid line
+    /// `-display_offset`, so subtract the offset to land on the right line.
     fn viewport_point(&self, col: u16, row: u16) -> Point {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
+        let offset = self.display_offset() as i32;
+        let row = (row as usize).min(rows.saturating_sub(1)) as i32;
         Point::new(
-            Line((row as usize).min(rows.saturating_sub(1)) as i32),
+            Line(row - offset),
             Column((col as usize).min(cols.saturating_sub(1))),
         )
     }
@@ -363,15 +402,25 @@ impl Terminal {
 
         let content = self.term.renderable_content();
         let selection = content.selection;
+        let display_offset = content.display_offset;
 
         // Selection isn't part of damage; a change repaints everything.
         if selection != self.last_selection {
             base_damage = FrameDamage::Full;
         }
+        // Scrolling shifts every viewport row -> grid line mapping; alacritty's
+        // own damage tracking doesn't account for that, so force a full repaint.
+        if display_offset != self.last_display_offset {
+            base_damage = FrameDamage::Full;
+        }
 
         let mut cells = Vec::new();
         for indexed in content.display_iter {
-            let line = indexed.point.line.0;
+            // Grid lines are relative to the live screen bottom (0 = bottom-most
+            // live row, negative = scrollback); shift by the display offset to
+            // get the viewport-relative row alacritty's iterator already scoped
+            // its range to.
+            let line = indexed.point.line.0 + display_offset as i32;
             if line < 0 || line >= rows as i32 {
                 continue;
             }
@@ -426,14 +475,23 @@ impl Terminal {
         }
 
         let cursor = content.cursor;
+        // The cursor's grid line is always within the live screen (never
+        // negative); while scrolled back into history it'd land outside the
+        // viewport, so hide it rather than draw it at a bogus row.
+        let cursor_shape = if display_offset > 0 {
+            CursorShape::Hidden
+        } else {
+            map_cursor(cursor.shape)
+        };
         self.last_selection = selection;
+        self.last_display_offset = display_offset;
         Frame {
             cols,
             rows,
             cells,
             cursor_col: cursor.point.column.0 as u16,
             cursor_row: cursor.point.line.0.max(0) as u16,
-            cursor_shape: map_cursor(cursor.shape),
+            cursor_shape,
             damage: base_damage,
         }
     }
@@ -601,6 +659,63 @@ mod tests {
         t.advance(b"jects\x07");
         let ev = t.take_shell_events();
         assert!(matches!(&ev[0], ShellEvent::Cwd(p) if p == "C:/Projects"));
+    }
+
+    #[test]
+    fn scroll_display_moves_offset_into_history() {
+        let mut t = term();
+        // 2 rows visible; push well past that so there's scrollback.
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.display_offset(), 0);
+        t.scroll_display(5);
+        assert!(t.display_offset() > 0, "scrolling up should move into history");
+        t.scroll_display(-1000);
+        assert_eq!(t.display_offset(), 0, "large negative delta snaps back to bottom");
+    }
+
+    #[test]
+    fn frame_reflects_scrolled_content() {
+        let mut t = term();
+        for i in 0..20 {
+            t.advance(format!("L{i}\r\n").as_bytes());
+        }
+        let _ = t.frame(); // consume damage from feeding
+        t.scroll_display(20); // scroll to the very top
+        let f = t.frame();
+        // Top-of-scrollback content ("L0") should now be visible somewhere.
+        let has_l0 = f.cells.iter().any(|c| c.c == 'L') ;
+        assert!(has_l0, "scrolled-back content should render");
+    }
+
+    #[test]
+    fn scrolling_forces_full_damage() {
+        let mut t = term();
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        let _ = t.frame(); // consume initial full damage
+        // Idle frame (no scroll) is incremental.
+        match t.frame().damage {
+            FrameDamage::Full => panic!("unrelated frame should not be full"),
+            FrameDamage::Rows(_) => {}
+        }
+        t.scroll_display(3);
+        let f = t.frame();
+        assert!(matches!(f.damage, FrameDamage::Full), "scrolling forces full damage");
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_offset() {
+        let mut t = term();
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        t.scroll_display(10);
+        assert!(t.display_offset() > 0);
+        t.scroll_to_bottom();
+        assert_eq!(t.display_offset(), 0);
     }
 
     #[test]

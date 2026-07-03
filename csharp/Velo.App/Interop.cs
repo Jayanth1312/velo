@@ -94,6 +94,12 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_pane_focus(IntPtr eng, uint pane);
 
+    /// Mouse wheel over `pane`. deltaLines is signed (positive = up/history,
+    /// negative = down/present). Translated to arrow keys when the pane's
+    /// session has its alt screen active (vim, less, ...).
+    [LibraryImport(Core)]
+    internal static partial void velo_pane_scroll(IntPtr eng, uint pane, int deltaLines);
+
     /// Destroy `pane` (pane 0 cannot be destroyed); its tab survives.
     [LibraryImport(Core)]
     internal static partial void velo_pane_close(IntPtr eng, uint pane);

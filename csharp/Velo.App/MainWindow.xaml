@@ -234,7 +234,8 @@
                                 CharacterReceived="Panel_CharacterReceived"
                                 PointerPressed="Panel_PointerPressed"
                                 PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                PointerReleased="Panel_PointerReleased"
+                                PointerWheelChanged="Panel_PointerWheelChanged" />
 
                 <SwapChainPanel x:Name="TerminalPanel1"
                                 Visibility="Collapsed"
@@ -244,7 +245,8 @@
                                 CharacterReceived="Panel_CharacterReceived"
                                 PointerPressed="Panel_PointerPressed"
                                 PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                PointerReleased="Panel_PointerReleased"
+                                PointerWheelChanged="Panel_PointerWheelChanged" />
                 <SwapChainPanel x:Name="TerminalPanel2"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
@@ -253,7 +255,8 @@
                                 CharacterReceived="Panel_CharacterReceived"
                                 PointerPressed="Panel_PointerPressed"
                                 PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                PointerReleased="Panel_PointerReleased"
+                                PointerWheelChanged="Panel_PointerWheelChanged" />
                 <SwapChainPanel x:Name="TerminalPanel3"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
@@ -262,7 +265,8 @@
                                 CharacterReceived="Panel_CharacterReceived"
                                 PointerPressed="Panel_PointerPressed"
                                 PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                PointerReleased="Panel_PointerReleased"
+                                PointerWheelChanged="Panel_PointerWheelChanged" />
 
                 <!-- Drop-zone overlay (a single highlight repositioned per edge). -->
                 <Grid x:Name="SplitOverlay"
