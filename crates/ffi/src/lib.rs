@@ -1115,16 +1115,20 @@ mod imp {
                 .and_then(|o| o.as_ref())
                 .map(|s| s.terminal.mouse_mode())
                 .unwrap_or_default();
+            // Only report when the app also asked for SGR (1006) coords; a
+            // legacy X10-only app would get sequences it can't parse, so it
+            // falls back to local selection instead.
+            let reporting = mm.reporting && mm.sgr;
             let sgr = match kind {
                 0 => {
-                    let m = mm.reporting && !shift;
+                    let m = reporting && !shift;
                     self.sgr_gesture = m;
                     m
                 }
                 // Mid-gesture events follow the press's decision, not live Shift.
                 _ if self.mouse_down => self.sgr_gesture,
                 // Hover motion (no gesture in flight): live check.
-                _ => mm.reporting && !shift,
+                _ => reporting && !shift,
             };
             if sgr {
                 let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
@@ -1134,6 +1138,12 @@ mod imp {
                     0 => {
                         self.mouse_down = true;
                         self.mouse_button = button;
+                        // Drop any highlight left over from an earlier local
+                        // selection; this press belongs to the app.
+                        if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                            s.terminal.clear_selection();
+                        }
+                        self.render_pane(idx);
                         Some(term_core::keys::sgr_mouse_seq(button, col, row, true))
                     }
                     1 => {
@@ -1252,7 +1262,8 @@ mod imp {
                 .and_then(|o| o.as_ref())
                 .map(|s| s.terminal.mouse_mode());
             if let Some(mm) = mouse_mode {
-                if mm.reporting && !shift {
+                // SGR-capable reporting only, same as on_mouse_pane.
+                if mm.reporting && mm.sgr && !shift {
                     if let Some((cols, rows)) = self.pane_cols_rows(idx) {
                         let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
                         let col = c + 1;
