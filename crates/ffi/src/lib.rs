@@ -48,10 +48,7 @@ mod imp {
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
-        VK_TAB, VK_UP,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NEXT, VK_PRIOR, VK_TAB};
     use windows::Win32::UI::Shell::{
         DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
     };
@@ -150,6 +147,10 @@ mod imp {
         wakeup_pending: Arc<std::sync::atomic::AtomicBool>,
         /// Live tab label (from OSC title), to debounce title callbacks.
         tab_title: String,
+        /// Set by `on_key` when Alt is held (without Ctrl) for a key that will
+        /// arrive as a char next; `on_char` prefixes the char with `ESC` and
+        /// clears it. Cleared on any other key event so it can't go stale.
+        pending_alt: bool,
     }
 
     /// Double-buffered flip swapchain.
@@ -816,6 +817,7 @@ mod imp {
                 inbox,
                 wakeup_pending,
                 tab_title: "PowerShell".to_string(),
+                pending_alt: false,
             });
             if id == self.sessions.len() {
                 self.sessions.push(Some(session));
@@ -952,9 +954,16 @@ mod imp {
         /// App keybinds + navigation keys. Returns `true` = handled (C# sets
         /// `e.Handled` and the matching `velo_char` is swallowed). Tab-management
         /// chords call back into C# (it owns the tab list); terminal-local actions
-        /// (copy/paste, nav keys) are handled here. `ctrl`/`shift` are the live
-        /// modifier states C# reads from the keyboard source.
-        fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> bool {
+        /// (copy/paste, nav keys) are handled here. `ctrl`/`shift`/`alt` are the
+        /// live modifier states C# reads from the keyboard source.
+        fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
+            // Cleared unconditionally on every key event; the one path that
+            // wants it set (Alt+printable falling through to on_char) re-sets
+            // it below, right before returning. Keeps the flag from going
+            // stale across unrelated keystrokes.
+            if let Some(s) = self.active_session() {
+                s.pending_alt = false;
+            }
             if ctrl && shift {
                 match vk {
                     0x54 => {
@@ -1004,17 +1013,51 @@ mod imp {
                 return true;
             }
 
-            if let Some(seq) = nav_seq(vk) {
-                if let Some(s) = self.active_session() {
-                    s.terminal.scroll_to_bottom();
-                    let _ = s.pty.writer().write_all(seq);
+            // Shift+PgUp/PgDn scrolls scrollback a page instead of sending a
+            // byte sequence, unless the alt screen (vim/less) is active —
+            // there's no scrollback to show there, so fall through to the
+            // normal PgUp/PgDn escape sequence below.
+            if shift && !ctrl && !alt && (vk == VK_PRIOR.0 || vk == VK_NEXT.0) {
+                let idx = self.focused_pane;
+                let alt_screen = self
+                    .active_session()
+                    .map(|s| s.terminal.alt_screen_active())
+                    .unwrap_or(false);
+                if !alt_screen {
+                    let rows = self.pane_cols_rows(idx).map(|(_, r)| r as i32).unwrap_or(24);
+                    let delta = if vk == VK_PRIOR.0 { rows } else { -rows };
+                    if let Some(s) = self.active_session() {
+                        s.terminal.scroll_display(delta);
+                    }
+                    self.render_pane(idx);
+                    return true;
                 }
-                return true;
+            }
+
+            if let Some(s) = self.active_session() {
+                let app_cursor = s.terminal.app_cursor();
+                if let Some(seq) = term_core::keys::key_seq(vk, ctrl, shift, alt, app_cursor) {
+                    s.terminal.scroll_to_bottom();
+                    let _ = s.pty.writer().write_all(&seq);
+                    return true;
+                }
+            }
+
+            // Not a nav/F-key: if Alt is held (without Ctrl), the key will
+            // arrive next as a WM_CHAR; flag it so `on_char` prefixes the
+            // UTF-8 bytes with ESC (the classic "meta" encoding).
+            if alt && !ctrl {
+                if let Some(s) = self.active_session() {
+                    s.pending_alt = true;
+                }
             }
             false
         }
 
         /// Text + control chars -> focused PTY (UTF-16 -> UTF-8, surrogate-aware).
+        /// When `on_key` flagged Alt held for this key (`pending_alt`), the
+        /// bytes are prefixed with `ESC` (classic Alt/meta encoding) and the
+        /// flag is consumed.
         fn on_char(&mut self, cu: u16) {
             if self.swallow_next_char {
                 self.swallow_next_char = false;
@@ -1022,8 +1065,14 @@ mod imp {
             }
             if cu == 0x08 {
                 if let Some(s) = self.active_session() {
+                    let alt = s.pending_alt;
+                    s.pending_alt = false;
                     s.terminal.scroll_to_bottom();
-                    let _ = s.pty.writer().write_all(b"\x7f");
+                    let w = s.pty.writer();
+                    if alt {
+                        let _ = w.write_all(b"\x1b");
+                    }
+                    let _ = w.write_all(b"\x7f");
                 }
                 return;
             }
@@ -1039,8 +1088,14 @@ mod imp {
             };
             let s = String::from_utf16_lossy(&units);
             if let Some(sess) = self.active_session() {
+                let alt = sess.pending_alt;
+                sess.pending_alt = false;
                 sess.terminal.scroll_to_bottom();
-                let _ = sess.pty.writer().write_all(s.as_bytes());
+                let w = sess.pty.writer();
+                if alt {
+                    let _ = w.write_all(b"\x1b");
+                }
+                let _ = w.write_all(s.as_bytes());
             }
         }
 
@@ -1168,34 +1223,6 @@ mod imp {
                 }
             }
         }
-    }
-
-    /// Navigation/function keys -> exact byte sequences (these emit no `WM_CHAR`).
-    fn nav_seq(vk: u16) -> Option<&'static [u8]> {
-        let seq: &[u8] = if vk == VK_UP.0 {
-            b"\x1b[A"
-        } else if vk == VK_DOWN.0 {
-            b"\x1b[B"
-        } else if vk == VK_RIGHT.0 {
-            b"\x1b[C"
-        } else if vk == VK_LEFT.0 {
-            b"\x1b[D"
-        } else if vk == VK_HOME.0 {
-            b"\x1b[H"
-        } else if vk == VK_END.0 {
-            b"\x1b[F"
-        } else if vk == VK_PRIOR.0 {
-            b"\x1b[5~"
-        } else if vk == VK_NEXT.0 {
-            b"\x1b[6~"
-        } else if vk == VK_DELETE.0 {
-            b"\x1b[3~"
-        } else if vk == VK_INSERT.0 {
-            b"\x1b[2~"
-        } else {
-            return None;
-        };
-        Some(seq)
     }
 
     /// Subclass proc for the engine's message-only wakeup window. `dwref` carries
@@ -1438,7 +1465,7 @@ mod imp {
     #[no_mangle]
     pub unsafe extern "C" fn velo_key(eng: *mut Engine, vk: u32, mods: u32) -> u8 {
         match eng.as_mut() {
-            Some(e) => e.on_key(vk as u16, mods & 1 != 0, mods & 2 != 0) as u8,
+            Some(e) => e.on_key(vk as u16, mods & 1 != 0, mods & 2 != 0, mods & 4 != 0) as u8,
             None => 0,
         }
     }

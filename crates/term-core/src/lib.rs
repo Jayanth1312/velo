@@ -14,6 +14,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape as AnsiCursorShape, Processor};
 
+pub mod keys;
 pub mod palette;
 
 /// Grid dimensions passed to alacritty's `Term`. `TermSize` lives in a test-only
@@ -356,6 +357,13 @@ impl Terminal {
     /// translated into arrow-key sequences.
     pub fn alt_screen_active(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether the app has enabled application cursor-key mode (DECCKM).
+    /// When set, arrow/Home/End keys (with no modifiers) send `ESC O <letter>`
+    /// instead of `CSI <letter>`.
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
     /// Selected text, if any (for clipboard copy).
