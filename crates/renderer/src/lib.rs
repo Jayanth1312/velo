@@ -351,6 +351,20 @@ impl Renderer {
         self.bg_a = a.clamp(0.0, 1.0);
     }
 
+    /// Adopt new cell metrics (font size/DPI change) without recreating the
+    /// pipeline/atlas texture/buffers. Old glyphs are keyed to the old size, so
+    /// the cache is dropped and the shelf allocator reset to reclaim the atlas
+    /// space (stale pixels are simply overwritten as glyphs are re-rasterized).
+    pub fn set_font_metrics(&mut self, cell_w: f32, cell_h: f32, ascent: f32) {
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.ascent = ascent;
+        self.glyphs.clear();
+        self.shelf_x = 1; // texel 0 is reserved white
+        self.shelf_y = 0;
+        self.shelf_h = 1;
+    }
+
     /// Rasterize a (char, bold, italic, sub-pixel bin) into the atlas if absent.
     fn glyph(
         &mut self,

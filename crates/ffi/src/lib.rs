@@ -615,11 +615,12 @@ mod imp {
         /// Rebuild the font + every pane's renderer for the current
         /// `font_pt` * `dpi_scale`, then recompute grids and reflow + repaint.
         fn rebuild_font(&mut self) {
-            self.font = text::Font::new(self.font_pt * self.dpi_scale);
-            let (bg, bg_a, dpi) = (self.bg, self.bg_a, self.dpi_scale);
+            self.font.set_size(self.font_pt * self.dpi_scale);
+            let dpi = self.dpi_scale;
+            let (cell_w, cell_h, ascent) = (self.font.cell_w, self.font.cell_h, self.font.ascent);
             for i in 0..self.panes.len() {
                 if let Some(Some(p)) = self.panes.get_mut(i) {
-                    p.renderer = build_renderer(&self.device, &self.queue, &self.font, bg, bg_a);
+                    p.renderer.set_font_metrics(cell_w, cell_h, ascent);
                     p.recompute_grid(&self.font, dpi);
                 }
             }
