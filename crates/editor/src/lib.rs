@@ -6,6 +6,8 @@
 mod buffer;
 mod highlight;
 mod view;
+mod workspace;
 pub use buffer::{Document, Move};
 pub use highlight::Highlighter;
 pub use view::{Span, View};
+pub use workspace::Workspace;
