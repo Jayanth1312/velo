@@ -65,6 +65,39 @@ struct Glyph {
 /// Glyph cache key: char + bold + italic + sub-pixel x bin.
 type GlyphKey = (char, bool, bool, u8);
 
+/// Smooth-scroll easing state: a pixel displacement applied to the whole grid
+/// in the vertex shader, decaying exponentially to 0. Content that jumped N
+/// rows starts drawn N*cell_h px from its final position and glides in.
+#[derive(Default)]
+pub struct ScrollAnim {
+    /// Current visual y displacement in px (positive = grid drawn lower).
+    pub px: f32,
+}
+
+/// Never displace more than this many cells — a `cat` flood should read as a
+/// fast glide, not launch the grid off-screen.
+const MAX_SCROLL_CELLS: f32 = 3.0;
+/// Exponential decay time constant (ms); ~4*tau ≈ 200ms to visually settle.
+const SCROLL_TAU_MS: f32 = 50.0;
+
+impl ScrollAnim {
+    /// Content moved `rows_up` rows up (negative = down) on a grid with
+    /// `cell_h`-px rows: displace so it starts where it was and eases home.
+    pub fn bump(&mut self, rows_up: i32, cell_h: f32) {
+        let max = MAX_SCROLL_CELLS * cell_h;
+        self.px = (self.px + rows_up as f32 * cell_h).clamp(-max, max);
+    }
+
+    /// Advance by `dt_ms`. Returns true while still moving.
+    pub fn tick(&mut self, dt_ms: f32) -> bool {
+        self.px *= (-dt_ms.max(0.0) / SCROLL_TAU_MS).exp();
+        if self.px.abs() < 0.5 {
+            self.px = 0.0;
+        }
+        self.px != 0.0
+    }
+}
+
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     atlas: wgpu::Texture,
@@ -94,6 +127,8 @@ pub struct Renderer {
     bg: [u8; 3],
     /// Clear alpha (0 = fully transparent → blur shows through; 1 = opaque).
     bg_a: f32,
+    /// Smooth-scroll displacement state (applied in the vertex shader).
+    scroll: ScrollAnim,
 }
 
 fn srgb(c: [u8; 3]) -> [f32; 3] {
@@ -330,6 +365,7 @@ impl Renderer {
             pad_y: 0.0,
             bg: palette::DEFAULT_BG,
             bg_a: 1.0,
+            scroll: ScrollAnim::default(),
         }
     }
 
@@ -351,6 +387,20 @@ impl Renderer {
         self.bg_a = a.clamp(0.0, 1.0);
     }
 
+    /// Content moved `rows_up` rows since the last frame: start the glide.
+    pub fn scroll_bump(&mut self, rows_up: i32) {
+        self.scroll.bump(rows_up, self.cell_h);
+    }
+
+    /// Advance the glide. Returns true while a redraw is still needed.
+    pub fn scroll_tick(&mut self, dt_ms: f32) -> bool {
+        self.scroll.tick(dt_ms)
+    }
+
+    pub fn scroll_active(&self) -> bool {
+        self.scroll.px != 0.0
+    }
+
     /// Adopt new cell metrics (font size/DPI change) without recreating the
     /// pipeline/atlas texture/buffers. Old glyphs are keyed to the old size, so
     /// the cache is dropped and the shelf allocator reset to reclaim the atlas
@@ -359,6 +409,8 @@ impl Renderer {
         self.cell_w = cell_w;
         self.cell_h = cell_h;
         self.ascent = ascent;
+        // Old displacement is in old-cell units; zoom mid-glide just snaps.
+        self.scroll.px = 0.0;
         self.glyphs.clear();
         self.shelf_x = 1; // texel 0 is reserved white
         self.shelf_y = 0;
@@ -698,7 +750,7 @@ impl Renderer {
         queue.write_buffer(
             &self.uniform,
             0,
-            bytemuck::cast_slice(&[screen_w, screen_h, 0.0, 0.0]),
+            bytemuck::cast_slice(&[screen_w, screen_h, 0.0, self.scroll.px]),
         );
 
         let total_instances = self.slots.len() as u32;
@@ -737,6 +789,16 @@ impl Renderer {
                 multiview_mask: None,
             });
             if total_instances > 0 {
+                // Clip gliding rows to the grid area so they don't slide over
+                // the inner padding (the clear ignores scissor, so the padding
+                // stays filled with bg either way).
+                if self.scroll.px != 0.0 {
+                    let py = self.pad_y.max(0.0) as u32;
+                    let h = (screen_h as u32).saturating_sub(py * 2);
+                    if py > 0 && h > 0 {
+                        pass.set_scissor_rect(0, py, screen_w as u32, h);
+                    }
+                }
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instances.slice(..));
@@ -749,7 +811,7 @@ impl Renderer {
 }
 
 const SHADER: &str = r#"
-struct Uniforms { screen: vec2<f32>, pad: vec2<f32> };
+struct Uniforms { screen: vec2<f32>, scroll: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -776,7 +838,7 @@ fn vs_main(
         vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vi];
-    let pos_px = rect.xy + corner * rect.zw;
+    let pos_px = rect.xy + corner * rect.zw + vec2<f32>(0.0, u.scroll.y);
     let ndc = vec2<f32>(
         pos_px.x / u.screen.x * 2.0 - 1.0,
         1.0 - pos_px.y / u.screen.y * 2.0,
@@ -863,3 +925,52 @@ mod row_ranges_tests {
     }
 }
 
+
+#[cfg(test)]
+mod scroll_anim_tests {
+    use super::ScrollAnim;
+
+    #[test]
+    fn bump_sets_offset_and_tick_decays_to_zero() {
+        let mut a = ScrollAnim::default();
+        a.bump(3, 20.0); // 3 rows up at 20px cells -> +60px
+        assert_eq!(a.px, 60.0);
+        let mut ticks = 0;
+        while a.tick(16.0) {
+            ticks += 1;
+            assert!(ticks < 100, "must settle");
+        }
+        assert_eq!(a.px, 0.0);
+        assert!(ticks > 2, "should take several frames, not snap");
+    }
+
+    #[test]
+    fn bump_is_clamped() {
+        let mut a = ScrollAnim::default();
+        a.bump(500, 20.0); // cat flood: don't fly the grid off-screen
+        assert!(a.px <= 3.0 * 20.0 + f32::EPSILON);
+        a.bump(-500, 20.0);
+        a.bump(-500, 20.0);
+        assert!(a.px >= -(3.0 * 20.0) - f32::EPSILON);
+    }
+
+    #[test]
+    fn opposite_bumps_cancel() {
+        let mut a = ScrollAnim::default();
+        a.bump(2, 20.0);
+        a.bump(-2, 20.0);
+        assert_eq!(a.px, 0.0);
+        assert!(!a.tick(16.0));
+    }
+
+    #[test]
+    fn decay_is_monotonic() {
+        let mut a = ScrollAnim::default();
+        a.bump(2, 20.0);
+        let mut prev = a.px;
+        while a.tick(16.0) {
+            assert!(a.px < prev && a.px >= 0.0);
+            prev = a.px;
+        }
+    }
+}
