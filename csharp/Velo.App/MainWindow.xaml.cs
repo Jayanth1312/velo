@@ -2651,6 +2651,9 @@ public sealed partial class MainWindow : Window
 
     private void EditorTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        // Pill visual tracks selection even when programmatic (suppressed).
+        foreach (var r in e.RemovedItems) if (r is EditorFileVM rv) rv.IsSelected = false;
+        foreach (var a in e.AddedItems) if (a is EditorFileVM av) av.IsSelected = true;
         if (_suppressEditorTab || _engine == IntPtr.Zero) return;
         if (EditorTabs.SelectedItem is EditorFileVM vm)
         {

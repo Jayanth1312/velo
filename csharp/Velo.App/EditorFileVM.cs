@@ -27,5 +27,25 @@ public sealed class EditorFileVM : INotifyPropertyChanged
     public Microsoft.UI.Xaml.Visibility DirtyVisibility =>
         _dirty ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
 
+    private bool _isSelected;
+    public bool IsSelected
+    {
+        get => _isSelected;
+        set
+        {
+            if (_isSelected == value) return;
+            _isSelected = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsSelected)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SelectedBrush)));
+        }
+    }
+
+    /// Pill fill: the ListViewItemPresenter draws square backgrounds no matter
+    /// what CornerRadius says, so the template's rounded Border binds this.
+    public Microsoft.UI.Xaml.Media.Brush SelectedBrush => new
+        Microsoft.UI.Xaml.Media.SolidColorBrush(_isSelected
+            ? Windows.UI.Color.FromArgb(0x33, 0xFF, 0xFF, 0xFF)
+            : Windows.UI.Color.FromArgb(0x00, 0x00, 0x00, 0x00));
+
     public event PropertyChangedEventHandler? PropertyChanged;
 }

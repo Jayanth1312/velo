@@ -317,12 +317,13 @@
                           ScrollViewer.HorizontalScrollMode="Enabled"
                           ScrollViewer.HorizontalScrollBarVisibility="Hidden">
                     <ListView.Resources>
-                        <!-- Theme-neutral translucent overlays so tabs blend with
-                             the terminal tint instead of stock light/dark pills. -->
+                        <!-- Presenter backgrounds off entirely: it draws square
+                             fills that ignore CornerRadius. The rounded pill is a
+                             Border inside the item template instead. -->
                         <SolidColorBrush x:Key="ListViewItemBackground" Color="Transparent" />
-                        <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="#22FFFFFF" />
-                        <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#33FFFFFF" />
-                        <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="#3DFFFFFF" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="Transparent" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="Transparent" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="Transparent" />
                     </ListView.Resources>
                     <ListView.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -340,7 +341,10 @@
                     </ListView.ItemContainerStyle>
                     <ListView.ItemTemplate>
                         <DataTemplate x:DataType="local:EditorFileVM">
-                            <Grid ColumnSpacing="6" Padding="10,0,4,0">
+                            <Border CornerRadius="6"
+                                    Padding="14,5,8,5"
+                                    Background="{x:Bind SelectedBrush, Mode=OneWay}">
+                            <Grid ColumnSpacing="6">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="Auto" />
@@ -366,6 +370,7 @@
                                         Tag="{x:Bind Id}"
                                         Click="EditorTabClose_Click" />
                             </Grid>
+                            </Border>
                         </DataTemplate>
                     </ListView.ItemTemplate>
                 </ListView>
