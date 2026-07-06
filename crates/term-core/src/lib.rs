@@ -207,6 +207,11 @@ pub struct Terminal {
     /// Last display offset observed; a change (scrollback) forces a full
     /// redraw since viewport row->grid line mapping shifts entirely.
     last_display_offset: usize,
+    /// History length at the last frame, to derive content motion.
+    last_history: usize,
+    /// Whether the last frame was on the alt screen (suppresses the motion
+    /// signal across screen switches, where history_size jumps to/from 0).
+    last_alt: bool,
     /// Latest OSC window title (shared with the `EventProxy`; `None` = default).
     title: Arc<Mutex<Option<String>>>,
     /// Shell-integration scanner + decoded-event queue (drained by the host).
@@ -239,6 +244,8 @@ impl Terminal {
             parser: Processor::new(),
             last_selection: None,
             last_display_offset: 0,
+            last_history: 0,
+            last_alt: false,
             title,
             osc: OscTee::default(),
             pending_shell: Vec::new(),
@@ -322,6 +329,10 @@ impl Terminal {
             columns: cols.max(1) as usize,
             screen_lines: rows.max(1) as usize,
         });
+        // Reflow can change history length; re-baseline so the next frame's
+        // scrolled_up doesn't read the jump as content motion.
+        self.last_history = self.term.grid().history_size();
+        self.last_display_offset = self.term.grid().display_offset();
     }
 
     /// Begin a simple (character-granularity) selection at a viewport cell.
@@ -423,6 +434,10 @@ impl Terminal {
     pub fn frame(&mut self) -> Frame {
         let cols = self.term.columns() as u16;
         let rows = self.term.screen_lines() as u16;
+        // Sampled before `renderable_content()` takes its borrow; consumed by
+        // the scrolled_up computation at the end of this fn.
+        let history = self.term.grid().history_size();
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
 
         // Collect content/cursor damage first (mutable borrow), then reset it.
         let mut base_damage = match self.term.damage() {
@@ -518,8 +533,20 @@ impl Terminal {
         } else {
             map_cursor(cursor.shape)
         };
+        // Content motion = change of (history above viewport top). New lines
+        // grow history (content up); scrolling back grows the offset (down);
+        // lines arriving while scrolled back grow both and cancel out.
+        let scrolled_up = if alt || self.last_alt {
+            0
+        } else {
+            ((history as i64 - display_offset as i64)
+                - (self.last_history as i64 - self.last_display_offset as i64))
+                .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        };
         self.last_selection = selection;
         self.last_display_offset = display_offset;
+        self.last_history = history;
+        self.last_alt = alt;
         Frame {
             cols,
             rows,
@@ -528,6 +555,7 @@ impl Terminal {
             cursor_row: cursor.point.line.0.max(0) as u16,
             cursor_shape,
             damage: base_damage,
+            scrolled_up,
         }
     }
 }
@@ -550,6 +578,11 @@ pub struct Frame {
     pub cursor_row: u16,
     pub cursor_shape: CursorShape,
     pub damage: FrameDamage,
+    /// Rows the viewport content moved *up* since the last frame (new output
+    /// scrolls content up; scrolling back into history moves it down =
+    /// negative). 0 on the alt screen and across alt-screen transitions.
+    /// Drives the renderer's smooth-scroll offset.
+    pub scrolled_up: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -573,6 +606,49 @@ mod tests {
 
     fn term() -> Terminal {
         Terminal::new(4, 2, Arc::new(|_: &[u8]| {}))
+    }
+
+    #[test]
+    fn scrolled_up_counts_lines_pushed_to_history() {
+        let mut t = term(); // 4 cols x 2 rows
+        let _ = t.frame(); // settle initial state
+        // 4 newlines on a 2-row screen -> lines pushed into history.
+        t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+        let f = t.frame();
+        assert!(f.scrolled_up > 0, "expected positive shift, got {}", f.scrolled_up);
+        // Second frame with no new data: no motion.
+        assert_eq!(t.frame().scrolled_up, 0);
+    }
+
+    #[test]
+    fn scrolled_up_negative_on_scrollback() {
+        let mut t = term();
+        t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+        let _ = t.frame();
+        t.scroll_display(2); // toward history -> content moves down
+        assert_eq!(t.frame().scrolled_up, -2);
+        t.scroll_to_bottom(); // back to present -> content moves up
+        assert_eq!(t.frame().scrolled_up, 2);
+    }
+
+    #[test]
+    fn scrolled_up_zero_on_alt_screen() {
+        let mut t = term();
+        let _ = t.frame();
+        t.advance(b"\x1b[?1049h"); // enter alt screen
+        t.advance(b"x\r\ny\r\nz\r\nw");
+        assert_eq!(t.frame().scrolled_up, 0);
+        t.advance(b"\x1b[?1049l"); // leave alt screen: transition frame also 0
+        assert_eq!(t.frame().scrolled_up, 0);
+    }
+
+    #[test]
+    fn scrolled_up_zero_after_resize() {
+        let mut t = term();
+        t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+        let _ = t.frame();
+        t.resize(6, 3); // reflow may change history size; must not read as motion
+        assert_eq!(t.frame().scrolled_up, 0);
     }
 
     #[test]
