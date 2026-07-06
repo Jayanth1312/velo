@@ -124,6 +124,8 @@ mod imp {
         /// (ctx) — a smooth-scroll glide started; the shell should drive
         /// `velo_tick` from its compositor frame callback until it returns 0.
         pub on_anim: Option<extern "C" fn(*mut c_void)>,
+        /// (ctx, file_id, dirty) — an editor buffer's dirty state flipped.
+        pub on_editor_dirty: Option<extern "C" fn(*mut c_void, u32, u8)>,
     }
 
     impl Default for VeloCallbacks {
@@ -139,6 +141,7 @@ mod imp {
                 on_cwd_changed: None,
                 on_command: None,
                 on_anim: None,
+                on_editor_dirty: None,
             }
         }
     }
@@ -169,7 +172,17 @@ mod imp {
     /// renderer (so per-grid damage tracking stays correct across panes), its cell
     /// grid, and the id of the session it currently displays (`NO_SESSION` if
     /// empty).
+    /// What a pane draws: a terminal session's frames, or the editor
+    /// workspace's. Editor panes reuse the whole render path (renderer,
+    /// glide, bg/alpha/zoom) — only the frame source differs.
+    #[derive(PartialEq, Clone, Copy)]
+    enum PaneKind {
+        Terminal,
+        Editor,
+    }
+
     struct Pane {
+        kind: PaneKind,
         swapchain: IDXGISwapChain3,
         backbuffers: Vec<(wgpu::Texture, wgpu::TextureView)>,
         renderer: renderer::Renderer,
@@ -332,6 +345,13 @@ mod imp {
         sessions: Vec<Option<Box<Session>>>,
         /// render order -> session id (for neighbor pick on close).
         tab_order: Vec<usize>,
+
+        /// Editor workspace: engine-owned so open files survive view switches.
+        workspace: editor::Workspace,
+        /// Index into `panes` of the editor pane (`NO_SESSION` until attached).
+        editor_pane: usize,
+        /// Dirty file ids at the last `on_editor_dirty` notification pass.
+        last_dirty: Vec<u32>,
 
         mouse_down: bool,
         /// SGR button code of the pressed button (0/1/2) for the gesture in flight.
@@ -516,18 +536,36 @@ mod imp {
         /// Draw the session bound to pane `idx` into that pane's swapchain and
         /// present it. No-op for an empty/unsized pane.
         fn render_pane(&mut self, idx: usize) {
-            let sid = match self.panes.get(idx) {
-                Some(Some(p)) => p.session,
+            let (kind, sid, dims) = match self.panes.get(idx) {
+                Some(Some(p)) => (p.kind, p.session, (p.cols, p.rows)),
                 _ => return,
             };
-            if sid == NO_SESSION {
-                return;
-            }
-            // Snapshot the frame first (ends the session borrow before the pane's
-            // mutable borrow + back-buffer view borrow below).
-            let mut frame = match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
-                Some(s) => s.terminal.frame(),
-                None => return,
+            // Snapshot the frame first (ends the session/workspace borrow before
+            // the pane's mutable borrow + back-buffer view borrow below).
+            let mut frame = match kind {
+                PaneKind::Editor => match self.workspace.frame(dims.0, dims.1) {
+                    Some(f) => f,
+                    // No files open: draw an empty grid (bg clear only).
+                    None => term_core::Frame {
+                        cols: dims.0,
+                        rows: dims.1,
+                        cells: Vec::new(),
+                        cursor_col: 0,
+                        cursor_row: 0,
+                        cursor_shape: term_core::CursorShape::Hidden,
+                        damage: term_core::FrameDamage::Full,
+                        scrolled_up: 0,
+                    },
+                },
+                PaneKind::Terminal => {
+                    if sid == NO_SESSION {
+                        return;
+                    }
+                    match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
+                        Some(s) => s.terminal.frame(),
+                        None => return,
+                    }
+                }
             };
             // Disjoint field borrows: `self.panes` (mut) vs `self.device`,
             // `self.queue`, `self.font` (the renderer draw args).
@@ -742,11 +780,12 @@ mod imp {
         /// Create a new pane with its own composition swapchain. Returns the stable
         /// pane id and the swapchain pointer (borrowed — the engine keeps it alive)
         /// for C# to bind to a fresh SwapChainPanel.
-        fn add_pane(&mut self) -> Result<(usize, *mut c_void)> {
+        fn add_pane(&mut self, kind: PaneKind) -> Result<(usize, *mut c_void)> {
             let swapchain = unsafe { create_comp_swapchain(&self.queue)? };
             let raw = swapchain.as_raw();
             let renderer = build_renderer(&self.device, &self.queue, &self.font, self.bg, self.bg_a);
             let pane = Pane {
+                kind,
                 swapchain,
                 backbuffers: Vec::new(),
                 renderer,
@@ -773,6 +812,9 @@ mod imp {
 
         /// Bind a session to a pane and repaint it (C#-driven, e.g. drop a tab).
         fn pane_bind(&mut self, idx: usize, sid: usize) {
+            if matches!(self.panes.get(idx), Some(Some(p)) if p.kind == PaneKind::Editor) {
+                return; // the editor pane never shows a session
+            }
             if self.sessions.get(sid).and_then(|o| o.as_ref()).is_some() {
                 self.bind(idx, sid);
                 self.render_pane(idx);
@@ -783,7 +825,7 @@ mod imp {
         /// surface and is never destroyed. The session it showed stays alive as a
         /// background tab.
         fn close_pane(&mut self, idx: usize) {
-            if idx == 0 {
+            if idx == 0 || idx == self.editor_pane {
                 return;
             }
             if let Some(slot) = self.panes.get_mut(idx) {
@@ -793,6 +835,161 @@ mod imp {
                 self.focused_pane = 0;
                 self.notify_active_changed();
             }
+        }
+
+        // ---- Editor pane ----------------------------------------------------
+
+        /// Create (or return) the editor pane. Idempotent: re-attach hands back
+        /// the existing swapchain so C# can rebind after a XAML reload.
+        fn editor_attach(&mut self) -> Option<(usize, *mut c_void)> {
+            if self.editor_pane != NO_SESSION {
+                if let Some(Some(p)) = self.panes.get(self.editor_pane) {
+                    return Some((self.editor_pane, p.swapchain.as_raw()));
+                }
+            }
+            match self.add_pane(PaneKind::Editor) {
+                Ok((idx, sc)) => {
+                    self.editor_pane = idx;
+                    Some((idx, sc))
+                }
+                Err(e) => {
+                    dbglog(&format!("editor_attach failed: {e}"));
+                    None
+                }
+            }
+        }
+
+        /// Diff dirty state against the last notification and emit flips.
+        fn notify_editor_dirty(&mut self) {
+            let now = self.workspace.dirty_ids();
+            if now == self.last_dirty {
+                return;
+            }
+            if let Some(f) = self.cb.on_editor_dirty {
+                for id in now.iter().filter(|i| !self.last_dirty.contains(i)) {
+                    f(self.cb.ctx, *id, 1);
+                }
+                for id in self.last_dirty.iter().filter(|i| !now.contains(i)) {
+                    f(self.cb.ctx, *id, 0);
+                }
+            }
+            self.last_dirty = now;
+        }
+
+        /// Editor key handling. Returns true when handled (C# swallows the
+        /// matching WM_CHAR). Printable chars arrive via `editor_char`.
+        fn editor_key(&mut self, vk: u16, mods: u32) -> bool {
+            use editor::Move;
+            let ctrl = mods & 1 != 0;
+            let shift = mods & 2 != 0;
+            let rows = match self.panes.get(self.editor_pane) {
+                Some(Some(p)) => p.rows as usize,
+                _ => 24,
+            };
+            let hwnd = self.wakeup_hwnd;
+            let Some(doc) = self.workspace.doc_mut() else {
+                return false;
+            };
+            let handled = match (vk, ctrl) {
+                (0x25, false) => { doc.move_cursor(Move::Left, shift); true }
+                (0x27, false) => { doc.move_cursor(Move::Right, shift); true }
+                (0x25, true) => { doc.move_cursor(Move::WordLeft, shift); true }
+                (0x27, true) => { doc.move_cursor(Move::WordRight, shift); true }
+                (0x26, _) => { doc.move_cursor(Move::Up, shift); true }
+                (0x28, _) => { doc.move_cursor(Move::Down, shift); true }
+                (0x24, false) => { doc.move_cursor(Move::Home, shift); true }
+                (0x23, false) => { doc.move_cursor(Move::End, shift); true }
+                (0x24, true) => { doc.move_cursor(Move::DocStart, shift); true }
+                (0x23, true) => { doc.move_cursor(Move::DocEnd, shift); true }
+                (0x21, _) => { doc.move_cursor(Move::PageUp(rows), shift); true }
+                (0x22, _) => { doc.move_cursor(Move::PageDown(rows), shift); true }
+                (0x08, _) => { doc.backspace(); true }
+                (0x2E, _) => { doc.delete(); true }
+                (0x0D, _) => { doc.insert("\n"); true }
+                (0x09, _) => { doc.insert("\t"); true }
+                (0x5A, true) if shift => { doc.redo(); true } // Ctrl+Shift+Z
+                (0x5A, true) => { doc.undo(); true }          // Ctrl+Z
+                (0x59, true) => { doc.redo(); true }          // Ctrl+Y
+                (0x53, true) => {                             // Ctrl+S
+                    let _ = doc.save();
+                    true
+                }
+                (0x43, true) => {                             // Ctrl+C
+                    if let Some(t) = doc.selection_text() {
+                        clipboard_set_text(hwnd, &t);
+                    }
+                    true
+                }
+                (0x58, true) => {                             // Ctrl+X
+                    if let Some(t) = doc.selection_text() {
+                        clipboard_set_text(hwnd, &t);
+                        doc.backspace(); // deletes the selection
+                    }
+                    true
+                }
+                (0x56, true) => {                             // Ctrl+V
+                    if let Some(t) = clipboard_get_text(hwnd) {
+                        doc.insert(&t.replace("\r\n", "\n"));
+                    }
+                    true
+                }
+                (0x41, true) => {                             // Ctrl+A
+                    doc.move_cursor(Move::DocStart, false);
+                    doc.move_cursor(Move::DocEnd, true);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                self.notify_editor_dirty();
+                let ep = self.editor_pane;
+                self.render_pane(ep);
+            }
+            handled
+        }
+
+        fn editor_char(&mut self, cu: u32) {
+            // Skip control chars (Enter/Tab/Backspace arrive via editor_key;
+            // Ctrl+letter WM_CHARs must not insert control bytes).
+            let Some(c) = char::from_u32(cu) else { return };
+            if c.is_control() {
+                return;
+            }
+            if self.workspace.doc_mut().is_none() {
+                return;
+            }
+            if let Some(doc) = self.workspace.doc_mut() {
+                doc.insert(&c.to_string());
+            }
+            self.notify_editor_dirty();
+            let ep = self.editor_pane;
+            self.render_pane(ep);
+        }
+
+        /// Editor pointer event: place the cursor (down) or extend a drag
+        /// selection (move; C# only sends moves while the button is held).
+        fn editor_mouse(&mut self, kind: u32, x: f32, y: f32) {
+            let (cols, rows) = match self.panes.get(self.editor_pane) {
+                Some(Some(p)) => (p.cols, p.rows),
+                _ => return,
+            };
+            let pad = (PAD_LOGICAL_PX * self.dpi_scale).round();
+            let col =
+                (((x - pad) / self.font.cell_w).max(0.0) as u16).min(cols.saturating_sub(1));
+            let row =
+                (((y - pad) / self.font.cell_h).max(0.0) as u16).min(rows.saturating_sub(1));
+            let Some((line, dcol)) = self.workspace.hit(col, row) else {
+                return;
+            };
+            if let Some(doc) = self.workspace.doc_mut() {
+                match kind {
+                    0 => doc.set_cursor(line, dcol),
+                    1 => doc.select_to(line, dcol),
+                    _ => return,
+                }
+            }
+            let ep = self.editor_pane;
+            self.render_pane(ep);
         }
 
         /// Set the pane that receives keyboard input + legacy mouse/resize.
@@ -1512,6 +1709,7 @@ mod imp {
 
         // Pane 0 reuses the primary swapchain so the single-pane host is unchanged.
         let pane0 = Pane {
+            kind: PaneKind::Terminal,
             swapchain,
             backbuffers: Vec::new(),
             renderer,
@@ -1537,6 +1735,9 @@ mod imp {
             focused_pane: 0,
             sessions: Vec::new(),
             tab_order: Vec::new(),
+            workspace: editor::Workspace::default(),
+            editor_pane: NO_SESSION,
+            last_dirty: Vec::new(),
             mouse_down: false,
             mouse_button: 0,
             sgr_gesture: false,
@@ -1696,7 +1897,7 @@ mod imp {
         let Some(e) = eng.as_mut() else {
             return u32::MAX;
         };
-        match e.add_pane() {
+        match e.add_pane(PaneKind::Terminal) {
             Ok((id, sc)) => {
                 if !out_swapchain.is_null() {
                     *out_swapchain = sc;
@@ -1758,6 +1959,164 @@ mod imp {
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
+    // ---- Editor pane ABI ---------------------------------------------------
+
+    /// Create (or return) the editor pane; writes its swapchain to
+    /// `*out_swapchain` (bind to the EditorHost SwapChainPanel). Returns the
+    /// pane id, or `u32::MAX` on failure.
+    ///
+    /// # Safety
+    /// `eng` must be live; `out_swapchain` must be a valid writable pointer.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_attach(
+        eng: *mut Engine,
+        out_swapchain: *mut *mut c_void,
+    ) -> u32 {
+        let Some(e) = eng.as_mut() else {
+            return u32::MAX;
+        };
+        match e.editor_attach() {
+            Some((idx, sc)) => {
+                if !out_swapchain.is_null() {
+                    *out_swapchain = sc;
+                }
+                idx as u32
+            }
+            None => u32::MAX,
+        }
+    }
+
+    /// Resize the editor pane to physical px.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_resize(eng: *mut Engine, w: u32, h: u32) {
+        if let Some(e) = eng.as_mut() {
+            let ep = e.editor_pane;
+            e.resize_pane(ep, w, h);
+        }
+    }
+
+    /// Open (or refocus) a file in the editor. Returns its stable file id, or
+    /// -1 when the file is unreadable / not UTF-8 text.
+    ///
+    /// # Safety
+    /// `eng` must be live; `path` must point to `len` valid UTF-16 code units.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_open(
+        eng: *mut Engine,
+        path: *const u16,
+        len: usize,
+    ) -> i64 {
+        let Some(e) = eng.as_mut() else {
+            return -1;
+        };
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+        match e.workspace.open(std::path::Path::new(&s)) {
+            Ok(id) => {
+                let ep = e.editor_pane;
+                e.render_pane(ep);
+                id as i64
+            }
+            Err(_) => -1,
+        }
+    }
+
+    /// Close a file (saves it first if dirty).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_close_file(eng: *mut Engine, id: u32) {
+        if let Some(e) = eng.as_mut() {
+            let _ = e.workspace.close(id);
+            e.notify_editor_dirty();
+            let ep = e.editor_pane;
+            e.render_pane(ep);
+        }
+    }
+
+    /// Focus an open file (editor tab click).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_focus_file(eng: *mut Engine, id: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.workspace.focus(id);
+            let ep = e.editor_pane;
+            e.render_pane(ep);
+        }
+    }
+
+    /// Save every dirty editor buffer (autosave flush).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_save_all(eng: *mut Engine) {
+        if let Some(e) = eng.as_mut() {
+            let _ = e.workspace.save_all();
+            e.notify_editor_dirty();
+        }
+    }
+
+    /// Editor key-down. mods bit0=Ctrl, bit1=Shift, bit2=Alt. Returns 1 when
+    /// handled (C# swallows the matching character event).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_key(eng: *mut Engine, vk: u32, mods: u32) -> u8 {
+        match eng.as_mut() {
+            Some(e) => e.editor_key(vk as u16, mods) as u8,
+            None => 0,
+        }
+    }
+
+    /// Editor character input (one UTF-16 code unit; control chars ignored).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_char(eng: *mut Engine, cu: u32) {
+        if let Some(e) = eng.as_mut() {
+            e.editor_char(cu);
+        }
+    }
+
+    /// Editor wheel scroll (positive = down/toward the end of the file).
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_scroll(eng: *mut Engine, delta_lines: i32) {
+        if let Some(e) = eng.as_mut() {
+            e.workspace.scroll(delta_lines);
+            let ep = e.editor_pane;
+            e.render_pane(ep);
+        }
+    }
+
+    /// Editor pointer event. kind 0=down, 1=move (drag), 2=up; (x, y) physical
+    /// px inside the editor panel.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_editor_mouse(
+        eng: *mut Engine,
+        kind: u32,
+        x: f32,
+        y: f32,
+        _mods: u32,
+    ) {
+        if let Some(e) = eng.as_mut() {
+            e.editor_mouse(kind, x, y);
+        }
+    }
+
     /// Advance smooth-scroll animations by `dt_ms` and repaint animating panes.
     /// Returns 1 while more frames are needed, 0 when everything settled.
     ///

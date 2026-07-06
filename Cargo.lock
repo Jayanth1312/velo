@@ -3161,6 +3161,7 @@ name = "velo_core"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "editor",
  "log",
  "parking_lot",
  "pollster",
