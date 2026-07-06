@@ -547,22 +547,66 @@ public sealed partial class MainWindow : Window
     // (/mnt/d/velo) that Windows can't open directly, so convert first.
     private void InfoReveal_Click(object sender, RoutedEventArgs e)
     {
-        var win = ToWindowsPath(CurrentTab()?.Cwd) ?? Environment.CurrentDirectory;
+        var raw = CurrentTab()?.Cwd;
+        var win = ToWindowsPath(raw);
+        Log.Write($"reveal: raw={raw ?? "<null>"} win={win ?? "<null>"}");
+        // No fallback: explorer.exe opens Documents for any arg it can't parse,
+        // which is worse than doing nothing.
+        if (win is null || !Directory.Exists(win))
+        {
+            Log.Write("reveal: skipped (no cwd or directory missing)");
+            return;
+        }
         try { Process.Start(new ProcessStartInfo("explorer.exe", $"\"{win}\"") { UseShellExecute = true }); }
         catch { /* best effort */ }
     }
 
+    /// Default WSL distro name (first line of `wsl.exe -l -q`), cached; null if
+    /// WSL is unavailable.
+    private static string? _wslDistro;
+    private static bool _wslDistroProbed;
+
+    private static string? WslDistro()
+    {
+        if (_wslDistroProbed) return _wslDistro;
+        _wslDistroProbed = true;
+        try
+        {
+            var psi = new ProcessStartInfo("wsl.exe", "-l -q")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.Unicode,
+            };
+            using var p = Process.Start(psi);
+            var line = p?.StandardOutput.ReadLine()?.Trim('\0', ' ', '\r', '\n');
+            p?.WaitForExit(2000);
+            _wslDistro = string.IsNullOrWhiteSpace(line) ? null : line;
+        }
+        catch { _wslDistro = null; }
+        return _wslDistro;
+    }
+
     /// Best-effort Windows path for a shell cwd: maps WSL /mnt/&lt;drive&gt;/… to
-    /// &lt;DRIVE&gt;:\…; leaves an already-Windows path untouched.
+    /// &lt;DRIVE&gt;:\…, any other absolute unix path to \\wsl.localhost\&lt;distro&gt;\…;
+    /// leaves an already-Windows path untouched.
     private static string? ToWindowsPath(string? cwd)
     {
         if (string.IsNullOrEmpty(cwd))
             return null;
-        if (cwd.Length >= 7 && cwd[0] == '/' && cwd.StartsWith("/mnt/", StringComparison.Ordinal)
+        if (cwd.Length >= 7 && cwd.StartsWith("/mnt/", StringComparison.Ordinal)
             && char.IsLetter(cwd[5]) && cwd[6] == '/')
         {
             var rest = cwd.Substring(7).Replace('/', '\\');
             return $"{char.ToUpperInvariant(cwd[5])}:\\{rest}";
+        }
+        if (cwd[0] == '/')
+        {
+            // Inside-WSL path (e.g. /home/user/proj): reachable via the
+            // \\wsl.localhost UNC share of the default distro.
+            var distro = WslDistro();
+            return distro is null ? null : $@"\\wsl.localhost\{distro}{cwd.Replace('/', '\\')}";
         }
         return cwd;
     }
