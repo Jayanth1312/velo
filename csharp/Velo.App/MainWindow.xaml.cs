@@ -2689,8 +2689,102 @@ public sealed partial class MainWindow : Window
             e.Handled = true;
             return;
         }
+        // Ctrl+J toggles the bottom terminal panel.
+        if (e.Key == Windows.System.VirtualKey.J && (Modifiers() & 1) != 0)
+        {
+            ToggleEditorTerminal();
+            e.Handled = true;
+            return;
+        }
         if (Native.velo_editor_key(_engine, (uint)e.Key, Modifiers()) != 0)
             e.Handled = true;
+    }
+
+    // ---- Editor bottom terminal (Ctrl+J) -----------------------------------
+
+    private uint _editorTermPane = InvalidId;
+
+    /// Show/hide the bottom terminal in editor mode. Lazily creates a core
+    /// pane bound to the active tab's session (no new shell is spawned).
+    private void ToggleEditorTerminal()
+    {
+        if (_engine == IntPtr.Zero) return;
+        bool show = EditorTermHost.Visibility == Visibility.Collapsed;
+        if (show && _editorTermPane == InvalidId)
+        {
+            IntPtr swap;
+            uint pid;
+            unsafe
+            {
+                IntPtr s;
+                pid = Native.velo_pane_new(_engine, &s);
+                swap = s;
+            }
+            if (pid == InvalidId || swap == IntPtr.Zero)
+            {
+                Log.Write("EditorTerm: velo_pane_new failed");
+                return;
+            }
+            _editorTermPane = pid;
+            EditorTermPanel.Tag = pid;
+            EditorTermHost.Tag = pid;
+            EditorTermPanel.As<ISwapChainPanelNative>().SetSwapChain(swap);
+        }
+        if (show)
+        {
+            EditorTermHost.Visibility = Visibility.Visible;
+            // (Re)bind to the active tab every show — it may have changed.
+            if (CurrentTab() is TabVM t)
+                Native.velo_pane_bind(_engine, _editorTermPane, t.Id);
+            PushPaneSize(EditorTermPanel);
+            Native.velo_pane_focus(_engine, _editorTermPane);
+            EditorTermHost.Focus(FocusState.Programmatic);
+        }
+        else
+        {
+            EditorTermHost.Visibility = Visibility.Collapsed;
+            Native.velo_pane_focus(_engine, 0);
+            EditorPanel.Focus(FocusState.Programmatic);
+        }
+    }
+
+    private void EditorTerm_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.J && (Modifiers() & 1) != 0)
+        {
+            ToggleEditorTerminal();
+            e.Handled = true;
+            return;
+        }
+        Panel_KeyDown(sender, e); // Tag carries the pane id
+    }
+
+    private void EditorTerm_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero || _editorTermPane == InvalidId) return;
+        EditorTermHost.Focus(FocusState.Pointer);
+        Native.velo_pane_focus(_engine, _editorTermPane);
+        ForwardMouse(EditorTermPanel, 0, e);
+        e.Handled = true;
+    }
+
+    private void EditorTerm_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero || _editorTermPane == InvalidId) return;
+        int delta = e.GetCurrentPoint(EditorTermPanel).Properties.MouseWheelDelta;
+        int lines = delta * 3 / 120;
+        if (lines == 0) return;
+        double sx = EditorTermPanel.CompositionScaleX > 0 ? EditorTermPanel.CompositionScaleX : _lastScale;
+        double sy = EditorTermPanel.CompositionScaleY > 0 ? EditorTermPanel.CompositionScaleY : _lastScale;
+        var p = e.GetCurrentPoint(EditorTermPanel).Position;
+        Native.velo_pane_scroll(_engine, _editorTermPane, lines,
+            (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
+        e.Handled = true;
+    }
+
+    private void EditorTerm_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (_editorTermPane != InvalidId) PushPaneSize(EditorTermPanel);
     }
 
     private void EditorPanel_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)

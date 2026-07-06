@@ -307,6 +307,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="36" />
                     <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <ListView x:Name="EditorTabs"
@@ -385,6 +386,23 @@
                                 PointerMoved="EditorPanel_PointerMoved"
                                 PointerReleased="EditorPanel_PointerReleased"
                                 PointerWheelChanged="EditorPanel_PointerWheelChanged" />
+
+                <!-- Ctrl+J bottom terminal: shows the active tab's live session.
+                     Transparent Grid takes keyboard focus (SwapChainPanel can't),
+                     same pattern as PaneHost. -->
+                <Grid x:Name="EditorTermHost"
+                      Grid.Row="2"
+                      Height="220"
+                      Visibility="Collapsed"
+                      Background="Transparent"
+                      IsTabStop="True"
+                      KeyDown="EditorTerm_KeyDown"
+                      CharacterReceived="Panel_CharacterReceived"
+                      PointerPressed="EditorTerm_PointerPressed"
+                      PointerWheelChanged="EditorTerm_PointerWheelChanged">
+                    <SwapChainPanel x:Name="EditorTermPanel"
+                                    SizeChanged="EditorTerm_SizeChanged" />
+                </Grid>
             </Grid>
         </Grid>
 
