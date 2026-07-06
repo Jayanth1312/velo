@@ -197,7 +197,16 @@
             <!-- Thin title bar: just tall enough for the toggle icons + small
                  padding. No title text (drag + double-click-maximize only). -->
             <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent"
-                  SizeChanged="TitleBar_SizeChanged" />
+                  SizeChanged="TitleBar_SizeChanged">
+                <TextBlock x:Name="TitleBarTitle"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           FontSize="12"
+                           MaxWidth="420"
+                           TextTrimming="CharacterEllipsis"
+                           IsHitTestVisible="False"
+                           Opacity="0.8" />
+            </Grid>
 
             <!-- Pane host: a 2x2 grid holding up to 4 terminal panes.
                  ponytail: background is Transparent (shows ContentRoot's terminal-

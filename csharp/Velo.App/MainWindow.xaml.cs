@@ -1610,6 +1610,7 @@ public sealed partial class MainWindow : Window
         // set) so the active row's shared fill follows the selection.
         foreach (var r in e.RemovedItems) if (r is TabVM rv) rv.IsActive = false;
         foreach (var a in e.AddedItems) if (a is TabVM av) av.IsActive = true;
+        UpdateTitleBarTitle();
         if (_suppressSelection || _engine == IntPtr.Zero)
             return;
         if (TabList.SelectedItem is TabVM t)
@@ -2140,6 +2141,7 @@ public sealed partial class MainWindow : Window
             {
                 if (save && v.Length > 0) t.Title = v;
                 t.IsEditing = false;
+                UpdateTitleBarTitle();
             }
             else if (tb.DataContext is TabGroup g)
             {
@@ -2421,8 +2423,10 @@ public sealed partial class MainWindow : Window
         // text follows the terminal theme's foreground.
         EditorTabs.Background = surface;
         var fg = Themes.Rgb(Themes.ByName(_settings.ThemeName).Fg);
-        EditorTabs.Foreground = new SolidColorBrush(
+        var fgBrush = new SolidColorBrush(
             Microsoft.UI.ColorHelper.FromArgb(0xFF, fg.R, fg.G, fg.B));
+        EditorTabs.Foreground = fgBrush;
+        TitleBarTitle.Foreground = fgBrush;
         // Palette card: same tint as the chrome, but floored so text stays
         // readable over the dim overlay at very low opacity settings.
         byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
@@ -2774,8 +2778,13 @@ public sealed partial class MainWindow : Window
                     break;
                 }
             }
+            w.UpdateTitleBarTitle();
         });
     }
+
+    /// Mirror the active tab's title into the title-bar center.
+    private void UpdateTitleBarTitle()
+        => TitleBarTitle.Text = CurrentTab()?.Title ?? "";
 
     [UnmanagedCallersOnly]
     private static void OnTabClosed(IntPtr ctx, uint id)
