@@ -1730,6 +1730,7 @@ mod imp {
             rows: 24,
             session: NO_SESSION,
             force_full: true,
+            glide_mute_until: std::time::Instant::now(),
         };
 
         let engine = Box::new(Engine {
