@@ -75,17 +75,19 @@ pub struct ScrollAnim {
 }
 
 /// Never displace more than this many cells — a `cat` flood should read as a
-/// fast glide, not launch the grid off-screen.
-const MAX_SCROLL_CELLS: f32 = 3.0;
-/// Exponential decay time constant (ms); ~4*tau ≈ 200ms to visually settle.
-const SCROLL_TAU_MS: f32 = 50.0;
+/// fast glide, not launch the grid off-screen. Was 3, but one wheel notch is
+/// 3 rows: back-to-back notches saturated the clamp and their motion was
+/// dropped (read as "stuck"). 12 lets successive notches merge into one glide.
+const MAX_SCROLL_CELLS: f32 = 12.0;
+/// Exponential decay time constant (ms); ~4*tau ≈ 260ms to visually settle.
+const SCROLL_TAU_MS: f32 = 65.0;
 
 impl ScrollAnim {
     /// Content moved `rows_up` rows up (negative = down) on a grid with
     /// `cell_h`-px rows: displace so it starts where it was and eases home.
-    pub fn bump(&mut self, rows_up: i32, cell_h: f32) {
-        let max = MAX_SCROLL_CELLS * cell_h;
-        self.px = (self.px + rows_up as f32 * cell_h).clamp(-max, max);
+    /// `max_px` bounds the displacement (viewport-aware, caller-supplied).
+    pub fn bump(&mut self, rows_up: i32, cell_h: f32, max_px: f32) {
+        self.px = (self.px + rows_up as f32 * cell_h).clamp(-max_px, max_px);
     }
 
     /// Advance by `dt_ms`. Returns true while still moving.
@@ -389,7 +391,9 @@ impl Renderer {
 
     /// Content moved `rows_up` rows since the last frame: start the glide.
     pub fn scroll_bump(&mut self, rows_up: i32) {
-        self.scroll.bump(rows_up, self.cell_h);
+        // ponytail: feel-tuned on Windows; viewport-height cap keeps short panes sane.
+        let max_px = self.cell_h * (self.grid_rows as f32).min(MAX_SCROLL_CELLS).max(1.0);
+        self.scroll.bump(rows_up, self.cell_h, max_px);
     }
 
     /// Advance the glide. Returns true while a redraw is still needed.
@@ -933,7 +937,7 @@ mod scroll_anim_tests {
     #[test]
     fn bump_sets_offset_and_tick_decays_to_zero() {
         let mut a = ScrollAnim::default();
-        a.bump(3, 20.0); // 3 rows up at 20px cells -> +60px
+        a.bump(3, 20.0, 600.0); // 3 rows up at 20px cells -> +60px
         assert_eq!(a.px, 60.0);
         let mut ticks = 0;
         while a.tick(16.0) {
@@ -947,18 +951,27 @@ mod scroll_anim_tests {
     #[test]
     fn bump_is_clamped() {
         let mut a = ScrollAnim::default();
-        a.bump(500, 20.0); // cat flood: don't fly the grid off-screen
-        assert!(a.px <= 3.0 * 20.0 + f32::EPSILON);
-        a.bump(-500, 20.0);
-        a.bump(-500, 20.0);
-        assert!(a.px >= -(3.0 * 20.0) - f32::EPSILON);
+        a.bump(500, 20.0, 240.0); // cat flood: don't fly the grid off-screen
+        assert!(a.px <= 240.0 + f32::EPSILON);
+        a.bump(-500, 20.0, 240.0);
+        a.bump(-500, 20.0, 240.0);
+        assert!(a.px >= -240.0 - f32::EPSILON);
+    }
+
+    #[test]
+    fn bump_clamp_is_caller_supplied() {
+        let mut a = ScrollAnim::default();
+        a.bump(10, 20.0, 240.0); // 12-cell cap: 10 rows * 20px fits
+        assert_eq!(a.px, 200.0);
+        a.bump(10, 20.0, 240.0); // accumulates but clamps at 240
+        assert_eq!(a.px, 240.0);
     }
 
     #[test]
     fn opposite_bumps_cancel() {
         let mut a = ScrollAnim::default();
-        a.bump(2, 20.0);
-        a.bump(-2, 20.0);
+        a.bump(2, 20.0, 600.0);
+        a.bump(-2, 20.0, 600.0);
         assert_eq!(a.px, 0.0);
         assert!(!a.tick(16.0));
     }
@@ -966,7 +979,7 @@ mod scroll_anim_tests {
     #[test]
     fn decay_is_monotonic() {
         let mut a = ScrollAnim::default();
-        a.bump(2, 20.0);
+        a.bump(2, 20.0, 600.0);
         let mut prev = a.px;
         while a.tick(16.0) {
             assert!(a.px < prev && a.px >= 0.0);
