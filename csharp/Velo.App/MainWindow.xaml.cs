@@ -646,9 +646,9 @@ public sealed partial class MainWindow : Window
             if (node is not null)
                 node.IsExpanded = !node.IsExpanded;
         }
-        else if (fi is { IsDir: false } && _editorMode)
+        else if (fi is { IsDir: false })
         {
-            OpenInEditor(fi.Path);
+            OpenInEditor(fi.Path); // flips to editor mode itself
         }
     }
 
@@ -681,8 +681,7 @@ public sealed partial class MainWindow : Window
         if (FilesTree.SelectedNode?.Content is not FileItem fi)
             return;
         if (fi.IsDir) { _filesDir = fi.Path; RefreshFiles(); }
-        else if (_editorMode) OpenInEditor(fi.Path);
-        else ShellOpen(fi.Path);
+        else OpenInEditor(fi.Path);
     }
 
     // ---- Git (porcelain status of the cwd's repo) ----
