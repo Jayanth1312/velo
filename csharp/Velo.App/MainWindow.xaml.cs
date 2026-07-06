@@ -425,6 +425,13 @@ public sealed partial class MainWindow : Window
             SelectDetailsTab(b);
         if (!_detailsOpen)
             SetDetails(true);
+        // Files button doubles as the editor-mode toggle: first click opens the
+        // tree + editor surface, clicking again returns to the terminal.
+        if (ReferenceEquals(sender, FilesTabButton))
+        {
+            SetEditorMode(!_editorMode);
+            return; // SetEditorMode owns focus either way
+        }
         FocusTerminal();
     }
 
@@ -639,6 +646,10 @@ public sealed partial class MainWindow : Window
             if (node is not null)
                 node.IsExpanded = !node.IsExpanded;
         }
+        else if (fi is { IsDir: false } && _editorMode)
+        {
+            OpenInEditor(fi.Path);
+        }
     }
 
     private static TreeViewNode? FindNode(IList<TreeViewNode> nodes, FileItem item)
@@ -670,6 +681,7 @@ public sealed partial class MainWindow : Window
         if (FilesTree.SelectedNode?.Content is not FileItem fi)
             return;
         if (fi.IsDir) { _filesDir = fi.Path; RefreshFiles(); }
+        else if (_editorMode) OpenInEditor(fi.Path);
         else ShellOpen(fi.Path);
     }
 
@@ -1602,6 +1614,9 @@ public sealed partial class MainWindow : Window
             return;
         if (TabList.SelectedItem is TabVM t)
         {
+            // Picking a terminal tab leaves editor mode (workspace state
+            // survives in the engine; re-entering shows the same files).
+            SetEditorMode(false);
             // Binds the focused pane to this tab (core), so track it per pane.
             Native.velo_tab_set_active(_engine, t.Id);
             _slotTab[_focusedPane] = t.Id;
@@ -2505,10 +2520,18 @@ public sealed partial class MainWindow : Window
         OnCwdChanged = (IntPtr)(delegate* unmanaged<IntPtr, uint, ushort*, nuint, void>)&OnCwdChanged,
         OnCommand = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, int, ulong, ushort*, nuint, void>)&OnCommand,
         OnAnim = (IntPtr)(delegate* unmanaged<IntPtr, void>)&OnAnim,
+        OnEditorDirty = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, void>)&OnEditorDirty,
     };
 
     private static MainWindow? FromCtx(IntPtr ctx)
         => ctx == IntPtr.Zero ? null : GCHandle.FromIntPtr(ctx).Target as MainWindow;
+
+    [UnmanagedCallersOnly]
+    private static void OnEditorDirty(IntPtr ctx, uint fileId, byte dirty)
+    {
+        var w = FromCtx(ctx);
+        w?.DispatcherQueue.TryEnqueue(() => w.OnEditorDirtyUi(fileId, dirty != 0));
+    }
 
     [UnmanagedCallersOnly]
     private static void OnAnim(IntPtr ctx)
@@ -2541,6 +2564,179 @@ public sealed partial class MainWindow : Window
             CompositionTarget.Rendering -= AnimPump_Rendering;
             _animPumping = false;
         }
+    }
+
+    // ---- Editor mode -------------------------------------------------------
+
+    public ObservableCollection<EditorFileVM> EditorFiles { get; } = new();
+    private bool _editorMode;
+    private bool _editorAttached;
+    private bool _editorMouseDown;
+    private bool _suppressEditorTab;
+    private DispatcherTimer? _autosave;
+
+    /// Files button toggles editor mode; file clicks in the tree open here.
+    private void SetEditorMode(bool on)
+    {
+        if (_editorMode == on) return;
+        _editorMode = on;
+        if (on && !_editorAttached)
+            AttachEditorPane();
+        if (!on && _engine != IntPtr.Zero)
+            Native.velo_editor_save_all(_engine);   // flush on exit
+        PaneHost.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        EditorHost.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        if (on) EditorPanel.Focus(FocusState.Programmatic);
+        else FocusTerminal();
+    }
+
+    private unsafe void AttachEditorPane()
+    {
+        if (_engine == IntPtr.Zero) return;
+        IntPtr sc = IntPtr.Zero;
+        uint id = Native.velo_editor_attach(_engine, &sc);
+        if (id == uint.MaxValue || sc == IntPtr.Zero)
+        {
+            Log.Write("AttachEditorPane: velo_editor_attach failed");
+            return;
+        }
+        EditorPanel.As<ISwapChainPanelNative>().SetSwapChain(sc);
+        _editorAttached = true;
+        PushEditorSize();
+    }
+
+    private void EditorPanel_SizeChanged(object sender, SizeChangedEventArgs e)
+        => PushEditorSize();
+
+    private void PushEditorSize()
+    {
+        if (!_editorAttached || _engine == IntPtr.Zero) return;
+        double sx = EditorPanel.CompositionScaleX > 0 ? EditorPanel.CompositionScaleX : _lastScale;
+        double sy = EditorPanel.CompositionScaleY > 0 ? EditorPanel.CompositionScaleY : _lastScale;
+        uint w = (uint)Math.Max(1, Math.Round(EditorPanel.ActualWidth * sx));
+        uint h = (uint)Math.Max(1, Math.Round(EditorPanel.ActualHeight * sy));
+        Native.velo_editor_resize(_engine, w, h);
+    }
+
+    /// Open (or refocus) a file in the editor; enters editor mode.
+    private unsafe void OpenInEditor(string path)
+    {
+        if (_engine == IntPtr.Zero) return;
+        SetEditorMode(true);
+        long id;
+        fixed (char* p = path)
+            id = Native.velo_editor_open(_engine, (ushort*)p, (nuint)path.Length);
+        if (id < 0) { ShellOpen(path); return; } // binary/unreadable: OS fallback
+        var fid = (uint)id;
+        var vm = EditorFiles.FirstOrDefault(f => f.Id == fid);
+        if (vm is null)
+        {
+            vm = new EditorFileVM { Id = fid, Path = path };
+            EditorFiles.Add(vm);
+        }
+        _suppressEditorTab = true;
+        EditorTabs.SelectedItem = vm;
+        _suppressEditorTab = false;
+        EditorPanel.Focus(FocusState.Programmatic);
+    }
+
+    private void EditorTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressEditorTab || _engine == IntPtr.Zero) return;
+        if (EditorTabs.SelectedItem is EditorFileVM vm)
+        {
+            Native.velo_editor_save_all(_engine); // flush on tab switch
+            Native.velo_editor_focus_file(_engine, vm.Id);
+            EditorPanel.Focus(FocusState.Programmatic);
+        }
+    }
+
+    private void EditorTabClose_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not uint id) return;
+        Native.velo_editor_close_file(_engine, id);
+        var vm = EditorFiles.FirstOrDefault(f => f.Id == id);
+        if (vm is not null) EditorFiles.Remove(vm);
+        if (EditorFiles.Count == 0) SetEditorMode(false);
+        else if (EditorTabs.SelectedItem is null)
+            EditorTabs.SelectedIndex = EditorFiles.Count - 1;
+    }
+
+    private void EditorPanel_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero) return;
+        if (Native.velo_editor_key(_engine, (uint)e.Key, Modifiers()) != 0)
+            e.Handled = true;
+    }
+
+    private void EditorPanel_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
+    {
+        if (_engine == IntPtr.Zero) return;
+        Native.velo_editor_char(_engine, args.Character);
+        args.Handled = true;
+    }
+
+    private void EditorPanel_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero) return;
+        int delta = e.GetCurrentPoint(EditorPanel).Properties.MouseWheelDelta;
+        Native.velo_editor_scroll(_engine, -delta * 3 / 120);
+        e.Handled = true;
+    }
+
+    private void EditorPanel_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero) return;
+        var (x, y) = EditorPhysicalPoint(e);
+        _editorMouseDown = true;
+        EditorPanel.CapturePointer(e.Pointer);
+        Native.velo_editor_mouse(_engine, 0, x, y, Modifiers());
+        EditorPanel.Focus(FocusState.Programmatic);
+        e.Handled = true;
+    }
+
+    private void EditorPanel_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_editorMouseDown || _engine == IntPtr.Zero) return;
+        var (x, y) = EditorPhysicalPoint(e);
+        Native.velo_editor_mouse(_engine, 1, x, y, Modifiers());
+    }
+
+    private void EditorPanel_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        _editorMouseDown = false;
+        EditorPanel.ReleasePointerCaptures();
+        if (_engine == IntPtr.Zero) return;
+        var (x, y) = EditorPhysicalPoint(e);
+        Native.velo_editor_mouse(_engine, 2, x, y, Modifiers());
+    }
+
+    private (float, float) EditorPhysicalPoint(PointerRoutedEventArgs e)
+    {
+        var pt = e.GetCurrentPoint(EditorPanel).Position;
+        double sx = EditorPanel.CompositionScaleX > 0 ? EditorPanel.CompositionScaleX : _lastScale;
+        double sy = EditorPanel.CompositionScaleY > 0 ? EditorPanel.CompositionScaleY : _lastScale;
+        return ((float)(pt.X * sx), (float)(pt.Y * sy));
+    }
+
+    /// Dirty flip from Rust: update the tab dot + restart the 1s autosave timer.
+    private void OnEditorDirtyUi(uint fileId, bool dirty)
+    {
+        var vm = EditorFiles.FirstOrDefault(f => f.Id == fileId);
+        if (vm is not null) vm.Dirty = dirty;
+        if (!dirty) return;
+        if (_autosave is null)
+        {
+            _autosave = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _autosave.Tick += (_, _) =>
+            {
+                _autosave!.Stop();
+                if (_engine != IntPtr.Zero)
+                    Native.velo_editor_save_all(_engine); // Rust fires dirty=false back
+            };
+        }
+        _autosave.Stop();
+        _autosave.Start();
     }
 
     [UnmanagedCallersOnly]

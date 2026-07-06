@@ -287,6 +287,83 @@
                                Foreground="White" />
                 </Border>
             </Grid>
+
+            <!-- Editor mode host: file tab strip + editor swapchain. Shown in
+                 place of PaneHost while editor mode is on; terminal panes stay
+                 alive underneath (hidden, not destroyed). -->
+            <Grid x:Name="EditorHost"
+                  Grid.Row="1"
+                  Visibility="Collapsed"
+                  Background="Transparent">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="36" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <ListView x:Name="EditorTabs"
+                          Grid.Row="0"
+                          ItemsSource="{x:Bind EditorFiles}"
+                          SelectionMode="Single"
+                          SelectionChanged="EditorTabs_SelectionChanged"
+                          ScrollViewer.HorizontalScrollMode="Enabled"
+                          ScrollViewer.HorizontalScrollBarVisibility="Hidden">
+                    <ListView.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <ItemsStackPanel Orientation="Horizontal" />
+                        </ItemsPanelTemplate>
+                    </ListView.ItemsPanel>
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="MinHeight" Value="30" />
+                            <Setter Property="MinWidth" Value="0" />
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="Margin" Value="2,0" />
+                            <Setter Property="CornerRadius" Value="6" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="local:EditorFileVM">
+                            <Grid ColumnSpacing="6" Padding="10,0,4,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="{x:Bind Name}"
+                                           VerticalAlignment="Center"
+                                           FontSize="12" />
+                                <Ellipse Grid.Column="1"
+                                         Width="7" Height="7"
+                                         Fill="{ThemeResource AccentFillColorDefaultBrush}"
+                                         Visibility="{x:Bind DirtyVisibility, Mode=OneWay}"
+                                         VerticalAlignment="Center" />
+                                <Button Grid.Column="2"
+                                        Content="&#xE711;"
+                                        FontFamily="Segoe MDL2 Assets"
+                                        FontSize="10"
+                                        Width="22" Height="22"
+                                        Padding="0"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Tag="{x:Bind Id}"
+                                        Click="EditorTabClose_Click" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <SwapChainPanel x:Name="EditorPanel"
+                                Grid.Row="1"
+                                IsTabStop="True"
+                                SizeChanged="EditorPanel_SizeChanged"
+                                KeyDown="EditorPanel_KeyDown"
+                                CharacterReceived="EditorPanel_CharacterReceived"
+                                PointerPressed="EditorPanel_PointerPressed"
+                                PointerMoved="EditorPanel_PointerMoved"
+                                PointerReleased="EditorPanel_PointerReleased"
+                                PointerWheelChanged="EditorPanel_PointerWheelChanged" />
+            </Grid>
         </Grid>
 
         <!-- Title-bar hover/drag strip: full-width, transparent, above the terminal
