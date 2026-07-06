@@ -73,6 +73,17 @@ pub fn selection() -> [u8; 3] {
     THEME.read().unwrap().selection
 }
 
+/// Indexed palette color with the runtime theme applied to 0..16 (the fixed
+/// cube/grayscale above). The editor keys its syntax colors off this so
+/// terminal themes restyle code automatically.
+pub fn ansi(i: usize) -> [u8; 3] {
+    if i < 16 {
+        THEME.read().unwrap().ansi[i]
+    } else {
+        ANSI_256[i.min(255)]
+    }
+}
+
 /// Standard xterm 256-color palette: 16 system + 6x6x6 cube + 24 grays. Used for
 /// indexed colors >= 16; indices 0..16 go through the runtime theme in [`resolve`].
 pub static ANSI_256: [[u8; 3]; 256] = build_palette();

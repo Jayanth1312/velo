@@ -113,6 +113,12 @@ impl Document {
         self.rev
     }
 
+    /// Char index where `line` starts (view/selection bookkeeping).
+    pub fn line_start_char(&self, line: usize) -> usize {
+        self.rope
+            .line_to_char(line.min(self.rope.len_lines().saturating_sub(1)))
+    }
+
     pub fn save(&mut self) -> std::io::Result<()> {
         std::fs::write(&self.path, self.text())?;
         self.dirty = false;

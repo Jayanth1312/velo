@@ -4,4 +4,6 @@
 //! terminal renderer draws it (theme/opacity/zoom/smooth-scroll for free).
 
 mod buffer;
+mod view;
 pub use buffer::{Document, Move};
+pub use view::{Span, View};
