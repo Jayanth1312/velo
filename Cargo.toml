@@ -8,6 +8,7 @@ members = [
   "crates/ui",
   "crates/app",
   "crates/ffi",
+  "crates/editor",
 ]
 
 [workspace.package]
@@ -37,3 +38,4 @@ pty-win   = { path = "crates/pty-win" }
 renderer  = { path = "crates/renderer" }
 text      = { path = "crates/text" }
 ui        = { path = "crates/ui" }
+editor    = { path = "crates/editor" }
