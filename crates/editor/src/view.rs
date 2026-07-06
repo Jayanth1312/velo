@@ -10,7 +10,7 @@ use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell};
 pub const TAB_WIDTH: usize = 4;
 
 /// One highlight run on a line: char columns [start, end) -> fg color.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

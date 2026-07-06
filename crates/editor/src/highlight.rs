@@ -37,7 +37,9 @@ const MAX_HIGHLIGHT_BYTES: usize = 1 << 20;
 pub struct Highlighter {
     config: HighlightConfiguration,
     ts: TsHighlighter,
-    cached_rev: Option<u64>,
+    /// (Document::rev, palette::epoch) the cache was built for — theme swaps
+    /// must re-resolve span colors even when the text is unchanged.
+    cached_key: Option<(u64, u64)>,
     cache: Vec<Vec<Span>>,
 }
 
@@ -95,17 +97,18 @@ impl Highlighter {
         Some(Self {
             config,
             ts: TsHighlighter::new(),
-            cached_rev: None,
+            cached_key: None,
             cache: Vec::new(),
         })
     }
 
     /// Per-line spans for `text`; recomputed only when `rev` changes.
     pub fn lines(&mut self, text: &str, rev: u64) -> &[Vec<Span>] {
-        if self.cached_rev == Some(rev) {
+        let key = (rev, palette::epoch());
+        if self.cached_key == Some(key) {
             return &self.cache;
         }
-        self.cached_rev = Some(rev);
+        self.cached_key = Some(key);
         let n_lines = text.split('\n').count();
         self.cache = vec![Vec::new(); n_lines.max(1)];
         if text.len() > MAX_HIGHLIGHT_BYTES {
@@ -181,6 +184,24 @@ mod tests {
         let p1 = h.lines("def f():\n    pass\n", 7).as_ptr();
         let p2 = h.lines("IGNORED — same rev means cache hit", 7).as_ptr();
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn theme_change_invalidates_span_cache() {
+        let mut h = Highlighter::for_path("a.rs").unwrap();
+        let before = h.lines("fn main() {}\n", 1)[0].clone();
+        let mut ansi = palette::BASE16;
+        ansi[5] = [1, 2, 3]; // keyword slot
+        palette::set_theme(ansi, [9, 9, 9], [9, 9, 9], [9, 9, 9]);
+        let after = h.lines("fn main() {}\n", 1)[0].clone();
+        // Restore defaults so parallel tests see sane colors.
+        palette::set_theme(
+            palette::BASE16,
+            palette::DEFAULT_FG,
+            palette::DEFAULT_FG,
+            palette::SELECTION_BG,
+        );
+        assert_ne!(before, after, "same rev must re-resolve colors after set_theme");
     }
 
     #[test]
