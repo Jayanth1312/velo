@@ -6,6 +6,28 @@
 use ropey::Rope;
 use std::path::Path;
 
+/// Cursor movement commands (shift-extended when `select` is true).
+#[derive(Clone, Copy)]
+pub enum Move {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordLeft,
+    WordRight,
+    Home,
+    End,
+    /// Page size = visible rows, passed by the caller.
+    PageUp(usize),
+    PageDown(usize),
+    DocStart,
+    DocEnd,
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// One undoable edit: chars replaced at [start, start+removed) with `inserted`.
 /// Inverse is applied on undo; reapplied on redo.
 struct Edit {
@@ -30,6 +52,8 @@ pub struct Document {
     dirty: bool,
     /// Bumped on every content change (highlight cache key).
     rev: u64,
+    /// Sticky column for vertical movement through short lines.
+    goal_col: Option<usize>,
 }
 
 impl Document {
@@ -44,6 +68,7 @@ impl Document {
             redo: Vec::new(),
             dirty: false,
             rev: 0,
+            goal_col: None,
         }
     }
 
@@ -124,6 +149,7 @@ impl Document {
         self.line = l;
         self.col = c;
         self.anchor = None;
+        self.goal_col = None;
     }
 
     /// Extend/replace selection: keep (or set) the anchor, move the cursor.
@@ -134,6 +160,7 @@ impl Document {
         let (l, c) = self.clamp(line, col);
         self.line = l;
         self.col = c;
+        self.goal_col = None;
     }
 
     /// Selection as ordered char range, if non-empty.
@@ -179,6 +206,90 @@ impl Document {
         self.redo.clear();
         self.dirty = true;
         self.rev += 1;
+        self.goal_col = None;
+    }
+
+    pub fn move_cursor(&mut self, m: Move, select: bool) {
+        if select && self.anchor.is_none() {
+            self.anchor = Some((self.line, self.col));
+        }
+        // Vertical moves remember the widest column wanted; everything else
+        // resets the goal.
+        let mut keep_goal = false;
+        match m {
+            Move::Left => {
+                if self.col > 0 {
+                    self.col -= 1;
+                } else if self.line > 0 {
+                    self.line -= 1;
+                    self.col = self.line_len(self.line);
+                }
+            }
+            Move::Right => {
+                if self.col < self.line_len(self.line) {
+                    self.col += 1;
+                } else if self.line + 1 < self.rope.len_lines() {
+                    self.line += 1;
+                    self.col = 0;
+                }
+            }
+            Move::Up | Move::Down | Move::PageUp(_) | Move::PageDown(_) => {
+                keep_goal = true;
+                let goal = self.goal_col.unwrap_or(self.col);
+                self.goal_col = Some(goal);
+                let delta = match m {
+                    Move::Up => -1i64,
+                    Move::Down => 1,
+                    Move::PageUp(n) => -(n as i64),
+                    Move::PageDown(n) => n as i64,
+                    _ => unreachable!(),
+                };
+                let max = self.rope.len_lines().saturating_sub(1) as i64;
+                self.line = (self.line as i64 + delta).clamp(0, max) as usize;
+                self.col = goal.min(self.line_len(self.line));
+            }
+            Move::WordLeft => {
+                let mut idx = self.char_idx(self.line, self.col);
+                while idx > 0 && !is_word(self.rope.char(idx - 1)) {
+                    idx -= 1;
+                }
+                while idx > 0 && is_word(self.rope.char(idx - 1)) {
+                    idx -= 1;
+                }
+                let (l, c) = self.cursor_from_char(idx);
+                self.line = l;
+                self.col = c;
+            }
+            Move::WordRight => {
+                let len = self.rope.len_chars();
+                let mut idx = self.char_idx(self.line, self.col);
+                while idx < len && is_word(self.rope.char(idx)) {
+                    idx += 1;
+                }
+                while idx < len && !is_word(self.rope.char(idx)) {
+                    idx += 1;
+                }
+                let (l, c) = self.cursor_from_char(idx);
+                self.line = l;
+                self.col = c;
+            }
+            Move::Home => self.col = 0,
+            Move::End => self.col = self.line_len(self.line),
+            Move::DocStart => {
+                self.line = 0;
+                self.col = 0;
+            }
+            Move::DocEnd => {
+                self.line = self.rope.len_lines().saturating_sub(1);
+                self.col = self.line_len(self.line);
+            }
+        }
+        if !keep_goal {
+            self.goal_col = None;
+        }
+        if !select {
+            self.anchor = None;
+        }
     }
 
     pub fn insert(&mut self, s: &str) {
@@ -363,6 +474,67 @@ mod tests {
         assert!(!d.dirty());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "data");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn arrows_and_line_wrapping_moves() {
+        let mut d = doc("ab\ncd");
+        d.set_cursor(0, 2);
+        d.move_cursor(Move::Right, false); // wraps to next line
+        assert_eq!(d.cursor(), (1, 0));
+        d.move_cursor(Move::Left, false); // wraps back
+        assert_eq!(d.cursor(), (0, 2));
+        d.move_cursor(Move::Home, false);
+        assert_eq!(d.cursor(), (0, 0));
+        d.move_cursor(Move::End, false);
+        assert_eq!(d.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn up_down_sticky_column() {
+        let mut d = doc("longline\nab\nlongline");
+        d.set_cursor(0, 6);
+        d.move_cursor(Move::Down, false); // short line clamps
+        assert_eq!(d.cursor(), (1, 2));
+        d.move_cursor(Move::Down, false); // returns to goal col
+        assert_eq!(d.cursor(), (2, 6));
+    }
+
+    #[test]
+    fn word_moves() {
+        let mut d = doc("foo bar_baz  qux");
+        d.set_cursor(0, 0);
+        d.move_cursor(Move::WordRight, false);
+        assert_eq!(d.cursor(), (0, 4)); // start of "bar_baz"
+        d.move_cursor(Move::WordRight, false);
+        assert_eq!(d.cursor(), (0, 13)); // start of "qux"
+        d.move_cursor(Move::WordLeft, false);
+        assert_eq!(d.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn shift_moves_select() {
+        let mut d = doc("hello");
+        d.set_cursor(0, 0);
+        d.move_cursor(Move::Right, true);
+        d.move_cursor(Move::Right, true);
+        assert_eq!(d.selection_text().as_deref(), Some("he"));
+        d.move_cursor(Move::Right, false); // unshifted move collapses
+        assert!(d.selection_text().is_none());
+    }
+
+    #[test]
+    fn page_and_doc_moves() {
+        let text = (0..50).map(|i| format!("l{i}\n")).collect::<String>();
+        let mut d = doc(&text);
+        d.move_cursor(Move::PageDown(10), false);
+        assert_eq!(d.cursor().0, 10);
+        d.move_cursor(Move::DocEnd, false);
+        assert_eq!(d.cursor().0, d.line_count() - 1);
+        d.move_cursor(Move::PageUp(10), false);
+        assert_eq!(d.cursor().0, d.line_count() - 1 - 10);
+        d.move_cursor(Move::DocStart, false);
+        assert_eq!(d.cursor(), (0, 0));
     }
 
     #[test]
