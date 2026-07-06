@@ -2417,6 +2417,12 @@ public sealed partial class MainWindow : Window
         TitleBar.Background = surface;
         SidebarSurface.Background = surface;
         DetailsSurface.Background = surface;
+        // Editor tab strip composites like the rest of the chrome, and its
+        // text follows the terminal theme's foreground.
+        EditorTabs.Background = surface;
+        var fg = Themes.Rgb(Themes.ByName(_settings.ThemeName).Fg);
+        EditorTabs.Foreground = new SolidColorBrush(
+            Microsoft.UI.ColorHelper.FromArgb(0xFF, fg.R, fg.G, fg.B));
         // Palette card: same tint as the chrome, but floored so text stays
         // readable over the dim overlay at very low opacity settings.
         byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);

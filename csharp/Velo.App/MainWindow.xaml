@@ -307,6 +307,14 @@
                           SelectionChanged="EditorTabs_SelectionChanged"
                           ScrollViewer.HorizontalScrollMode="Enabled"
                           ScrollViewer.HorizontalScrollBarVisibility="Hidden">
+                    <ListView.Resources>
+                        <!-- Theme-neutral translucent overlays so tabs blend with
+                             the terminal tint instead of stock light/dark pills. -->
+                        <SolidColorBrush x:Key="ListViewItemBackground" Color="Transparent" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="#22FFFFFF" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#33FFFFFF" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="#3DFFFFFF" />
+                    </ListView.Resources>
                     <ListView.ItemsPanel>
                         <ItemsPanelTemplate>
                             <ItemsStackPanel Orientation="Horizontal" />
