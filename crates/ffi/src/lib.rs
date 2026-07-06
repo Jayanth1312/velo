@@ -163,7 +163,7 @@ mod imp {
 
     /// How long after a resize/zoom to suppress scroll glides (ConPTY repaints
     /// arrive asynchronously, several frames later).
-    const GLIDE_MUTE_AFTER_RESIZE: std::time::Duration = std::time::Duration::from_millis(300);
+    const GLIDE_MUTE_AFTER_RESIZE: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Double-buffered flip swapchain.
     const BACKBUFFER_COUNT: u32 = 2;
@@ -587,8 +587,16 @@ mod imp {
                 frame.damage = term_core::FrameDamage::Full;
                 pane.force_full = false;
             }
-            if frame.scrolled_up != 0 && std::time::Instant::now() >= pane.glide_mute_until {
-                pane.renderer.scroll_bump(frame.scrolled_up);
+            if frame.scrolled_up != 0 {
+                // Shifts a wheel/stream can produce are small; anything bigger
+                // is a resize/ConPTY repaint — snap, don't glide. Snapping also
+                // wipes stale overscan content.
+                let organic = frame.scrolled_up.unsigned_abs() <= renderer::OVERSCAN_ROWS as u32;
+                if organic && std::time::Instant::now() >= pane.glide_mute_until {
+                    pane.renderer.scroll_bump(frame.scrolled_up);
+                } else {
+                    pane.renderer.scroll_reset();
+                }
             }
             let bb = unsafe { pane.swapchain.GetCurrentBackBufferIndex() } as usize;
             let Some((_, view)) = pane.backbuffers.get(bb) else {
