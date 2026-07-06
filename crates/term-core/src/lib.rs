@@ -621,6 +621,18 @@ mod tests {
     }
 
     #[test]
+    fn wide_char_emits_single_leading_cell() {
+        let mut t = term(); // 4 cols x 2 rows
+        t.advance("😀".to_string().as_bytes());
+        let f = t.frame();
+        let emoji: Vec<_> = f.cells.iter().filter(|c| c.c == '😀').collect();
+        assert_eq!(emoji.len(), 1, "emoji must render exactly once");
+        assert_eq!(emoji[0].col, 0);
+        // The spacer cell (col 1) must not emit a glyph.
+        assert!(!f.cells.iter().any(|c| c.col == 1 && c.c != '\0'));
+    }
+
+    #[test]
     fn scrolled_up_negative_on_scrollback() {
         let mut t = term();
         t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
