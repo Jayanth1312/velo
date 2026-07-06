@@ -2402,6 +2402,10 @@ public sealed partial class MainWindow : Window
         TitleBar.Background = surface;
         SidebarSurface.Background = surface;
         DetailsSurface.Background = surface;
+        // Palette card: same tint as the chrome, but floored so text stays
+        // readable over the dim overlay at very low opacity settings.
+        byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
+        PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
     }
 
     private async void Settings_Click(object sender, RoutedEventArgs e)
