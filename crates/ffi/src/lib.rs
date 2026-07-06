@@ -161,6 +161,10 @@ mod imp {
         tab_title: String,
     }
 
+    /// How long after a resize/zoom to suppress scroll glides (ConPTY repaints
+    /// arrive asynchronously, several frames later).
+    const GLIDE_MUTE_AFTER_RESIZE: std::time::Duration = std::time::Duration::from_millis(300);
+
     /// Double-buffered flip swapchain.
     const BACKBUFFER_COUNT: u32 = 2;
     /// wgpu view format over the `R8G8B8A8_UNORM` swapchain buffers (sRGB RTV
@@ -194,6 +198,10 @@ mod imp {
         session: usize,
         /// Force a full repaint next frame (set on bind / resize / theme change).
         force_full: bool,
+        /// Glides are suppressed until this instant. Resize/zoom triggers an
+        /// async ConPTY repaint whose history churn would otherwise read as
+        /// content motion and fire a bogus bounce glide.
+        glide_mute_until: std::time::Instant,
     }
 
     impl Pane {
@@ -579,7 +587,7 @@ mod imp {
                 frame.damage = term_core::FrameDamage::Full;
                 pane.force_full = false;
             }
-            if frame.scrolled_up != 0 {
+            if frame.scrolled_up != 0 && std::time::Instant::now() >= pane.glide_mute_until {
                 pane.renderer.scroll_bump(frame.scrolled_up);
             }
             let bb = unsafe { pane.swapchain.GetCurrentBackBufferIndex() } as usize;
@@ -674,6 +682,7 @@ mod imp {
                 };
                 p.apply_size(&self.device, w, h, dpi);
                 let (cols, rows) = p.recompute_grid(&self.font, dpi);
+                p.glide_mute_until = std::time::Instant::now() + GLIDE_MUTE_AFTER_RESIZE;
                 (p.session, cols, rows)
             };
             let (sid, cols, rows) = bound;
@@ -708,6 +717,7 @@ mod imp {
                 if let Some(Some(p)) = self.panes.get_mut(i) {
                     p.renderer.set_font_metrics(cell_w, cell_h, ascent);
                     p.recompute_grid(&self.font, dpi);
+                    p.glide_mute_until = std::time::Instant::now() + GLIDE_MUTE_AFTER_RESIZE;
                 }
             }
             // Reflow each pane's bound session, then repaint all.
@@ -795,6 +805,7 @@ mod imp {
                 rows: 24,
                 session: NO_SESSION,
                 force_full: true,
+                glide_mute_until: std::time::Instant::now(),
             };
             let id = self
                 .panes
