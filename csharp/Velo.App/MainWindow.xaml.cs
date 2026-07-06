@@ -2504,10 +2504,44 @@ public sealed partial class MainWindow : Window
         OnSwitchTabRequested = (IntPtr)(delegate* unmanaged<IntPtr, byte, void>)&OnSwitchTabRequested,
         OnCwdChanged = (IntPtr)(delegate* unmanaged<IntPtr, uint, ushort*, nuint, void>)&OnCwdChanged,
         OnCommand = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, int, ulong, ushort*, nuint, void>)&OnCommand,
+        OnAnim = (IntPtr)(delegate* unmanaged<IntPtr, void>)&OnAnim,
     };
 
     private static MainWindow? FromCtx(IntPtr ctx)
         => ctx == IntPtr.Zero ? null : GCHandle.FromIntPtr(ctx).Target as MainWindow;
+
+    [UnmanagedCallersOnly]
+    private static void OnAnim(IntPtr ctx)
+    {
+        // Fired on the UI thread (subclass proc) whenever a render leaves a
+        // scroll glide in flight; StartAnimPump is idempotent.
+        FromCtx(ctx)?.StartAnimPump();
+    }
+
+    private bool _animPumping;
+    private long _animLastTicks;
+
+    /// Drive velo_tick from the compositor while a scroll glide is live.
+    private void StartAnimPump()
+    {
+        if (_animPumping)
+            return;
+        _animPumping = true;
+        _animLastTicks = Stopwatch.GetTimestamp();
+        CompositionTarget.Rendering += AnimPump_Rendering;
+    }
+
+    private void AnimPump_Rendering(object? sender, object e)
+    {
+        long now = Stopwatch.GetTimestamp();
+        float dtMs = (float)((now - _animLastTicks) * 1000.0 / Stopwatch.Frequency);
+        _animLastTicks = now;
+        if (Native.velo_tick(_engine, dtMs) == 0)
+        {
+            CompositionTarget.Rendering -= AnimPump_Rendering;
+            _animPumping = false;
+        }
+    }
 
     [UnmanagedCallersOnly]
     private static unsafe void OnTitleChanged(IntPtr ctx, uint id, ushort* utf16, nuint len)

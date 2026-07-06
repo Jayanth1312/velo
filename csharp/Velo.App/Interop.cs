@@ -27,6 +27,7 @@ internal static unsafe partial class Native
         public IntPtr OnSwitchTabRequested;// (ctx, forward)
         public IntPtr OnCwdChanged;       // (ctx, id, utf16*, len)
         public IntPtr OnCommand;          // (ctx, id, phase, exit, dur_ms, utf16*, len)
+        public IntPtr OnAnim;             // (ctx) — start driving velo_tick
     }
 
     /// Init GPU + composition swapchain + the core's internal wakeup window.
@@ -45,6 +46,10 @@ internal static unsafe partial class Native
     /// Draw + present the active session immediately.
     [LibraryImport(Core)]
     internal static partial void velo_render(IntPtr eng);
+
+    /// Advance smooth-scroll animations; returns 1 while more frames are needed.
+    [LibraryImport(Core)]
+    internal static partial int velo_tick(IntPtr eng, float dtMs);
 
     /// Forward a key-down. mods bit0=Ctrl, bit1=Shift, bit2=Alt. Returns 1 if handled.
     [LibraryImport(Core)]
