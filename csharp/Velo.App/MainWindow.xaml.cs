@@ -2660,6 +2660,11 @@ public sealed partial class MainWindow : Window
     private void EditorTabClose_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.Tag is not uint id) return;
+        CloseEditorFile(id);
+    }
+
+    private void CloseEditorFile(uint id)
+    {
         Native.velo_editor_close_file(_engine, id);
         var vm = EditorFiles.FirstOrDefault(f => f.Id == id);
         if (vm is not null) EditorFiles.Remove(vm);
@@ -2671,6 +2676,13 @@ public sealed partial class MainWindow : Window
     private void EditorPanel_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero) return;
+        // Ctrl+W closes the focused file (editor mode only).
+        if (e.Key == Windows.System.VirtualKey.W && (Modifiers() & 1) != 0)
+        {
+            if (EditorTabs.SelectedItem is EditorFileVM cur) CloseEditorFile(cur.Id);
+            e.Handled = true;
+            return;
+        }
         if (Native.velo_editor_key(_engine, (uint)e.Key, Modifiers()) != 0)
             e.Handled = true;
     }
