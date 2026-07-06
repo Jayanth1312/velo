@@ -121,6 +121,9 @@ mod imp {
         /// command mark. phase: 0 prompt, 1 command-start (text), 2 command-end.
         pub on_command:
             Option<extern "C" fn(*mut c_void, u32, u8, i32, u64, *const u16, usize)>,
+        /// (ctx) — a smooth-scroll glide started; the shell should drive
+        /// `velo_tick` from its compositor frame callback until it returns 0.
+        pub on_anim: Option<extern "C" fn(*mut c_void)>,
     }
 
     impl Default for VeloCallbacks {
@@ -135,6 +138,7 @@ mod imp {
                 on_switch_tab_requested: None,
                 on_cwd_changed: None,
                 on_command: None,
+                on_anim: None,
             }
         }
     }
@@ -537,6 +541,9 @@ mod imp {
                 frame.damage = term_core::FrameDamage::Full;
                 pane.force_full = false;
             }
+            if frame.scrolled_up != 0 {
+                pane.renderer.scroll_bump(frame.scrolled_up);
+            }
             let bb = unsafe { pane.swapchain.GetCurrentBackBufferIndex() } as usize;
             let Some((_, view)) = pane.backbuffers.get(bb) else {
                 return;
@@ -556,6 +563,39 @@ mod imp {
             unsafe {
                 let _ = pane.swapchain.Present(0, DXGI_PRESENT(0)).ok();
             }
+            // A glide is live: tell C# to start driving velo_tick. Its handler
+            // is idempotent (hooking an already-hooked pump is a no-op).
+            let animating =
+                matches!(self.panes.get(idx), Some(Some(p)) if p.renderer.scroll_active());
+            if animating {
+                if let Some(f) = self.cb.on_anim {
+                    f(self.cb.ctx);
+                }
+            }
+        }
+
+        /// Advance every pane's smooth-scroll glide by `dt_ms` and repaint the
+        /// ones that moved. Returns true while any pane still needs frames.
+        fn tick(&mut self, dt_ms: f32) -> bool {
+            let mut any = false;
+            for i in 0..self.panes.len() {
+                let moved = match self.panes.get_mut(i) {
+                    Some(Some(p)) if p.renderer.scroll_active() => {
+                        p.renderer.scroll_tick(dt_ms);
+                        true
+                    }
+                    _ => false,
+                };
+                if moved {
+                    // Re-renders with the advanced offset; if new PTY data
+                    // landed between ticks this also re-bumps (flood glide).
+                    self.render_pane(i);
+                    if matches!(self.panes.get(i), Some(Some(p)) if p.renderer.scroll_active()) {
+                        any = true;
+                    }
+                }
+            }
+            any
         }
 
         /// Render every pane (used for initial paint + theme changes).
@@ -1718,6 +1758,19 @@ mod imp {
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
+    /// Advance smooth-scroll animations by `dt_ms` and repaint animating panes.
+    /// Returns 1 while more frames are needed, 0 when everything settled.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_tick(eng: *mut Engine, dt_ms: f32) -> i32 {
+        match eng.as_mut() {
+            Some(e) => e.tick(dt_ms) as i32,
+            None => 0,
+        }
+    }
+
     #[no_mangle]
     pub unsafe extern "C" fn velo_pane_scroll(
         eng: *mut Engine,
