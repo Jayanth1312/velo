@@ -173,6 +173,30 @@ impl Font {
         }
     }
 
+    /// Change the shaping size without reloading any font data. Reuses the
+    /// existing `font_system` (no fontdb/FontSystem rebuild, no file I/O) and
+    /// just re-derives cell metrics the same way [`Font::new`] does: rebuild
+    /// the shaping buffer at the new `Metrics`, re-shape "M", re-measure.
+    pub fn set_size(&mut self, font_size: f32) {
+        let metrics = Metrics::new(font_size, font_size * 1.2);
+        self.buffer = Buffer::new(&mut self.font_system, metrics);
+
+        let attrs = mono_attrs(&self.family, false, false);
+        self.buffer
+            .set_text(&mut self.font_system, "M", &attrs, Shaping::Advanced, None);
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let (raw_w, raw_ascent) = self
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first().map(|g| (g.w, run.line_y)))
+            .unwrap_or((font_size * 0.6, font_size));
+        self.cell_w = raw_w.round().max(1.0);
+        self.cell_h = metrics.line_height.round().max(1.0);
+        self.ascent = raw_ascent.round();
+    }
+
     /// Rasterize one char. `bold`/`italic` select font variants; `subpx_x` is the
     /// fractional pen x-position (0.0..1.0) baked into the glyph's sub-pixel cache
     /// key for crisper positioning. Returns `None` for blank/empty glyphs.
@@ -280,6 +304,18 @@ mod tests {
         let menu = char::from(Icon::Menu);
         let r = font.rasterize(menu, false, false, 0.0);
         assert!(r.is_some(), "lucide Menu icon should rasterize");
+    }
+
+    #[test]
+    fn set_size_matches_fresh_font_new() {
+        // set_size (reusing the FontSystem) must land on the same cell metrics
+        // as constructing a fresh Font at that size from scratch.
+        let mut font = Font::new(12.0);
+        font.set_size(20.0);
+        let fresh = Font::new(20.0);
+        assert_eq!(font.cell_w, fresh.cell_w);
+        assert_eq!(font.cell_h, fresh.cell_h);
+        assert_eq!(font.ascent, fresh.ascent);
     }
 
     #[test]

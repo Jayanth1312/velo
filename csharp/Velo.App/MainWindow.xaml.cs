@@ -10,6 +10,7 @@ using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
@@ -24,8 +25,20 @@ namespace Velo.App;
 
 public sealed partial class MainWindow : Window
 {
-    /// Vertical-tab list, bound to the sidebar ListView.
+    /// All tabs in display order (groups flattened). Drives switch/index logic; kept
+    /// in sync from <see cref="_layout"/>. The ListView binds to TabListItems, not this.
     public ObservableCollection<TabVM> Tabs { get; } = new();
+
+    /// What the sidebar ListView shows: group-header rows (TabGroup) interleaved with
+    /// tab rows (TabVM). Rebuilt from _layout; a collapsed group emits only its header.
+    public ObservableCollection<object> TabListItems { get; } = new();
+
+    /// Source of truth for tab order + grouping: each entry is a bare TabVM (ungrouped)
+    /// or a TabGroup (which owns its member TabVMs). Tabs/TabListItems derive from this.
+    private readonly List<object> _layout = new();
+
+    /// Tabs currently Ctrl+Click-selected, awaiting a Ctrl+G group action.
+    private readonly HashSet<TabVM> _selected = new();
 
     /// Filtered rows shown in the command palette.
     public ObservableCollection<PaletteItem> PaletteItems { get; } = new();
@@ -69,9 +82,19 @@ public sealed partial class MainWindow : Window
 
     public MainWindow()
     {
-        Log.Write("ctor: enter");
+        Log.Write("ctor: enter [build:geom-unparent+simple-backdrop]");
         InitializeComponent();
         Log.Write($"ctor: InitializeComponent done. Content={Content?.GetType().Name ?? "null"}");
+
+        // Selector wired in code, not XAML: instantiating a custom
+        // DataTemplateSelector as a <Grid.Resources> entry crashes the WinUI 1.6
+        // XamlCompiler (silent exit 1). Templates stay in XAML; we just bind them
+        // to the selector here and hand it to the tab list.
+        TabList.ItemTemplateSelector = new TabRowTemplateSelector
+        {
+            TabTemplate = (DataTemplate)RootGrid.Resources["TabRowTemplate"],
+            GroupHeaderTemplate = (DataTemplate)RootGrid.Resources["GroupHeaderTemplate"],
+        };
 
         // DEBUG: bracket the first-layout crash. These fire in order:
         // root.Loading -> root.Loaded -> PaneHost_Loaded -> TerminalPanel Loaded ->
@@ -84,9 +107,11 @@ public sealed partial class MainWindow : Window
         Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += OnFirstRender;
 
         // Inject shell integration before the first shell spawns so OSC 7/133
-        // emitters are live in tab 1's profile load.
-        ShellIntegration.Ensure(_settings);
-        Log.Write("ctor: ShellIntegration done");
+        // emitters are live in tab 1's profile load. Dispatched off-thread: it
+        // only touches profile files, injection is idempotent, and nothing in
+        // the ctor depends on it completing.
+        Task.Run(() => ShellIntegration.Ensure(_settings));
+        Log.Write("ctor: ShellIntegration dispatched");
         SelectDetailsTab(InfoTabButton);   // default section, shown when panel opens
         Log.Write("ctor: SelectDetailsTab done");
 
@@ -133,7 +158,46 @@ public sealed partial class MainWindow : Window
 
     // Fires when the terminal host Grid loads — right before TerminalPanel_Loaded.
     private void PaneHost_Loaded(object sender, RoutedEventArgs e)
-        => Log.Write($"PaneHost_Loaded: size={PaneHost.ActualWidth}x{PaneHost.ActualHeight}");
+    {
+        Log.Write($"PaneHost_Loaded: size={PaneHost.ActualWidth}x{PaneHost.ActualHeight}");
+        // XAML KeyDown="..." registers with handledEventsToo:false, so if the
+        // framework marks the key event Handled (accelerators / focus internals)
+        // before it reaches us, the handler is silently skipped — the "can't type"
+        // bug (log shows focus=Grid but no Panel_KeyDown ever fires). Re-register
+        // with handledEventsToo:true so we receive the keys regardless.
+        PaneHost.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(Panel_KeyDown), true);
+        PaneHost.AddHandler(
+            UIElement.CharacterReceivedEvent,
+            new TypedEventHandler<UIElement, CharacterReceivedRoutedEventArgs>(Panel_CharacterReceived),
+            true);
+
+        // Root-level safety net: if focus drifts off the terminal (sidebar list, a
+        // realized details control, a dismissed flyout) PaneHost stops receiving keys
+        // and the terminal goes dead even though FocusManager still reports the Grid.
+        // Catch keys at the window root and forward them to the terminal UNLESS focus
+        // is on the terminal already (PaneHost handler covers it — avoid double input)
+        // or in a text box (palette / find boxes own their typing).
+        RootGrid.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(Root_KeyDown), true);
+        RootGrid.AddHandler(
+            UIElement.CharacterReceivedEvent,
+            new TypedEventHandler<UIElement, CharacterReceivedRoutedEventArgs>(Root_CharacterReceived),
+            true);
+
+        // Ctrl+, → Settings. The comma is VK_OEM_COMMA (188); VirtualKey has no name
+        // for it, so the accelerator is built in code rather than XAML.
+        var settingsAccel = new KeyboardAccelerator
+        {
+            Modifiers = VirtualKeyModifiers.Control,
+            Key = (VirtualKey)188,
+        };
+        settingsAccel.Invoked += (_, args) => { args.Handled = true; Settings_Click(this, null!); };
+        RootGrid.KeyboardAccelerators.Add(settingsAccel);
+
+        // Ctrl+G → group the Ctrl+Click-selected tabs.
+        var groupAccel = new KeyboardAccelerator { Modifiers = VirtualKeyModifiers.Control, Key = VirtualKey.G };
+        groupAccel.Invoked += GroupAccel_Invoked;
+        RootGrid.KeyboardAccelerators.Add(groupAccel);
+    }
 
     // ---- Lifecycle --------------------------------------------------------
 
@@ -301,10 +365,11 @@ public sealed partial class MainWindow : Window
     {
         _sidebarOpen = open;
         AnimateWidth(ToggleBar, open ? BarOpen : BarClosed);
-        // Instant, both ways: the column width is the only thing that moves, so the
-        // terminal resizes exactly once (crisp, no flash) and the panel + its content
-        // appear/disappear in the same frame (no slide lag, no lingering border).
-        SidebarSurface.Width = open ? SidebarWidth : 0;
+        // Animate the column width instead of an instant jump: a 280px one-frame jump
+        // exposes a misaligned strip at the terminal↔sidebar seam (the swapchain's
+        // DComp present lags the XAML column commit by a frame → the color flash). At
+        // ~a few px per frame that desync is sub-pixel and reads as motion, not a flash.
+        AnimateWidth(SidebarSurface, open ? SidebarWidth : 0);
         FocusTerminal();
     }
 
@@ -345,9 +410,10 @@ public sealed partial class MainWindow : Window
     /// Mirror of SetSidebar for the LEFT details column.
     private void SetDetails(bool open)
     {
+        Log.Write($"SetDetails: open={open} tab={_activeDetailsTab} realized={_detailsRealized}");
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
-        DetailsSurface.Width = open ? SidebarWidth : 0;   // instant, see SetSidebar
+        AnimateWidth(DetailsSurface, open ? SidebarWidth : 0);   // animated, see SetSidebar
         if (open)
             EnsureDetailsRealized();   // build + fill the panels on first open
         FocusTerminal();
@@ -359,6 +425,13 @@ public sealed partial class MainWindow : Window
             SelectDetailsTab(b);
         if (!_detailsOpen)
             SetDetails(true);
+        // Files button doubles as the editor-mode toggle: first click opens the
+        // tree + editor surface, clicking again returns to the terminal.
+        if (ReferenceEquals(sender, FilesTabButton))
+        {
+            SetEditorMode(!_editorMode);
+            return; // SetEditorMode owns focus either way
+        }
         FocusTerminal();
     }
 
@@ -408,8 +481,8 @@ public sealed partial class MainWindow : Window
             RefreshDetails();
             return;
         }
-        if ((Content as FrameworkElement)?.FindName("DetailsBodyHost") is null)   // realizes the x:Load subtree
-            return;
+        DetailsBodyHost.Visibility = Visibility.Visible;   // build/measure the bodies now (first open)
+        Log.Write($"EnsureDetailsRealized: bodies shown InfoPanel={(InfoPanel is null ? "null" : "ok")}");
         _detailsRealized = true;
         ApplyDetailsTab();
         RefreshDetails();
@@ -470,8 +543,73 @@ public sealed partial class MainWindow : Window
         Clipboard.SetContent(dp);
     }
 
-    private void InfoReveal_Click(object sender, RoutedEventArgs e) => ShellOpen(CurrentCwd());
-    private void InfoOpenCode_Click(object sender, RoutedEventArgs e) => ShellExec("code", CurrentCwd());
+    // Reveal the tab's cwd in Explorer. The raw cwd may be a WSL path
+    // (/mnt/d/velo) that Windows can't open directly, so convert first.
+    private void InfoReveal_Click(object sender, RoutedEventArgs e)
+    {
+        var raw = CurrentTab()?.Cwd;
+        var win = ToWindowsPath(raw);
+        Log.Write($"reveal: raw={raw ?? "<null>"} win={win ?? "<null>"}");
+        // No fallback: explorer.exe opens Documents for any arg it can't parse,
+        // which is worse than doing nothing.
+        if (win is null || !Directory.Exists(win))
+        {
+            Log.Write("reveal: skipped (no cwd or directory missing)");
+            return;
+        }
+        try { Process.Start(new ProcessStartInfo("explorer.exe", $"\"{win}\"") { UseShellExecute = true }); }
+        catch { /* best effort */ }
+    }
+
+    /// Default WSL distro name (first line of `wsl.exe -l -q`), cached; null if
+    /// WSL is unavailable.
+    private static string? _wslDistro;
+    private static bool _wslDistroProbed;
+
+    private static string? WslDistro()
+    {
+        if (_wslDistroProbed) return _wslDistro;
+        _wslDistroProbed = true;
+        try
+        {
+            var psi = new ProcessStartInfo("wsl.exe", "-l -q")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.Unicode,
+            };
+            using var p = Process.Start(psi);
+            var line = p?.StandardOutput.ReadLine()?.Trim('\0', ' ', '\r', '\n');
+            p?.WaitForExit(2000);
+            _wslDistro = string.IsNullOrWhiteSpace(line) ? null : line;
+        }
+        catch { _wslDistro = null; }
+        return _wslDistro;
+    }
+
+    /// Best-effort Windows path for a shell cwd: maps WSL /mnt/&lt;drive&gt;/… to
+    /// &lt;DRIVE&gt;:\…, any other absolute unix path to \\wsl.localhost\&lt;distro&gt;\…;
+    /// leaves an already-Windows path untouched.
+    private static string? ToWindowsPath(string? cwd)
+    {
+        if (string.IsNullOrEmpty(cwd))
+            return null;
+        if (cwd.Length >= 7 && cwd.StartsWith("/mnt/", StringComparison.Ordinal)
+            && char.IsLetter(cwd[5]) && cwd[6] == '/')
+        {
+            var rest = cwd.Substring(7).Replace('/', '\\');
+            return $"{char.ToUpperInvariant(cwd[5])}:\\{rest}";
+        }
+        if (cwd[0] == '/')
+        {
+            // Inside-WSL path (e.g. /home/user/proj): reachable via the
+            // \\wsl.localhost UNC share of the default distro.
+            var distro = WslDistro();
+            return distro is null ? null : $@"\\wsl.localhost\{distro}{cwd.Replace('/', '\\')}";
+        }
+        return cwd;
+    }
 
     private static void ShellOpen(string path)
     {
@@ -479,32 +617,27 @@ public sealed partial class MainWindow : Window
         catch { /* best effort */ }
     }
 
-    private static void ShellExec(string file, string arg)
-    {
-        try { Process.Start(new ProcessStartInfo { FileName = file, Arguments = $"\"{arg}\"", UseShellExecute = true }); }
-        catch { /* best effort */ }
-    }
-
-    // ---- Files (flat per-directory listing) ----
-    private sealed class FileRow
-    {
-        public string Path = "";
-        public bool IsDir;
-        public string Name = "";
-        // ponytail: list renders via ToString — no DataTemplate.
-        public override string ToString() => (IsDir ? "📁 " : "📄 ") + Name;
-    }
-
+    // ---- Files (lazy tree: VS Code-style explorer) ----
     private void RefreshFiles()
     {
         if (!_detailsRealized)
             return;
         var dir = _filesDir ?? CurrentCwd();
         _filesDir = dir;
-        FilesTree.Items.Clear();
+        FilesTree.RootNodes.Clear();
         if (!Directory.Exists(dir))
             return;
-        var filter = FilesFind.Text ?? "";
+        foreach (var node in BuildNodes(dir, applyFilter: true))
+            FilesTree.RootNodes.Add(node);
+    }
+
+    /// One directory level → TreeViewNodes. Dirs get HasUnrealizedChildren so the
+    /// expander chevron shows and children load lazily on first expand. Find-box
+    /// filter applies only at the root level (children are unfiltered).
+    private IEnumerable<TreeViewNode> BuildNodes(string dir, bool applyFilter)
+    {
+        var filter = applyFilter ? (FilesFind?.Text ?? "") : "";
+        var nodes = new List<TreeViewNode>();
         try
         {
             var entries = new DirectoryInfo(dir).EnumerateFileSystemInfos()
@@ -513,9 +646,67 @@ public sealed partial class MainWindow : Window
                 .OrderByDescending(fi => fi is DirectoryInfo)
                 .ThenBy(fi => fi.Name, StringComparer.OrdinalIgnoreCase);
             foreach (var fi in entries)
-                FilesTree.Items.Add(new FileRow { Path = fi.FullName, IsDir = fi is DirectoryInfo, Name = fi.Name });
+            {
+                var isDir = fi is DirectoryInfo;
+                nodes.Add(new TreeViewNode
+                {
+                    Content = new FileItem { Path = fi.FullName, Name = fi.Name, IsDir = isDir },
+                    HasUnrealizedChildren = isDir,
+                });
+            }
         }
         catch { /* permission etc. */ }
+        return nodes;
+    }
+
+    private void FilesTree_Expanding(TreeView sender, TreeViewExpandingEventArgs args)
+    {
+        if (args.Node.Content is not FileItem fi)
+            return;
+        fi.SetOpen(true);   // swap closed → open folder icon
+        if (args.Node.HasUnrealizedChildren)
+        {
+            foreach (var child in BuildNodes(fi.Path, applyFilter: false))
+                args.Node.Children.Add(child);
+            args.Node.HasUnrealizedChildren = false;
+        }
+    }
+
+    private void FilesTree_Collapsed(TreeView sender, TreeViewCollapsedEventArgs args)
+    {
+        if (args.Node.Content is FileItem fi)
+            fi.SetOpen(false);
+    }
+
+    /// Single click on a folder row toggles its inline reveal.
+    private void FilesTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
+    {
+        // InvokedItem may be the FileItem or the TreeViewNode depending on mode.
+        var fi = args.InvokedItem as FileItem
+                 ?? (args.InvokedItem as TreeViewNode)?.Content as FileItem;
+        if (fi is { IsDir: true })
+        {
+            var node = FindNode(sender.RootNodes, fi);
+            if (node is not null)
+                node.IsExpanded = !node.IsExpanded;
+        }
+        else if (fi is { IsDir: false })
+        {
+            OpenInEditor(fi.Path); // flips to editor mode itself
+        }
+    }
+
+    private static TreeViewNode? FindNode(IList<TreeViewNode> nodes, FileItem item)
+    {
+        foreach (var n in nodes)
+        {
+            if (ReferenceEquals(n.Content, item))
+                return n;
+            var hit = FindNode(n.Children, item);
+            if (hit is not null)
+                return hit;
+        }
+        return null;
     }
 
     private void FilesFind_TextChanged(object sender, TextChangedEventArgs e) => RefreshFiles();
@@ -528,23 +719,33 @@ public sealed partial class MainWindow : Window
         if (p is not null) { _filesDir = p.FullName; RefreshFiles(); }
     }
 
+    /// Double click: open a file, or set a folder as the new tree root.
     private void FilesList_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
     {
-        if (FilesTree.SelectedItem is not FileRow r)
+        if (FilesTree.SelectedNode?.Content is not FileItem fi)
             return;
-        if (r.IsDir) { _filesDir = r.Path; RefreshFiles(); }
-        else ShellOpen(r.Path);
+        if (fi.IsDir) { _filesDir = fi.Path; RefreshFiles(); }
+        else OpenInEditor(fi.Path);
     }
 
     // ---- Git (porcelain status of the cwd's repo) ----
+    private static readonly SolidColorBrush GitBrushMod = new(Windows.UI.Color.FromArgb(255, 0xD2, 0x99, 0x22)); // amber
+    private static readonly SolidColorBrush GitBrushAdd = new(Windows.UI.Color.FromArgb(255, 0x3F, 0xB9, 0x50)); // green
+    private static readonly SolidColorBrush GitBrushDel = new(Windows.UI.Color.FromArgb(255, 0xF8, 0x51, 0x49)); // red
+    private static readonly SolidColorBrush GitBrushRen = new(Windows.UI.Color.FromArgb(255, 0x58, 0xA6, 0xFF)); // blue
+    private static readonly SolidColorBrush GitBrushUnk = new(Windows.UI.Color.FromArgb(255, 0x8B, 0x94, 0x9E)); // gray
+
     private async Task RefreshGitAsync()
     {
         if (!_detailsRealized)
             return;
         var dir = CurrentCwd();
         GitBranch.Text = "…";
-        GitSummary.Text = "";
+        GitAdds.Text = "";
+        GitDels.Text = "";
+        GitRemote.Visibility = Visibility.Collapsed;
         GitFiles.ItemsSource = null;
+        GitUnstagedLabel.Text = "Changes";
 
         var status = await RunGitAsync(dir, "status --porcelain=v1 --branch");
         if (string.IsNullOrWhiteSpace(status))
@@ -554,8 +755,8 @@ public sealed partial class MainWindow : Window
         }
 
         var lines = status.Replace("\r", "").Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        string branch = "—", summary = "";
-        var files = new List<string>();
+        string branch = "—";
+        var rows = new List<GitFileRow>();
         foreach (var ln in lines)
         {
             if (ln.StartsWith("## "))
@@ -563,19 +764,143 @@ public sealed partial class MainWindow : Window
                 var b = ln.Substring(3);
                 int dots = b.IndexOf("...", StringComparison.Ordinal);
                 branch = dots >= 0 ? b.Substring(0, dots) : b;
-                int br = b.IndexOf('[');
-                if (br >= 0) summary = b.Substring(br).Trim('[', ']');
             }
-            else
+            else if (ln.Length >= 3)
             {
-                files.Add(ln);
+                rows.Add(MakeGitRow(ln.Substring(0, 2), ln.Substring(3)));
             }
         }
         GitBranch.Text = branch;
-        GitSummary.Text = files.Count == 0
-            ? (summary.Length > 0 ? $"clean · {summary}" : "clean")
-            : (summary.Length > 0 ? $"Changes ({files.Count}) · {summary}" : $"Changes ({files.Count})");
-        GitFiles.ItemsSource = files;
+        GitUnstagedLabel.Text = rows.Count == 0 ? "No changes" : $"Changes ({rows.Count})";
+        GitFiles.ItemsSource = rows;
+
+        var (adds, dels) = ParseShortstat(await RunGitAsync(dir, "diff HEAD --shortstat"));
+        GitAdds.Text = adds > 0 ? $"+{adds}" : "";
+        GitDels.Text = dels > 0 ? $"−{dels}" : "";
+
+        var remote = (await RunGitAsync(dir, "remote get-url origin")).Trim();
+        if (remote.Length > 0)
+        {
+            GitRemote.Content = remote;
+            try { GitRemote.NavigateUri = new Uri(NormalizeRemote(remote)); } catch { /* non-URL remote */ }
+            GitRemote.Visibility = Visibility.Visible;
+        }
+    }
+
+    /// Porcelain "XY path" → a display row. X=index, Y=worktree; we surface the
+    /// more meaningful of the two as a single colored badge, and left-truncate the
+    /// path so the tail (filename) stays visible.
+    private static GitFileRow MakeGitRow(string code, string raw)
+    {
+        // renames come as "old -> new"; key off the new path.
+        var path = raw;
+        int arrow = path.IndexOf(" -> ", StringComparison.Ordinal);
+        if (arrow >= 0) path = path.Substring(arrow + 4);
+
+        char c = code.Trim().Length > 0 ? code.Trim()[0] : ' ';
+        if (code == "??") c = '?';
+        var (letter, brush) = c switch
+        {
+            'M' => ("M", GitBrushMod),
+            'A' => ("A", GitBrushAdd),
+            'D' => ("D", GitBrushDel),
+            'R' => ("R", GitBrushRen),
+            '?' => ("?", GitBrushUnk),
+            _   => (c.ToString(), GitBrushUnk),
+        };
+
+        const int budget = 30;
+        var display = path.Length <= budget ? path : "…" + path.Substring(path.Length - (budget - 1));
+        return new GitFileRow { Status = letter, StatusBrush = brush, Display = display, FullPath = path };
+    }
+
+    private static (int adds, int dels) ParseShortstat(string s)
+    {
+        int adds = 0, dels = 0;
+        var m = System.Text.RegularExpressions.Regex.Match(s, @"(\d+) insertion");
+        if (m.Success) int.TryParse(m.Groups[1].Value, out adds);
+        m = System.Text.RegularExpressions.Regex.Match(s, @"(\d+) deletion");
+        if (m.Success) int.TryParse(m.Groups[1].Value, out dels);
+        return (adds, dels);
+    }
+
+    /// git@github.com:user/repo.git → https://github.com/user/repo
+    private static string NormalizeRemote(string remote)
+    {
+        if (remote.StartsWith("git@"))
+        {
+            var at = remote.IndexOf('@');
+            var rest = remote.Substring(at + 1).Replace(":", "/");
+            remote = "https://" + rest;
+        }
+        if (remote.EndsWith(".git", StringComparison.Ordinal))
+            remote = remote.Substring(0, remote.Length - 4);
+        return remote;
+    }
+
+    // ---- Git actions ----
+    // SplitButton.Click has its own args type; forward to the shared handlers.
+    private void GitCommitBtn_Click(SplitButton sender, SplitButtonClickEventArgs args) => GitCommit_Click(sender, null!);
+    private void GitForkBtn_Click(SplitButton sender, SplitButtonClickEventArgs args) => GitFetch_Click(sender, null!);
+
+    private async void GitStageAll_Click(object sender, RoutedEventArgs e) => await GitRunRefresh("add -A");
+
+    private async void GitFiles_ItemClick(object sender, ItemClickEventArgs e)
+    {
+        if (e.ClickedItem is GitFileRow row)
+            await GitRunRefresh($"add -- \"{row.FullPath}\"");
+    }
+
+    private async void GitCommit_Click(object sender, RoutedEventArgs e)
+    {
+        var msg = await PromptAsync("Commit", "Message");
+        if (!string.IsNullOrWhiteSpace(msg))
+            await GitRunRefresh($"commit -m \"{Escape(msg)}\"");
+    }
+
+    private async void GitCommitPush_Click(object sender, RoutedEventArgs e)
+    {
+        var msg = await PromptAsync("Commit & Push", "Message");
+        if (!string.IsNullOrWhiteSpace(msg))
+            await GitRunRefresh($"commit -m \"{Escape(msg)}\"", then: "push");
+    }
+
+    private async void GitAmend_Click(object sender, RoutedEventArgs e)
+    {
+        var msg = await PromptAsync("Amend last commit", "New message (blank = keep)");
+        var arg = string.IsNullOrWhiteSpace(msg) ? "commit --amend --no-edit" : $"commit --amend -m \"{Escape(msg)}\"";
+        await GitRunRefresh(arg);
+    }
+
+    private async void GitFetch_Click(object sender, RoutedEventArgs e) => await GitRunRefresh("fetch");
+    private async void GitPull_Click(object sender, RoutedEventArgs e) => await GitRunRefresh("pull");
+    private async void GitPush_Click(object sender, RoutedEventArgs e) => await GitRunRefresh("push");
+
+    private async Task GitRunRefresh(string args, string? then = null)
+    {
+        var dir = CurrentCwd();
+        await RunGitAsync(dir, args);
+        if (then is not null)
+            await RunGitAsync(dir, then);
+        await RefreshGitAsync();
+    }
+
+    private static string Escape(string s) => s.Replace("\"", "\\\"");
+
+    /// Minimal single-line input dialog. Returns null on cancel.
+    private async Task<string?> PromptAsync(string title, string placeholder)
+    {
+        var box = new TextBox { PlaceholderText = placeholder, AcceptsReturn = false };
+        var dlg = new ContentDialog
+        {
+            Title = title,
+            Content = box,
+            PrimaryButtonText = "OK",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = (Content as FrameworkElement)?.XamlRoot,
+        };
+        return await dlg.ShowAsync() == ContentDialogResult.Primary ? box.Text : null;
     }
 
     private static async Task<string> RunGitAsync(string dir, string args)
@@ -613,6 +938,25 @@ public sealed partial class MainWindow : Window
             {
                 Rect = new Windows.Foundation.Rect(0, 0, fe.ActualWidth, fe.ActualHeight),
             };
+    }
+
+    /// Any tap inside the details body (file tree, git list, info buttons) pulls
+    /// keyboard focus into the sidebar, so typing stops reaching the terminal. Hand
+    /// focus back — EXCEPT when the tap landed in the Find box (the user is about to
+    /// type a filter there). FocusTerminal defers to Low priority, so the control's
+    /// own click runs first; only the keyboard focus returns.
+    private void DetailsBody_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (e.OriginalSource is DependencyObject d && Ancestor<TextBox>(d) is not null)
+            return;
+        FocusTerminal();
+    }
+
+    private static T? Ancestor<T>(DependencyObject d) where T : DependencyObject
+    {
+        for (var n = d; n is not null; n = VisualTreeHelper.GetParent(n))
+            if (n is T t) return t;
+        return null;
     }
 
     // Toggles are hidden at rest; hovering anywhere on the title bar (or any chrome
@@ -695,7 +1039,11 @@ public sealed partial class MainWindow : Window
     /// Return keyboard focus to the terminal. Chrome/sidebar interactions steal it;
     /// without this the user "can type at first, then can't".
     private void FocusTerminal()
-        => DispatcherQueue.TryEnqueue(() =>
+        // Low priority: a tab switch / new tab / ListView selection moves focus
+        // AFTER this runs at normal priority, stealing it back so keys never reach
+        // PaneHost (the "can't type until I alt-tab away and back" bug). Deferring to
+        // Low runs the focus restore once that churn has settled, so it sticks.
+        => DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
         {
             try
             {
@@ -703,15 +1051,8 @@ public sealed partial class MainWindow : Window
                 // Background and isn't hit-test-visible, so Focus() returns false and no
                 // KeyDown/CharacterReceived ever fire (the "can't type" bug).
                 if (PaneHost is null)
-                {
-                    Log.Write("FocusTerminal: PaneHost null, skip");
                     return;
-                }
-                bool ok = PaneHost.Focus(FocusState.Programmatic);
-                var xr = Content?.XamlRoot;
-                var f = xr is null ? "no-xamlroot"
-                    : FocusManager.GetFocusedElement(xr)?.GetType().Name ?? "null";
-                Log.Write($"FocusTerminal: PaneHost Focus()={ok} focused={f}");
+                PaneHost.Focus(FocusState.Programmatic);
             }
             catch (Exception ex)
             {
@@ -871,6 +1212,45 @@ public sealed partial class MainWindow : Window
     private static bool IsDown(VirtualKey key)
         => InputKeyboardSource.GetKeyStateForCurrentThread(key).HasFlag(CoreVirtualKeyStates.Down);
 
+    /// True when keyboard focus is NOT on the terminal and NOT in a text box — i.e.
+    /// it drifted somewhere that would otherwise swallow input (the dead-terminal bug).
+    private bool ShouldRouteKeysToTerminal()
+    {
+        var xr = Content?.XamlRoot;
+        if (xr is null) return false;
+        var focused = FocusManager.GetFocusedElement(xr) as DependencyObject;
+        if (focused is null) return true;                    // nobody owns focus → terminal
+        if (IsWithin(focused, PaneHost)) return false;       // terminal handler already runs
+        if (Ancestor<TextBox>(focused) is not null) return false; // a text box owns its keys
+        return true;
+    }
+
+    private static bool IsWithin(DependencyObject node, DependencyObject ancestor)
+    {
+        for (var n = node; n is not null; n = VisualTreeHelper.GetParent(n))
+            if (ReferenceEquals(n, ancestor)) return true;
+        return false;
+    }
+
+    private void Root_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Handled) return;
+        if (!ShouldRouteKeysToTerminal()) return;
+        // Pull focus back to PaneHost: a focused non-text control (e.g. the Info
+        // ScrollViewer) forwards keydowns but never raises CharacterReceived, so
+        // typed TEXT is lost. Refocusing makes this key's WM_CHAR land on PaneHost
+        // (which does raise it) and keeps subsequent keys on the normal path.
+        PaneHost.Focus(FocusState.Programmatic);
+        Panel_KeyDown(PaneHost, e);
+    }
+
+    private void Root_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs e)
+    {
+        if (e.Handled) return;
+        if (ShouldRouteKeysToTerminal())
+            Panel_CharacterReceived(PaneHost, e);
+    }
+
     private void Panel_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)
@@ -945,31 +1325,58 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         Native.velo_pane_focus(_engine, PaneId(sender)); // route to the focused pane
-        Native.velo_char(_engine, e.Character);
+        Native.velo_char(_engine, e.Character, Modifiers());
     }
 
-    private void Panel_PointerPressed(object sender, PointerRoutedEventArgs e)
-    {
-        if (_engine == IntPtr.Zero)
-            return;
-        var panel = (SwapChainPanel)sender;
-        uint id = PaneId(panel);
-        _focusedPane = (int)id;
-        PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus; keep it on the host
-        panel.CapturePointer(e.Pointer);
-        Native.velo_pane_focus(_engine, id);
-        ForwardMouse(panel, 0, e);
-    }
+    /// Pane index a press captured, so move/release during a drag keep going
+    /// to that pane even when the pointer leaves its bounds. -1 = no drag.
+    private int _mousePane = -1;
 
-    /// Click anywhere in the pane area focuses the pane under the pointer. The
-    /// SwapChainPanels composite their swapchain via DComp (no XAML brush), so they
-    /// are not hit-test-visible and their own PointerPressed never fires — without
-    /// this, clicking the terminal can't focus it and the user can't type.
+    /// All pointer input for the pane area lands on PaneHost: the SwapChainPanels
+    /// composite their swapchain via DComp (no XAML brush), so they are not
+    /// hit-test-visible and their own pointer events never fire. A press focuses
+    /// the pane under the pointer and starts forwarding mouse events to it
+    /// (selection, or SGR mouse reporting when an app enabled it).
     private void PaneHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)
             return;
-        var pos = e.GetCurrentPoint(PaneHost).Position;
+        int i = PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        if (i < 0)
+            return;
+        _focusedPane = i;
+        PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
+        Native.velo_pane_focus(_engine, PaneId(_panels[i]));
+        _mousePane = i;
+        PaneHost.CapturePointer(e.Pointer);
+        ForwardMouse(_panels[i], 0, e);
+    }
+
+    private void PaneHost_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        if (i < 0)
+            return;
+        ForwardMouse(_panels[i], 1, e);
+    }
+
+    private void PaneHost_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        _mousePane = -1;
+        PaneHost.ReleasePointerCapture(e.Pointer);
+        if (i < 0)
+            return;
+        ForwardMouse(_panels[i], 2, e);
+    }
+
+    /// Index of the visible pane under `pos` (PaneHost coordinates), or -1.
+    private int PaneAt(Windows.Foundation.Point pos)
+    {
         for (int i = 0; i < _paneCount && i < _panels.Length; i++)
         {
             var p = _panels[i];
@@ -978,23 +1385,33 @@ public sealed partial class MainWindow : Window
             var r = p.TransformToVisual(PaneHost)
                      .TransformBounds(new Windows.Foundation.Rect(0, 0, p.ActualWidth, p.ActualHeight));
             if (pos.X >= r.X && pos.X <= r.X + r.Width && pos.Y >= r.Y && pos.Y <= r.Y + r.Height)
-            {
-                _focusedPane = i;
-                PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
-                Native.velo_pane_focus(_engine, PaneId(p));
-                break;
-            }
+                return i;
         }
+        return -1;
     }
 
-    private void Panel_PointerMoved(object sender, PointerRoutedEventArgs e)
-        => ForwardMouse((SwapChainPanel)sender, 1, e);
-
-    private void Panel_PointerReleased(object sender, PointerRoutedEventArgs e)
+    /// Wheel over the pane area. Handled on PaneHost, not the SwapChainPanels —
+    /// like PointerPressed above, the panels are not hit-test-visible, so their
+    /// own wheel events never fire.
+    private void PaneHost_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
     {
-        var panel = (SwapChainPanel)sender;
-        ForwardMouse(panel, 2, e);
-        panel.ReleasePointerCapture(e.Pointer);
+        if (_engine == IntPtr.Zero)
+            return;
+        int i = PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        if (i < 0)
+            return;
+        int delta = e.GetCurrentPoint(PaneHost).Properties.MouseWheelDelta;
+        // Multiply first: precision touchpads report sub-120 deltas that
+        // delta/120*3 would truncate to zero.
+        int lines = delta * 3 / 120;
+        if (lines == 0)
+            return;
+        var panel = _panels[i];
+        double sx = panel.CompositionScaleX > 0 ? panel.CompositionScaleX : _lastScale;
+        double sy = panel.CompositionScaleY > 0 ? panel.CompositionScaleY : _lastScale;
+        var p = e.GetCurrentPoint(panel).Position;
+        Native.velo_pane_scroll(_engine, PaneId(panel), lines,
+            (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
     }
 
     private void ForwardMouse(SwapChainPanel panel, uint kind, PointerRoutedEventArgs e)
@@ -1003,30 +1420,135 @@ public sealed partial class MainWindow : Window
             return;
         double sx = panel.CompositionScaleX > 0 ? panel.CompositionScaleX : _lastScale;
         double sy = panel.CompositionScaleY > 0 ? panel.CompositionScaleY : _lastScale;
-        var p = e.GetCurrentPoint(panel).Position;
-        Native.velo_pane_mouse(_engine, PaneId(panel), kind, (float)(p.X * sx), (float)(p.Y * sy));
+        var pt = e.GetCurrentPoint(panel);
+        var p = pt.Position;
+        Native.velo_pane_mouse(_engine, PaneId(panel), kind,
+            (float)(p.X * sx), (float)(p.Y * sy), MouseButton(pt.Properties), Modifiers());
     }
+
+    /// SGR button code (0=left, 1=middle, 2=right) for a pointer event. Uses
+    /// PointerUpdateKind so releases (where the pressed flags are already
+    /// false) still identify the button.
+    private static uint MouseButton(Microsoft.UI.Input.PointerPointProperties p)
+        => p.PointerUpdateKind switch
+        {
+            Microsoft.UI.Input.PointerUpdateKind.MiddleButtonPressed or
+            Microsoft.UI.Input.PointerUpdateKind.MiddleButtonReleased => 1u,
+            Microsoft.UI.Input.PointerUpdateKind.RightButtonPressed or
+            Microsoft.UI.Input.PointerUpdateKind.RightButtonReleased => 2u,
+            _ => p.IsMiddleButtonPressed ? 1u : p.IsRightButtonPressed ? 2u : 0u,
+        };
 
     // ---- Tab actions ------------------------------------------------------
 
     private void AddTab_Click(object sender, RoutedEventArgs e) => AddTab();
 
-    private void AddTab()
+    // The + button spawns the configured default shell, ungrouped.
+    private void AddTab() => AddProfileTab(null);
+
+    /// Spawn a tab for `profile` (null = configured default shell) and append it ungrouped.
+    private void AddProfileTab(ShellProfile? profile)
     {
-        if (_engine == IntPtr.Zero)
+        var vm = SpawnTab(profile);
+        if (vm is null)
             return;
-        uint id = Native.velo_tab_new(_engine);
-        Log.Write($"AddTab: velo_tab_new -> {id}");
-        if (id == uint.MaxValue)
-        {
-            Log.Write("AddTab: ABORT, velo_tab_new returned uint.MaxValue (shell spawn failed?)");
-            return;
-        }
-        var vm = new TabVM(id, "PowerShell");
-        Tabs.Add(vm);
+        _layout.Add(vm);           // new tabs are always ungrouped (appended at the end)
+        RefreshTabList();
         TabList.SelectedItem = vm; // drives velo_tab_set_active via SelectionChanged
         FocusTerminal();
     }
+
+    /// New empty group holding one fresh default-shell tab.
+    private void NewGroupWithTab()
+    {
+        var vm = SpawnTab(null);
+        if (vm is null)
+            return;
+        var grp = new TabGroup($"Group {CountGroups() + 1}");
+        vm.Group = grp;
+        grp.Members.Add(vm);
+        vm.RefreshGrouping();
+        _layout.Add(grp);
+        RefreshTabList();
+        TabList.SelectedItem = vm;
+        FocusTerminal();
+    }
+
+    /// Core spawn: optionally switch the engine shell for this tab, then restore the
+    /// default so the + button stays on the configured shell. Returns null on failure.
+    private TabVM? SpawnTab(ShellProfile? profile)
+    {
+        if (_engine == IntPtr.Zero)
+            return null;
+        if (profile is not null)
+            SetShell(profile.Command);
+        uint id = Native.velo_tab_new(_engine);
+        if (profile is not null)
+            SetShell(_settings.Shell);
+        Log.Write($"SpawnTab: velo_tab_new -> {id} ({profile?.Name ?? "default"})");
+        if (id == uint.MaxValue)
+        {
+            Log.Write("SpawnTab: ABORT, velo_tab_new returned uint.MaxValue (shell spawn failed?)");
+            return null;
+        }
+        var vm = new TabVM(id, profile?.Name ?? "PowerShell");
+        ApplyShellKind(vm, profile?.Command ?? _settings.Shell);
+        return vm;
+    }
+
+    /// Sets the row's shell-kind label, derived from the launch command. For WSL
+    /// this probes the distro's default shell off the UI thread and fills the
+    /// label in once it's known instead of blocking tab creation on it.
+    private void ApplyShellKind(TabVM vm, string command)
+    {
+        if (command.Contains("pwsh", StringComparison.OrdinalIgnoreCase) ||
+            command.Contains("powershell", StringComparison.OrdinalIgnoreCase))
+        {
+            vm.ShellKind = "pwsh";
+            return;
+        }
+        if (command.Contains("cmd", StringComparison.OrdinalIgnoreCase))
+        {
+            vm.ShellKind = "cmd";
+            return;
+        }
+        var dIdx = command.IndexOf("-d ", StringComparison.OrdinalIgnoreCase);
+        if (dIdx < 0)
+            return;
+        var distro = command[(dIdx + 3)..].Trim();
+        _ = ShellProfiles.DefaultShellForAsync(distro).ContinueWith(t =>
+        {
+            var kind = t.Result;
+            DispatcherQueue.TryEnqueue(() => vm.ShellKind = kind);
+        }, TaskScheduler.Default);
+    }
+
+    /// Windows-Terminal-style dropdown: list installed shells + New group.
+    private void NewTabMenu_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe)
+            return;
+        var flyout = new MenuFlyout();
+        foreach (var p in ShellProfiles.All())
+        {
+            var prof = p;
+            var item = new MenuFlyoutItem { Text = prof.Name, Icon = ShellIcon(prof.Icon) };
+            item.Click += (_, _) => AddProfileTab(prof);
+            flyout.Items.Add(item);
+        }
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add(flyout, "New group", NewGroupWithTab);
+        flyout.ShowAt(fe);
+    }
+
+    /// 18px SVG brand icon for a shell profile (Assets/ShellIcons/<file>).
+    private static IconElement ShellIcon(string file) => new ImageIcon
+    {
+        Width = 18,
+        Height = 18,
+        Source = new Microsoft.UI.Xaml.Media.Imaging.SvgImageSource(
+            new Uri($"ms-appx:///Assets/ShellIcons/{file}")),
+    };
 
     private void TabClose_Click(object sender, RoutedEventArgs e)
     {
@@ -1035,20 +1557,28 @@ public sealed partial class MainWindow : Window
     }
 
     // Close button is hidden until its tab row is hovered.
-    private void TabRow_PointerEntered(object sender, PointerRoutedEventArgs e) => SetRowClose(sender, 1);
-    private void TabRow_PointerExited(object sender, PointerRoutedEventArgs e) => SetRowClose(sender, 0);
+    private void TabRow_PointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is TabVM t) t.IsHovered = true;
+        SetRowClose(sender, 1);
+    }
 
+    private void TabRow_PointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is TabVM t) t.IsHovered = false;
+        SetRowClose(sender, 0);
+    }
+
+    // The row fill (active/hover/multi-select) is VM-bound; this only fades the
+    // close button in and the shell-kind label out on hover.
     private static void SetRowClose(object sender, double opacity)
     {
         if (sender is not Grid g)
             return;
         foreach (var child in g.Children)
         {
-            if (child is Button b)
-            {
-                b.Opacity = opacity;
-                return;
-            }
+            if (child is Button b) b.Opacity = opacity;
+            else if (child is TextBlock { Name: "ShellKindText" } tb) tb.Opacity = (1 - opacity) * 0.5;
         }
     }
 
@@ -1106,28 +1636,45 @@ public sealed partial class MainWindow : Window
 
     private void RemoveTab(uint id)
     {
-        for (int i = 0; i < Tabs.Count; i++)
-        {
-            if (Tabs[i].Id == id)
-            {
-                Tabs.RemoveAt(i);
-                return;
-            }
-        }
+        TabVM? hit = null;
+        foreach (var t in OrderedTabs())
+            if (t.Id == id) { hit = t; break; }
+        if (hit is null)
+            return;
+        _selected.Remove(hit);
+        DetachFromLayout(hit);     // drops it from a bare slot or a group (empty groups vanish)
+        RefreshTabList();
     }
 
     private void TabList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        // Track the active-tab fill regardless of suppression (RefreshTabList and
+        // ToggleGroupCollapse re-select programmatically with _suppressSelection
+        // set) so the active row's shared fill follows the selection.
+        foreach (var r in e.RemovedItems) if (r is TabVM rv) rv.IsActive = false;
+        foreach (var a in e.AddedItems) if (a is TabVM av) av.IsActive = true;
+        UpdateTitleBarTitle();
         if (_suppressSelection || _engine == IntPtr.Zero)
             return;
         if (TabList.SelectedItem is TabVM t)
         {
+            // Picking a terminal tab leaves editor mode (workspace state
+            // survives in the engine; re-entering shows the same files).
+            SetEditorMode(false);
             // Binds the focused pane to this tab (core), so track it per pane.
             Native.velo_tab_set_active(_engine, t.Id);
             _slotTab[_focusedPane] = t.Id;
             _filesDir = null;            // Files panel follows the new tab's cwd
             if (_detailsOpen) RefreshDetails();
             FocusTerminal();
+        }
+        else if (TabList.SelectedItem is TabGroup)
+        {
+            // Group-header rows aren't a tab: bounce selection back to the active tab so
+            // the header doesn't show the selected fill.
+            _suppressSelection = true;
+            TabList.SelectedItem = e.RemovedItems.Count > 0 ? e.RemovedItems[0] : null;
+            _suppressSelection = false;
         }
     }
 
@@ -1347,6 +1894,492 @@ public sealed partial class MainWindow : Window
         TabList.SelectedItem = Tabs[next]; // not suppressed: drives set_active
     }
 
+    // ---- Tab grouping -----------------------------------------------------
+
+    /// Every TabVM in display order (a group's members appear where the group sits).
+    // Groups pinned to the top, ungrouped tabs below — see RefreshTabList.
+    private IEnumerable<TabVM> OrderedTabs()
+    {
+        foreach (var entry in _layout)
+            if (entry is TabGroup g)
+                foreach (var m in g.Members) yield return m;
+        foreach (var entry in _layout)
+            if (entry is TabVM t) yield return t;
+    }
+
+    /// Regenerate Tabs (flat, for switch/index logic) + TabListItems (display) from
+    /// _layout. Preserves the active selection across the rebuild.
+    private void RefreshTabList()
+    {
+        var active = TabList.SelectedItem as TabVM;
+
+        Tabs.Clear();
+        foreach (var t in OrderedTabs())
+            Tabs.Add(t);
+
+        _suppressSelection = true;
+        TabListItems.Clear();
+        // Groups first (header + members), then all ungrouped tabs below.
+        bool firstGroup = true;
+        foreach (var entry in _layout)
+        {
+            if (entry is TabGroup g)
+            {
+                g.ShowSeparator = !firstGroup;   // divider only between groups, not above the first
+                firstGroup = false;
+                TabListItems.Add(g);
+                if (!g.IsCollapsed)
+                    foreach (var m in g.Members) TabListItems.Add(m);
+            }
+        }
+        foreach (var entry in _layout)
+            if (entry is TabVM t)
+                TabListItems.Add(t);
+        // Restore the active highlight if its row is still visible (not in a collapsed
+        // group). Core binding is independent of ListView selection, so a hidden active
+        // tab keeps rendering in its pane regardless.
+        if (active is not null && TabListItems.Contains(active))
+            TabList.SelectedItem = active;
+        _suppressSelection = false;
+    }
+
+    /// Remove a tab from wherever it lives in _layout: a bare entry, or a group's
+    /// members (an emptied group is dropped). Does not refresh — caller does.
+    private void DetachFromLayout(TabVM t)
+    {
+        if (_layout.Remove(t))
+            return;
+        foreach (var entry in _layout)
+        {
+            if (entry is TabGroup g && g.Members.Remove(t))
+            {
+                if (g.Members.Count == 0)
+                    _layout.Remove(g);
+                return;
+            }
+        }
+    }
+
+    // ---- Multi-select (Ctrl+Click) ----------------------------------------
+
+    private void TabRow_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not TabVM t)
+            return;
+        // Right-click opens the context menu — must NOT touch the multi-select set,
+        // else the pending selection is gone before the menu is built.
+        if (e.GetCurrentPoint(fe).Properties.IsRightButtonPressed)
+            return;
+        if ((Modifiers() & 1) != 0)            // Ctrl held → toggle into the group set
+        {
+            if (!_selected.Add(t)) { _selected.Remove(t); t.IsMultiSelected = false; }
+            else t.IsMultiSelected = true;
+            e.Handled = true;                  // suppress the normal active-select
+        }
+        else
+        {
+            ClearMultiSelect();                // plain click drops any pending selection
+        }
+    }
+
+    private void ClearMultiSelect()
+    {
+        foreach (var t in _selected) t.IsMultiSelected = false;
+        _selected.Clear();
+    }
+
+    // ---- Group / ungroup --------------------------------------------------
+
+    private void GroupAccel_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    {
+        args.Handled = true;
+        if (_selected.Count == 0)
+            return;
+        GroupTabs(OrderedTabs().Where(_selected.Contains).ToList());
+    }
+
+    /// Pull `tabs` (in display order) out of their current slots into a new group,
+    /// inserted at the position of the first one.
+    private void GroupTabs(List<TabVM> tabs)
+    {
+        if (tabs.Count == 0)
+            return;
+        var grp = new TabGroup($"Group {CountGroups() + 1}");
+        var sel = new HashSet<TabVM>(tabs);
+
+        var next = new List<object>();
+        bool inserted = false;
+        void Take(TabVM t)
+        {
+            if (!inserted) { next.Add(grp); inserted = true; }
+            t.Group = grp;
+            grp.Members.Add(t);
+            t.RefreshGrouping();
+        }
+        foreach (var entry in _layout)
+        {
+            if (entry is TabVM t)
+            {
+                if (sel.Contains(t)) Take(t); else next.Add(t);
+            }
+            else if (entry is TabGroup g)
+            {
+                var keep = new List<TabVM>();
+                foreach (var m in g.Members)
+                {
+                    if (sel.Contains(m)) Take(m); else keep.Add(m);
+                }
+                if (keep.Count > 0)
+                {
+                    g.Members.Clear();
+                    foreach (var m in keep) g.Members.Add(m);
+                    next.Add(g);
+                }
+            }
+        }
+        _layout.Clear();
+        _layout.AddRange(next);
+        ClearMultiSelect();
+        RefreshTabList();
+    }
+
+    private int CountGroups()
+    {
+        int n = 0;
+        foreach (var e in _layout) if (e is TabGroup) n++;
+        return n;
+    }
+
+    /// Dissolve a group: its members become bare tabs in place.
+    private void Ungroup(TabGroup g)
+    {
+        int i = _layout.IndexOf(g);
+        if (i < 0)
+            return;
+        _layout.RemoveAt(i);
+        var members = g.Members.ToList();
+        g.Members.Clear();
+        for (int k = 0; k < members.Count; k++)
+        {
+            members[k].Group = null;
+            members[k].RefreshGrouping();
+            _layout.Insert(i + k, members[k]);
+        }
+        RefreshTabList();
+    }
+
+    /// Pop a single tab out of its group (the group survives if others remain).
+    private void RemoveFromGroup(TabVM t)
+    {
+        if (t.Group is not TabGroup g)
+            return;
+        int gi = _layout.IndexOf(g);
+        g.Members.Remove(t);
+        t.Group = null;
+        t.RefreshGrouping();
+        if (g.Members.Count == 0) { _layout.RemoveAt(gi); _layout.Insert(gi, t); }
+        else _layout.Insert(gi + 1, t);
+        RefreshTabList();
+    }
+
+    // Single tap toggles collapse; double tap renames. Collapse updates the list
+    // INCREMENTALLY (adds/removes only the member rows) instead of via
+    // RefreshTabList's full Clear+rebuild — a full rebuild destroyed this header's
+    // ListView container between the two taps, so DoubleTapped never fired and
+    // rename was dead. Keeping the header container alive, Tapped then DoubleTapped
+    // both land on it as intended.
+    private void GroupHeader_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is TabGroup g)
+            ToggleGroupCollapse(g);
+    }
+
+    // Presenter hover is disabled list-wide (see TabList ItemContainerStyle), so
+    // the group header draws its own hover fill.
+    private void GroupHeader_PointerEntered(object sender, PointerRoutedEventArgs e) => SetHeaderHover(sender, 1);
+    private void GroupHeader_PointerExited(object sender, PointerRoutedEventArgs e) => SetHeaderHover(sender, 0);
+
+    private static void SetHeaderHover(object sender, double opacity)
+    {
+        if (sender is Grid g)
+            foreach (var child in g.Children)
+                if (child is Border { Name: "HoverFill" } hf) { hf.Opacity = opacity; break; }
+    }
+
+    private void GroupHeader_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is TabGroup g)
+        {
+            ToggleGroupCollapse(g);   // undo the collapse the paired single-tap applied
+            BeginRename(g);
+            e.Handled = true;
+        }
+    }
+
+    /// Expand/collapse a group by inserting/removing just its member rows, keeping
+    /// the header's ListView container alive (so gestures on it aren't interrupted).
+    private void ToggleGroupCollapse(TabGroup g)
+    {
+        int hi = TabListItems.IndexOf(g);
+        if (hi < 0)
+            return;
+        var active = TabList.SelectedItem as TabVM;
+        _suppressSelection = true;
+        if (g.IsCollapsed)
+        {
+            g.IsCollapsed = false;
+            for (int i = 0; i < g.Members.Count; i++)
+                TabListItems.Insert(hi + 1 + i, g.Members[i]);
+        }
+        else
+        {
+            g.IsCollapsed = true;
+            foreach (var m in g.Members.ToList())
+                TabListItems.Remove(m);
+        }
+        if (active is not null && TabListItems.Contains(active))
+            TabList.SelectedItem = active;
+        _suppressSelection = false;
+    }
+
+    private void SetGroupColor(TabGroup g, string hex)
+    {
+        g.ColorHex = hex;
+        foreach (var m in g.Members) m.RefreshGrouping();
+    }
+
+    // ---- Inline rename ----------------------------------------------------
+
+    private void BeginRename(object item)
+    {
+        if (item is TabVM t) t.IsEditing = true;
+        else if (item is TabGroup g) g.IsEditing = true;
+        DispatcherQueue.TryEnqueue(() => FocusRenameBox(item));
+    }
+
+    private void FocusRenameBox(object item)
+    {
+        if (TabList.ContainerFromItem(item) is FrameworkElement c &&
+            FindDescendant(c, "RenameBox") is TextBox tb)
+        {
+            tb.Focus(FocusState.Programmatic);
+            tb.SelectAll();
+        }
+    }
+
+    private void RenameBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == VirtualKey.Enter) { CommitRename(sender, save: true); e.Handled = true; }
+        else if (e.Key == VirtualKey.Escape) { CommitRename(sender, save: false); e.Handled = true; }
+    }
+
+    private void RenameBox_LostFocus(object sender, RoutedEventArgs e) => CommitRename(sender, save: true);
+
+    private void CommitRename(object sender, bool save)
+    {
+        if (sender is TextBox tb)
+        {
+            string v = tb.Text.Trim();
+            if (tb.DataContext is TabVM t)
+            {
+                if (save && v.Length > 0) t.Title = v;
+                t.IsEditing = false;
+                UpdateTitleBarTitle();
+            }
+            else if (tb.DataContext is TabGroup g)
+            {
+                if (save && v.Length > 0) g.Name = v;
+                g.IsEditing = false;
+            }
+        }
+        FocusTerminal();
+    }
+
+    private void TabRow_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is TabVM t) { BeginRename(t); e.Handled = true; }
+    }
+
+    // ---- Context menus ----------------------------------------------------
+
+    private void TabRow_ContextRequested(UIElement sender, ContextRequestedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not TabVM t)
+            return;
+        var flyout = new MenuFlyout();
+        Add(flyout, "Rename", () => BeginRename(t));
+        // New group from the current selection (≥2 selected) or just this tab.
+        var groupTabs = _selected.Count >= 2 && _selected.Contains(t)
+            ? OrderedTabs().Where(_selected.Contains).ToList()
+            : new List<TabVM> { t };
+        Add(flyout, groupTabs.Count > 1 ? $"New group ({groupTabs.Count} tabs)" : "New group",
+            () => { GroupTabs(groupTabs); ClearMultiSelect(); });
+        if (t.Group is not null)
+        {
+            Add(flyout, "Remove from group", () => RemoveFromGroup(t));
+            Add(flyout, "Ungroup", () => Ungroup(t.Group!));
+        }
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add(flyout, "Close", () => CloseTab(t.Id));
+        ShowFlyout(flyout, fe, e);
+    }
+
+    // Only reached when a row/group didn't already claim the event (they mark e.Handled).
+    private void TabList_ContextRequested(UIElement sender, ContextRequestedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe)
+            return;
+        var flyout = new MenuFlyout();
+        Add(flyout, "New tab", AddTab);
+        Add(flyout, "New group", NewGroupWithTab);
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add(flyout, "Exit", Close);
+        ShowFlyout(flyout, fe, e);
+    }
+
+    private void GroupHeader_ContextRequested(UIElement sender, ContextRequestedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not TabGroup g)
+            return;
+        var flyout = new MenuFlyout();
+        Add(flyout, "Rename", () => BeginRename(g));
+        Add(flyout, g.IsCollapsed ? "Expand" : "Collapse",
+            () => { g.IsCollapsed = !g.IsCollapsed; RefreshTabList(); });
+
+        var color = new MenuFlyoutSubItem { Text = "Colour" };
+        foreach (var (name, hex) in TabGroup.Swatches)
+        {
+            var swatch = name;
+            var h = hex;
+            var item = new MenuFlyoutItem
+            {
+                Text = swatch,
+                Icon = new FontIcon { Glyph = "", Foreground = new SolidColorBrush(TabGroup.ParseHex(h)) },
+            };
+            item.Click += (_, _) => SetGroupColor(g, h);
+            color.Items.Add(item);
+        }
+        flyout.Items.Add(color);
+
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add(flyout, "Ungroup", () => Ungroup(g));
+        Add(flyout, "Close all tabs", () =>
+        {
+            foreach (var id in g.Members.Select(m => m.Id).ToList()) CloseTab(id);
+        });
+        ShowFlyout(flyout, fe, e);
+    }
+
+    private void GroupMenu_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe)
+            GroupHeader_ContextRequested(fe, null!);
+    }
+
+    private static void Add(MenuFlyout f, string text, Action onClick)
+    {
+        var item = new MenuFlyoutItem { Text = text };
+        item.Click += (_, _) => onClick();
+        f.Items.Add(item);
+    }
+
+    private static void ShowFlyout(MenuFlyout flyout, FrameworkElement target, ContextRequestedEventArgs? e)
+    {
+        if (e is not null && e.TryGetPosition(target, out var p))
+        {
+            flyout.ShowAt(target, new FlyoutShowOptions { Position = p });
+            e.Handled = true;
+        }
+        else
+        {
+            flyout.ShowAt(target);
+        }
+    }
+
+    // ---- Drag a tab in / out of a group -----------------------------------
+
+    private void TabList_DragOver(object sender, DragEventArgs e)
+    {
+        if (_dragTab is not null)
+            e.AcceptedOperation = DataPackageOperation.Move;
+    }
+
+    private void TabList_Drop(object sender, DragEventArgs e)
+    {
+        var dragged = _dragTab;
+        _dragTab = null;
+        if (dragged is null)
+            return;
+        e.Handled = true;
+        object? target = ItemAtPoint(e.GetPosition(TabList).Y);
+        DropTab(dragged, target);
+    }
+
+    /// Reposition `dragged` based on what it was dropped onto:
+    ///  - a group header → join that group (appended)
+    ///  - a grouped tab  → join that tab's group, just before it
+    ///  - an ungrouped tab → become ungrouped, just before it
+    ///  - empty space (null) → become ungrouped at the end
+    private void DropTab(TabVM dragged, object? target)
+    {
+        if (ReferenceEquals(target, dragged))
+            return;
+        DetachFromLayout(dragged);
+
+        if (target is TabGroup g)
+        {
+            dragged.Group = g;
+            g.Members.Add(dragged);
+        }
+        else if (target is TabVM tt && tt.Group is TabGroup tg)
+        {
+            dragged.Group = tg;
+            int idx = tg.Members.IndexOf(tt);
+            tg.Members.Insert(idx < 0 ? tg.Members.Count : idx, dragged);
+        }
+        else if (target is TabVM ut)
+        {
+            dragged.Group = null;
+            int idx = _layout.IndexOf(ut);
+            _layout.Insert(idx < 0 ? _layout.Count : idx, dragged);
+        }
+        else
+        {
+            dragged.Group = null;
+            _layout.Add(dragged);
+        }
+        dragged.RefreshGrouping();
+        RefreshTabList();
+    }
+
+    /// The TabListItems entry whose row contains vertical position `y` (relative to TabList).
+    private object? ItemAtPoint(double y)
+    {
+        foreach (var item in TabListItems)
+        {
+            if (TabList.ContainerFromItem(item) is not FrameworkElement c)
+                continue;
+            var top = c.TransformToVisual(TabList).TransformPoint(new Point(0, 0)).Y;
+            if (y >= top && y <= top + c.ActualHeight)
+                return item;
+        }
+        return null;
+    }
+
+    private static FrameworkElement? FindDescendant(DependencyObject root, string name)
+    {
+        int n = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < n; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is FrameworkElement fe && fe.Name == name)
+                return fe;
+            if (FindDescendant(child, name) is FrameworkElement hit)
+                return hit;
+        }
+        return null;
+    }
+
     // ---- Settings ---------------------------------------------------------
 
     /// Push the current settings into the core + chrome. The titlebar background
@@ -1366,12 +2399,8 @@ public sealed partial class MainWindow : Window
         // layer that exactly matches the terminal (which the swapchain composites as
         // ONE layer over the backdrop). ContentRoot stays transparent — see its XAML
         // note — so the terminal isn't darkened by a second tint layer behind it.
-        byte a = (byte)Math.Round(_settings.BackgroundOpacity * 255);
-        var surface = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(a, r, g, b));
         ContentRoot.Background = null;            // transparent: swapchain owns the body tint
-        TitleBar.Background = surface;            // thin bar matches the panels
-        SidebarSurface.Background = surface;
-        DetailsSurface.Background = surface;
+        UpdatePanelTint();                        // title bar tint + panels (transparent if backdrop-tinted)
         // NOTE: SwapChainPanel does NOT support the Background property — setting
         // it throws COMException 0x80004005 and aborts the entire Loaded handler,
         // leaving the panel blank. The terminal bg is owned by the Rust renderer
@@ -1407,9 +2436,11 @@ public sealed partial class MainWindow : Window
             Native.velo_set_shell(_engine, (ushort*)p, (nuint)shell.Length);
     }
 
-    /// Apply the backdrop. "Blur intensity" maps to discrete kinds (Mica < Mica
-    /// Alt < Acrylic). ponytail: continuous tint-opacity needs a manual
-    /// DesktopAcrylicController; add that if a slider is required.
+    /// Apply the backdrop. Simple, untinted backdrop kinds (Mica / Mica Alt /
+    /// Acrylic); the tint comes from the panels' own translucent brush in
+    /// UpdatePanelTint, so the terminal, title bar and both panels all composite the
+    /// SAME way (one flat tint over the same raw backdrop) and read consistently —
+    /// and Mica vs Mica Alt stay visually distinct.
     private void ApplyBackdrop()
     {
         SystemBackdrop = _settings.Backdrop switch
@@ -1419,6 +2450,30 @@ public sealed partial class MainWindow : Window
             "None" => null,
             _ => new MicaBackdrop { Kind = Microsoft.UI.Composition.SystemBackdrops.MicaKind.Base },
         };
+    }
+
+    /// One translucent brush (bg color + opacity) drives the title bar and both
+    /// panels, so they match the terminal's tint over the backdrop.
+    private void UpdatePanelTint()
+    {
+        var (r, g, b) = _settings.BackgroundRgb();
+        byte a = (byte)Math.Round(_settings.BackgroundOpacity * 255);
+        var surface = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(a, r, g, b));
+        TitleBar.Background = surface;
+        SidebarSurface.Background = surface;
+        DetailsSurface.Background = surface;
+        // Editor tab strip composites like the rest of the chrome, and its
+        // text follows the terminal theme's foreground.
+        EditorTabs.Background = surface;
+        var fg = Themes.Rgb(Themes.ByName(_settings.ThemeName).Fg);
+        var fgBrush = new SolidColorBrush(
+            Microsoft.UI.ColorHelper.FromArgb(0xFF, fg.R, fg.G, fg.B));
+        EditorTabs.Foreground = fgBrush;
+        TitleBarTitle.Foreground = fgBrush;
+        // Palette card: same tint as the chrome, but floored so text stays
+        // readable over the dim overlay at very low opacity settings.
+        byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
+        PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
     }
 
     private async void Settings_Click(object sender, RoutedEventArgs e)
@@ -1517,10 +2572,334 @@ public sealed partial class MainWindow : Window
         OnSwitchTabRequested = (IntPtr)(delegate* unmanaged<IntPtr, byte, void>)&OnSwitchTabRequested,
         OnCwdChanged = (IntPtr)(delegate* unmanaged<IntPtr, uint, ushort*, nuint, void>)&OnCwdChanged,
         OnCommand = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, int, ulong, ushort*, nuint, void>)&OnCommand,
+        OnAnim = (IntPtr)(delegate* unmanaged<IntPtr, void>)&OnAnim,
+        OnEditorDirty = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, void>)&OnEditorDirty,
     };
 
     private static MainWindow? FromCtx(IntPtr ctx)
         => ctx == IntPtr.Zero ? null : GCHandle.FromIntPtr(ctx).Target as MainWindow;
+
+    [UnmanagedCallersOnly]
+    private static void OnEditorDirty(IntPtr ctx, uint fileId, byte dirty)
+    {
+        var w = FromCtx(ctx);
+        w?.DispatcherQueue.TryEnqueue(() => w.OnEditorDirtyUi(fileId, dirty != 0));
+    }
+
+    [UnmanagedCallersOnly]
+    private static void OnAnim(IntPtr ctx)
+    {
+        // Fired on the UI thread (subclass proc) whenever a render leaves a
+        // scroll glide in flight; StartAnimPump is idempotent.
+        FromCtx(ctx)?.StartAnimPump();
+    }
+
+    private bool _animPumping;
+    private long _animLastTicks;
+
+    /// Drive velo_tick from the compositor while a scroll glide is live.
+    private void StartAnimPump()
+    {
+        if (_animPumping)
+            return;
+        _animPumping = true;
+        _animLastTicks = Stopwatch.GetTimestamp();
+        CompositionTarget.Rendering += AnimPump_Rendering;
+    }
+
+    private void AnimPump_Rendering(object? sender, object e)
+    {
+        long now = Stopwatch.GetTimestamp();
+        float dtMs = (float)((now - _animLastTicks) * 1000.0 / Stopwatch.Frequency);
+        _animLastTicks = now;
+        if (Native.velo_tick(_engine, dtMs) == 0)
+        {
+            CompositionTarget.Rendering -= AnimPump_Rendering;
+            _animPumping = false;
+        }
+    }
+
+    // ---- Editor mode -------------------------------------------------------
+
+    public ObservableCollection<EditorFileVM> EditorFiles { get; } = new();
+    private bool _editorMode;
+    private bool _editorAttached;
+    private bool _editorMouseDown;
+    private bool _suppressEditorTab;
+    private DispatcherTimer? _autosave;
+
+    /// Files button toggles editor mode; file clicks in the tree open here.
+    private void SetEditorMode(bool on)
+    {
+        if (_editorMode == on) return;
+        _editorMode = on;
+        if (on && !_editorAttached)
+            AttachEditorPane();
+        if (!on && _engine != IntPtr.Zero)
+            Native.velo_editor_save_all(_engine);   // flush on exit
+        PaneHost.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        EditorHost.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        if (on) EditorPanel.Focus(FocusState.Programmatic);
+        else FocusTerminal();
+    }
+
+    private unsafe void AttachEditorPane()
+    {
+        if (_engine == IntPtr.Zero) return;
+        IntPtr sc = IntPtr.Zero;
+        uint id = Native.velo_editor_attach(_engine, &sc);
+        if (id == uint.MaxValue || sc == IntPtr.Zero)
+        {
+            Log.Write("AttachEditorPane: velo_editor_attach failed");
+            return;
+        }
+        EditorPanel.As<ISwapChainPanelNative>().SetSwapChain(sc);
+        _editorAttached = true;
+        PushEditorSize();
+    }
+
+    private void EditorPanel_SizeChanged(object sender, SizeChangedEventArgs e)
+        => PushEditorSize();
+
+    private void PushEditorSize()
+    {
+        if (!_editorAttached || _engine == IntPtr.Zero) return;
+        double sx = EditorPanel.CompositionScaleX > 0 ? EditorPanel.CompositionScaleX : _lastScale;
+        double sy = EditorPanel.CompositionScaleY > 0 ? EditorPanel.CompositionScaleY : _lastScale;
+        uint w = (uint)Math.Max(1, Math.Round(EditorPanel.ActualWidth * sx));
+        uint h = (uint)Math.Max(1, Math.Round(EditorPanel.ActualHeight * sy));
+        Native.velo_editor_resize(_engine, w, h);
+    }
+
+    /// Open (or refocus) a file in the editor; enters editor mode.
+    private unsafe void OpenInEditor(string path)
+    {
+        if (_engine == IntPtr.Zero) return;
+        SetEditorMode(true);
+        long id;
+        fixed (char* p = path)
+            id = Native.velo_editor_open(_engine, (ushort*)p, (nuint)path.Length);
+        if (id < 0) { ShellOpen(path); return; } // binary/unreadable: OS fallback
+        var fid = (uint)id;
+        var vm = EditorFiles.FirstOrDefault(f => f.Id == fid);
+        if (vm is null)
+        {
+            vm = new EditorFileVM { Id = fid, Path = path };
+            EditorFiles.Add(vm);
+        }
+        _suppressEditorTab = true;
+        EditorTabs.SelectedItem = vm;
+        _suppressEditorTab = false;
+        EditorPanel.Focus(FocusState.Programmatic);
+    }
+
+    private void EditorTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        // Pill visual tracks selection even when programmatic (suppressed).
+        foreach (var r in e.RemovedItems) if (r is EditorFileVM rv) rv.IsSelected = false;
+        foreach (var a in e.AddedItems) if (a is EditorFileVM av) av.IsSelected = true;
+        if (_suppressEditorTab || _engine == IntPtr.Zero) return;
+        if (EditorTabs.SelectedItem is EditorFileVM vm)
+        {
+            Native.velo_editor_save_all(_engine); // flush on tab switch
+            Native.velo_editor_focus_file(_engine, vm.Id);
+            EditorPanel.Focus(FocusState.Programmatic);
+        }
+    }
+
+    private void EditorTabClose_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not uint id) return;
+        CloseEditorFile(id);
+    }
+
+    private void CloseEditorFile(uint id)
+    {
+        Native.velo_editor_close_file(_engine, id);
+        var vm = EditorFiles.FirstOrDefault(f => f.Id == id);
+        if (vm is not null) EditorFiles.Remove(vm);
+        if (EditorFiles.Count == 0) SetEditorMode(false);
+        else if (EditorTabs.SelectedItem is null)
+            EditorTabs.SelectedIndex = EditorFiles.Count - 1;
+    }
+
+    private void EditorPanel_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero) return;
+        // Ctrl+W closes the focused file (editor mode only).
+        if (e.Key == Windows.System.VirtualKey.W && (Modifiers() & 1) != 0)
+        {
+            if (EditorTabs.SelectedItem is EditorFileVM cur) CloseEditorFile(cur.Id);
+            e.Handled = true;
+            return;
+        }
+        // Ctrl+J toggles the bottom terminal panel.
+        if (e.Key == Windows.System.VirtualKey.J && (Modifiers() & 1) != 0)
+        {
+            ToggleEditorTerminal();
+            e.Handled = true;
+            return;
+        }
+        if (Native.velo_editor_key(_engine, (uint)e.Key, Modifiers()) != 0)
+            e.Handled = true;
+    }
+
+    // ---- Editor bottom terminal (Ctrl+J) -----------------------------------
+
+    private uint _editorTermPane = InvalidId;
+
+    /// Show/hide the bottom terminal in editor mode. Lazily creates a core
+    /// pane bound to the active tab's session (no new shell is spawned).
+    private void ToggleEditorTerminal()
+    {
+        if (_engine == IntPtr.Zero) return;
+        bool show = EditorTermHost.Visibility == Visibility.Collapsed;
+        if (show && _editorTermPane == InvalidId)
+        {
+            IntPtr swap;
+            uint pid;
+            unsafe
+            {
+                IntPtr s;
+                pid = Native.velo_pane_new(_engine, &s);
+                swap = s;
+            }
+            if (pid == InvalidId || swap == IntPtr.Zero)
+            {
+                Log.Write("EditorTerm: velo_pane_new failed");
+                return;
+            }
+            _editorTermPane = pid;
+            EditorTermPanel.Tag = pid;
+            EditorTermHost.Tag = pid;
+            EditorTermPanel.As<ISwapChainPanelNative>().SetSwapChain(swap);
+        }
+        if (show)
+        {
+            EditorTermHost.Visibility = Visibility.Visible;
+            // (Re)bind to the active tab every show — it may have changed.
+            if (CurrentTab() is TabVM t)
+                Native.velo_pane_bind(_engine, _editorTermPane, t.Id);
+            PushPaneSize(EditorTermPanel);
+            Native.velo_pane_focus(_engine, _editorTermPane);
+            EditorTermHost.Focus(FocusState.Programmatic);
+        }
+        else
+        {
+            EditorTermHost.Visibility = Visibility.Collapsed;
+            Native.velo_pane_focus(_engine, 0);
+            EditorPanel.Focus(FocusState.Programmatic);
+        }
+    }
+
+    private void EditorTerm_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.J && (Modifiers() & 1) != 0)
+        {
+            ToggleEditorTerminal();
+            e.Handled = true;
+            return;
+        }
+        Panel_KeyDown(sender, e); // Tag carries the pane id
+    }
+
+    private void EditorTerm_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero || _editorTermPane == InvalidId) return;
+        EditorTermHost.Focus(FocusState.Pointer);
+        Native.velo_pane_focus(_engine, _editorTermPane);
+        ForwardMouse(EditorTermPanel, 0, e);
+        e.Handled = true;
+    }
+
+    private void EditorTerm_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero || _editorTermPane == InvalidId) return;
+        int delta = e.GetCurrentPoint(EditorTermPanel).Properties.MouseWheelDelta;
+        int lines = delta * 3 / 120;
+        if (lines == 0) return;
+        double sx = EditorTermPanel.CompositionScaleX > 0 ? EditorTermPanel.CompositionScaleX : _lastScale;
+        double sy = EditorTermPanel.CompositionScaleY > 0 ? EditorTermPanel.CompositionScaleY : _lastScale;
+        var p = e.GetCurrentPoint(EditorTermPanel).Position;
+        Native.velo_pane_scroll(_engine, _editorTermPane, lines,
+            (float)(p.X * sx), (float)(p.Y * sy), Modifiers());
+        e.Handled = true;
+    }
+
+    private void EditorTerm_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (_editorTermPane != InvalidId) PushPaneSize(EditorTermPanel);
+    }
+
+    private void EditorPanel_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
+    {
+        if (_engine == IntPtr.Zero) return;
+        Native.velo_editor_char(_engine, args.Character);
+        args.Handled = true;
+    }
+
+    private void EditorPanel_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero) return;
+        int delta = e.GetCurrentPoint(EditorPanel).Properties.MouseWheelDelta;
+        Native.velo_editor_scroll(_engine, -delta * 3 / 120);
+        e.Handled = true;
+    }
+
+    private void EditorPanel_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_engine == IntPtr.Zero) return;
+        var (x, y) = EditorPhysicalPoint(e);
+        _editorMouseDown = true;
+        EditorPanel.CapturePointer(e.Pointer);
+        Native.velo_editor_mouse(_engine, 0, x, y, Modifiers());
+        EditorPanel.Focus(FocusState.Programmatic);
+        e.Handled = true;
+    }
+
+    private void EditorPanel_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_editorMouseDown || _engine == IntPtr.Zero) return;
+        var (x, y) = EditorPhysicalPoint(e);
+        Native.velo_editor_mouse(_engine, 1, x, y, Modifiers());
+    }
+
+    private void EditorPanel_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        _editorMouseDown = false;
+        EditorPanel.ReleasePointerCaptures();
+        if (_engine == IntPtr.Zero) return;
+        var (x, y) = EditorPhysicalPoint(e);
+        Native.velo_editor_mouse(_engine, 2, x, y, Modifiers());
+    }
+
+    private (float, float) EditorPhysicalPoint(PointerRoutedEventArgs e)
+    {
+        var pt = e.GetCurrentPoint(EditorPanel).Position;
+        double sx = EditorPanel.CompositionScaleX > 0 ? EditorPanel.CompositionScaleX : _lastScale;
+        double sy = EditorPanel.CompositionScaleY > 0 ? EditorPanel.CompositionScaleY : _lastScale;
+        return ((float)(pt.X * sx), (float)(pt.Y * sy));
+    }
+
+    /// Dirty flip from Rust: update the tab dot + restart the 1s autosave timer.
+    private void OnEditorDirtyUi(uint fileId, bool dirty)
+    {
+        var vm = EditorFiles.FirstOrDefault(f => f.Id == fileId);
+        if (vm is not null) vm.Dirty = dirty;
+        if (!dirty) return;
+        if (_autosave is null)
+        {
+            _autosave = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _autosave.Tick += (_, _) =>
+            {
+                _autosave!.Stop();
+                if (_engine != IntPtr.Zero)
+                    Native.velo_editor_save_all(_engine); // Rust fires dirty=false back
+            };
+        }
+        _autosave.Stop();
+        _autosave.Start();
+    }
 
     [UnmanagedCallersOnly]
     private static unsafe void OnTitleChanged(IntPtr ctx, uint id, ushort* utf16, nuint len)
@@ -1539,8 +2918,13 @@ public sealed partial class MainWindow : Window
                     break;
                 }
             }
+            w.UpdateTitleBarTitle();
         });
     }
+
+    /// Mirror the active tab's title into the title-bar center.
+    private void UpdateTitleBarTitle()
+        => TitleBarTitle.Text = CurrentTab()?.Title ?? "";
 
     [UnmanagedCallersOnly]
     private static void OnTabClosed(IntPtr ctx, uint id)
@@ -1592,6 +2976,7 @@ public sealed partial class MainWindow : Window
         string cwd = new string((char*)utf16, 0, (int)len);
         w.DispatcherQueue.TryEnqueue(() =>
         {
+            Log.Write($"OnCwdChanged: tab={id} cwd='{cwd}'");
             foreach (var t in w.Tabs)
                 if (t.Id == id) { t.Cwd = cwd; break; }
             if (w._detailsOpen && w.CurrentTab()?.Id == id)
@@ -1625,7 +3010,7 @@ public sealed partial class MainWindow : Window
                 case 2:
                     var cmd = tab.RunningCommand;
                     if (cmd.Length > 0)
-                        tab.CommandHistory.Add(new CommandEntry { Command = cmd, Exit = exit, DurMs = (long)durMs, When = DateTime.Now });
+                        tab.AddCommand(new CommandEntry { Command = cmd, Exit = exit, DurMs = (long)durMs, When = DateTime.Now });
                     tab.RunningCommand = "";
                     Log.Write($"OnCommand: tab={id} cmd='{cmd}' exit={exit} dur={durMs}ms");
                     if (w._detailsOpen && w.CurrentTab()?.Id == id

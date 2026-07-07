@@ -6,7 +6,17 @@
 //! shows through default-bg cells for blur/transparency.
 
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+
+/// Bumped on every theme swap; caches of resolved RGB key off this.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Current theme generation. Anything caching colors resolved through this
+/// module must include this in its cache key.
+pub fn epoch() -> u64 {
+    EPOCH.load(Ordering::Relaxed)
+}
 
 /// Default foreground (light gray).
 pub const DEFAULT_FG: [u8; 3] = [0xd0, 0xd0, 0xd0];
@@ -56,6 +66,7 @@ static THEME: RwLock<Theme> = RwLock::new(Theme {
 /// not themeable and keep their standard xterm values.
 pub fn set_theme(ansi: [[u8; 3]; 16], fg: [u8; 3], cursor: [u8; 3], selection: [u8; 3]) {
     *THEME.write().unwrap() = Theme { ansi, fg, cursor, selection };
+    EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Themed default foreground.
@@ -71,6 +82,17 @@ pub fn cursor() -> [u8; 3] {
 /// Themed selection-highlight background.
 pub fn selection() -> [u8; 3] {
     THEME.read().unwrap().selection
+}
+
+/// Indexed palette color with the runtime theme applied to 0..16 (the fixed
+/// cube/grayscale above). The editor keys its syntax colors off this so
+/// terminal themes restyle code automatically.
+pub fn ansi(i: usize) -> [u8; 3] {
+    if i < 16 {
+        THEME.read().unwrap().ansi[i]
+    } else {
+        ANSI_256[i.min(255)]
+    }
 }
 
 /// Standard xterm 256-color palette: 16 system + 6x6x6 cube + 24 grays. Used for

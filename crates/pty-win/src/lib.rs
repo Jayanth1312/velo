@@ -162,7 +162,7 @@ mod imp {
 
             // 6. Reader thread: pump conout to events until EOF/error.
             let reader = std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; 65536];
                 loop {
                     match reader_file.read(&mut buf) {
                         Ok(0) | Err(_) => {

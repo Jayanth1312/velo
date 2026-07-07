@@ -27,6 +27,8 @@ internal static unsafe partial class Native
         public IntPtr OnSwitchTabRequested;// (ctx, forward)
         public IntPtr OnCwdChanged;       // (ctx, id, utf16*, len)
         public IntPtr OnCommand;          // (ctx, id, phase, exit, dur_ms, utf16*, len)
+        public IntPtr OnAnim;             // (ctx) — start driving velo_tick
+        public IntPtr OnEditorDirty;      // (ctx, file_id, dirty)
     }
 
     /// Init GPU + composition swapchain + the core's internal wakeup window.
@@ -46,17 +48,25 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_render(IntPtr eng);
 
+    /// Advance smooth-scroll animations; returns 1 while more frames are needed.
+    [LibraryImport(Core)]
+    internal static partial int velo_tick(IntPtr eng, float dtMs);
+
     /// Forward a key-down. mods bit0=Ctrl, bit1=Shift, bit2=Alt. Returns 1 if handled.
     [LibraryImport(Core)]
     internal static partial byte velo_key(IntPtr eng, uint vk, uint mods);
 
-    /// Forward a received character (one UTF-16 code unit).
+    /// Forward a received character (one UTF-16 code unit). mods is the same
+    /// live modifier bitset as velo_key (bit0=Ctrl, bit1=Shift, bit2=Alt).
     [LibraryImport(Core)]
-    internal static partial void velo_char(IntPtr eng, uint cu);
+    internal static partial void velo_char(IntPtr eng, uint cu, uint mods);
 
     /// Forward a pointer event. kind 0=down,1=move,2=up; (x,y) physical px.
+    /// button: 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
+    /// Shift; shift forces local selection even when the app has enabled
+    /// mouse reporting).
     [LibraryImport(Core)]
-    internal static partial void velo_mouse(IntPtr eng, uint kind, float x, float y);
+    internal static partial void velo_mouse(IntPtr eng, uint kind, float x, float y, uint button, uint mods);
 
     [LibraryImport(Core)]
     internal static partial void velo_set_callbacks(IntPtr eng, VeloCallbacks cb);
@@ -87,12 +97,23 @@ internal static unsafe partial class Native
     internal static partial void velo_pane_resize(IntPtr eng, uint pane, uint w, uint h);
 
     /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up.
+    /// button: 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
+    /// Shift; shift forces local selection even when the app has enabled
+    /// mouse reporting).
     [LibraryImport(Core)]
-    internal static partial void velo_pane_mouse(IntPtr eng, uint pane, uint kind, float x, float y);
+    internal static partial void velo_pane_mouse(IntPtr eng, uint pane, uint kind, float x, float y, uint button, uint mods);
 
     /// Make `pane` the keyboard-focused pane.
     [LibraryImport(Core)]
     internal static partial void velo_pane_focus(IntPtr eng, uint pane);
+
+    /// Mouse wheel over `pane`. deltaLines is signed (positive = up/history,
+    /// negative = down/present). (x,y) are physical px inside the pane (places
+    /// the SGR wheel event when the app has mouse reporting on); mods is the
+    /// velo_key bitset (bit1 = Shift overrides mouse reporting). Falls back to
+    /// arrow keys on the alt screen (vim, less, ...) or scrollback otherwise.
+    [LibraryImport(Core)]
+    internal static partial void velo_pane_scroll(IntPtr eng, uint pane, int deltaLines, float x, float y, uint mods);
 
     /// Destroy `pane` (pane 0 cannot be destroyed); its tab survives.
     [LibraryImport(Core)]
@@ -120,6 +141,44 @@ internal static unsafe partial class Native
 
     [LibraryImport(Core)]
     internal static partial void velo_paste_utf16(IntPtr eng, ushort* ptr, nuint len);
+
+    // ---- Editor pane -------------------------------------------------------
+
+    /// Create (or return) the editor pane; writes its swapchain to *outSwapchain.
+    /// Returns the pane id, or uint.MaxValue on failure.
+    [LibraryImport(Core)]
+    internal static partial uint velo_editor_attach(IntPtr eng, IntPtr* outSwapchain);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_resize(IntPtr eng, uint w, uint h);
+
+    /// Open (or refocus) a file; returns its id, or -1 (unreadable / not UTF-8).
+    [LibraryImport(Core)]
+    internal static partial long velo_editor_open(IntPtr eng, ushort* path, nuint len);
+
+    /// Close a file (saves it first if dirty).
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_close_file(IntPtr eng, uint id);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_focus_file(IntPtr eng, uint id);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_save_all(IntPtr eng);
+
+    /// Editor key-down. mods bit0=Ctrl, bit1=Shift, bit2=Alt. 1 = handled.
+    [LibraryImport(Core)]
+    internal static partial byte velo_editor_key(IntPtr eng, uint vk, uint mods);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_char(IntPtr eng, uint cu);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_scroll(IntPtr eng, int deltaLines);
+
+    /// kind 0=down,1=move,2=up; (x,y) physical px inside the editor panel.
+    [LibraryImport(Core)]
+    internal static partial void velo_editor_mouse(IntPtr eng, uint kind, float x, float y, uint mods);
 
     [LibraryImport(Core)]
     internal static partial void velo_shutdown(IntPtr eng);

@@ -34,18 +34,35 @@ internal static class ShellIntegration
         }
     }
 
-    /// Append `block` between the markers to `path`, once. If the markers are
-    /// already present the file is left untouched.
+    /// Write `block` between the markers in `path`. If a velo block already exists
+    /// it is REPLACED (so a fixed emitter upgrades an old injection); if its content
+    /// already matches, the file is left untouched.
     private static void InjectFile(string path, string block)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
         var existing = File.Exists(path) ? File.ReadAllText(path) : "";
-        if (existing.Contains(Begin))
+        var fenced = $"{Begin}\n{block}\n{End}";
+
+        var b = existing.IndexOf(Begin, StringComparison.Ordinal);
+        if (b >= 0)
+        {
+            var e = existing.IndexOf(End, b, StringComparison.Ordinal);
+            if (e < 0)
+                return; // malformed (no end marker) — leave it alone
+            e += End.Length;
+            var current = existing.Substring(b, e - b);
+            if (current == fenced)
+                return; // up to date
+            var updated = existing.Remove(b, e - b).Insert(b, fenced);
+            File.WriteAllText(path, updated);
+            Log.Write($"ShellIntegration: updated block in {path}");
             return;
+        }
+
         var sep = existing.Length > 0 && !existing.EndsWith('\n') ? "\n" : "";
-        File.AppendAllText(path, $"{sep}{Begin}\n{block}\n{End}\n");
+        File.AppendAllText(path, $"{sep}{fenced}\n");
         Log.Write($"ShellIntegration: injected into {path}");
     }
 
@@ -74,7 +91,8 @@ if ($env:VELO_SHELL_INTEGRATION -ne '0') {
   function global:prompt {
     $code = $LASTEXITCODE; if ($null -eq $code) { $code = 0 }
     $e = [char]27; $b = [char]7
-    $h = (Get-Location).Path
+    # OSC 7 wants file://HOST/PATH with forward slashes: C:\a\b -> /C:/a/b.
+    $h = '/' + ((Get-Location).Path -replace '\\','/')
     $out = "$e]133;D;$code$b$e]133;A$b$e]7;file://$env:COMPUTERNAME$h$b"
     $out += (& $global:__VeloPrompt)
     $out += "$e]133;B$b"

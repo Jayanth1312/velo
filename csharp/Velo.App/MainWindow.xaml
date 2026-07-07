@@ -11,13 +11,167 @@
          animates its column width, the `*` terminal column reflows in lockstep. The
          toggles sit in the terminal column anchored to its edges, so they track the
          panel boundary automatically; their inner bar animates wide<->narrow. -->
-    <Grid KeyboardAcceleratorPlacementMode="Hidden">
+    <Grid x:Name="RootGrid" KeyboardAcceleratorPlacementMode="Hidden">
         <Grid.KeyboardAccelerators>
             <KeyboardAccelerator Modifiers="Control" Key="B" Invoked="PaneToggleAccel_Invoked" />
             <KeyboardAccelerator Modifiers="Control,Shift" Key="B" Invoked="DetailsToggleAccel_Invoked" />
             <KeyboardAccelerator Modifiers="Control,Shift" Key="P" Invoked="PaletteAccel_Invoked" />
             <KeyboardAccelerator Modifiers="Control" Key="P" Invoked="PaletteAccel_Invoked" />
         </Grid.KeyboardAccelerators>
+
+        <Grid.Resources>
+            <!-- Tab list rows: a tab row, or a group-header row. Selected by TabRowSelector. -->
+            <!-- Classic Binding (no x:Bind/x:DataType): the TabVM<->TabGroup
+                 reference cycle makes the WinUI 1.6 x:Bind validation-context
+                 generator recurse forever -> silent XamlCompiler StackOverflow. -->
+            <DataTemplate x:Key="TabRowTemplate">
+                <Grid ColumnSpacing="8"
+                      Margin="{Binding RowIndent, Mode=OneWay}"
+                      Background="Transparent"
+                      PointerPressed="TabRow_PointerPressed"
+                      PointerEntered="TabRow_PointerEntered"
+                      PointerExited="TabRow_PointerExited"
+                      DoubleTapped="TabRow_DoubleTapped"
+                      ContextRequested="TabRow_ContextRequested">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <!-- The ONLY row fill: active, hover, and ctrl-select all share
+                         this one Border (presenter draws no background), so every
+                         state is identical brush + geometry and can never stack. -->
+                    <Border Grid.ColumnSpan="4"
+                            Margin="-10,0,-8,0"
+                            CornerRadius="7"
+                            Background="{ThemeResource ListViewItemBackgroundSelected}"
+                            Opacity="{Binding FillOpacity, Mode=OneWay}"
+                            IsHitTestVisible="False" />
+                    <!-- Group colour accent bar. -->
+                    <Border Grid.Column="0"
+                            Width="3" Height="16"
+                            CornerRadius="2"
+                            VerticalAlignment="Center"
+                            Background="{Binding AccentBrush, Mode=OneWay}"
+                            Visibility="{Binding AccentVisibility, Mode=OneWay}" />
+                    <TextBlock Grid.Column="1"
+                               Text="{Binding Title, Mode=OneWay}"
+                               Visibility="{Binding TitleVisibility, Mode=OneWay}"
+                               TextTrimming="CharacterEllipsis"
+                               VerticalAlignment="Center" />
+                    <TextBox Grid.Column="1"
+                             Name="RenameBox"
+                             Text="{Binding Title, Mode=OneWay}"
+                             Visibility="{Binding EditVisibility, Mode=OneWay}"
+                             VerticalAlignment="Center"
+                             MinHeight="0" Height="26"
+                             Padding="6,2"
+                             KeyDown="RenameBox_KeyDown"
+                             LostFocus="RenameBox_LostFocus" />
+                    <TextBlock Grid.Column="2"
+                               Text="{Binding Badge, Mode=OneWay}"
+                               VerticalAlignment="Center"
+                               Opacity="0.7" />
+                    <TextBlock Grid.Column="3"
+                               Name="ShellKindText"
+                               Text="{Binding ShellKind, Mode=OneWay}"
+                               VerticalAlignment="Center"
+                               HorizontalAlignment="Right"
+                               FontSize="11"
+                               Opacity="0.5" />
+                    <Button Grid.Column="3"
+                            Opacity="0"
+                            Content="&#xE711;"
+                            FontFamily="Segoe MDL2 Assets"
+                            FontSize="11"
+                            Width="24" Height="24"
+                            Padding="0"
+                            CornerRadius="6"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Tag="{Binding Id}"
+                            Click="TabClose_Click" />
+                </Grid>
+            </DataTemplate>
+
+            <DataTemplate x:Key="GroupHeaderTemplate">
+                <Grid ColumnSpacing="6"
+                      Padding="0,6"
+                      Background="Transparent"
+                      Tapped="GroupHeader_Tapped"
+                      DoubleTapped="GroupHeader_DoubleTapped"
+                      PointerEntered="GroupHeader_PointerEntered"
+                      PointerExited="GroupHeader_PointerExited"
+                      ContextRequested="GroupHeader_ContextRequested">
+                    <!-- ColumnDefinitions MUST precede content children: a child
+                         element before this property element made the WinUI 1.6
+                         XamlCompiler pass1 parser recurse forever -> silent
+                         XamlCompiler.exe exit-1 (StackOverflow, no error). -->
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <!-- Hover fill (presenter hover is disabled for the whole list;
+                         drawn here so the header still highlights on hover). Margin
+                         cancels the presenter ContentMargin + this Grid's padding so
+                         it fills the row like the old presenter fill did. -->
+                    <Border x:Name="HoverFill"
+                            Grid.ColumnSpan="4"
+                            Margin="-10,-6,-8,-6"
+                            CornerRadius="7"
+                            Background="{ThemeResource ListViewItemBackgroundSelected}"
+                            Opacity="0"
+                            IsHitTestVisible="False" />
+                    <!-- Separator hairline between consecutive groups (hidden on the
+                         first group via SeparatorVisibility). Spans nearly the full
+                         panel width to match the design. -->
+                    <Border Grid.ColumnSpan="4"
+                            Height="1"
+                            VerticalAlignment="Top"
+                            Margin="-14,-6,-12,0"
+                            Visibility="{Binding SeparatorVisibility, Mode=OneWay}"
+                            Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                    <FontIcon Grid.Column="0"
+                              Width="22" Height="22"
+                              FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                              FontSize="11"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center"
+                              Glyph="{Binding ChevronGlyph, Mode=OneWay}" />
+                    <Ellipse Grid.Column="1"
+                             Width="9" Height="9"
+                             VerticalAlignment="Center"
+                             Fill="{Binding ColorBrush, Mode=OneWay}" />
+                    <TextBlock Grid.Column="2"
+                               Text="{Binding Name, Mode=OneWay}"
+                               Visibility="{Binding NameVisibility, Mode=OneWay}"
+                               FontWeight="SemiBold"
+                               FontSize="12"
+                               TextTrimming="CharacterEllipsis"
+                               VerticalAlignment="Center" />
+                    <TextBox Grid.Column="2"
+                             Name="RenameBox"
+                             Text="{Binding Name, Mode=OneWay}"
+                             Visibility="{Binding EditVisibility, Mode=OneWay}"
+                             VerticalAlignment="Center"
+                             MinHeight="0" Height="26"
+                             Padding="6,2"
+                             KeyDown="RenameBox_KeyDown"
+                             LostFocus="RenameBox_LostFocus" />
+                    <Button Grid.Column="3"
+                            Style="{StaticResource IconButtonStyle}"
+                            Content="&#xE712;"
+                            FontSize="12"
+                            VerticalAlignment="Center"
+                            HorizontalAlignment="Right"
+                            Click="GroupMenu_Click" />
+                </Grid>
+            </DataTemplate>
+
+        </Grid.Resources>
 
         <!-- Three real columns: details panel | terminal | tabs panel. Toggling a
              panel animates its column's WIDTH (Auto columns track the panel Border
@@ -43,7 +197,16 @@
             <!-- Thin title bar: just tall enough for the toggle icons + small
                  padding. No title text (drag + double-click-maximize only). -->
             <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent"
-                  SizeChanged="TitleBar_SizeChanged" />
+                  SizeChanged="TitleBar_SizeChanged">
+                <TextBlock x:Name="TitleBarTitle"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           FontSize="12"
+                           MaxWidth="420"
+                           TextTrimming="CharacterEllipsis"
+                           IsHitTestVisible="False"
+                           Opacity="0.8" />
+            </Grid>
 
             <!-- Pane host: a 2x2 grid holding up to 4 terminal panes.
                  ponytail: background is Transparent (shows ContentRoot's terminal-
@@ -61,9 +224,10 @@
                   ColumnSpacing="1"
                   RowSpacing="1"
                   Loaded="PaneHost_Loaded"
-                  KeyDown="Panel_KeyDown"
-                  CharacterReceived="Panel_CharacterReceived"
-                  PointerPressed="PaneHost_PointerPressed">
+                  PointerPressed="PaneHost_PointerPressed"
+                  PointerMoved="PaneHost_PointerMoved"
+                  PointerReleased="PaneHost_PointerReleased"
+                  PointerWheelChanged="PaneHost_PointerWheelChanged">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" />
                     <RowDefinition Height="*" />
@@ -79,38 +243,26 @@
                                 SizeChanged="Panel_SizeChanged"
                                 Loaded="TerminalPanel_Loaded"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
 
                 <SwapChainPanel x:Name="TerminalPanel1"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
                                 SizeChanged="Panel_SizeChanged"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
                 <SwapChainPanel x:Name="TerminalPanel2"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
                                 SizeChanged="Panel_SizeChanged"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
                 <SwapChainPanel x:Name="TerminalPanel3"
                                 Visibility="Collapsed"
                                 IsTabStop="True"
                                 SizeChanged="Panel_SizeChanged"
                                 KeyDown="Panel_KeyDown"
-                                CharacterReceived="Panel_CharacterReceived"
-                                PointerPressed="Panel_PointerPressed"
-                                PointerMoved="Panel_PointerMoved"
-                                PointerReleased="Panel_PointerReleased" />
+                                CharacterReceived="Panel_CharacterReceived" />
 
                 <!-- Drop-zone overlay (a single highlight repositioned per edge). -->
                 <Grid x:Name="SplitOverlay"
@@ -143,6 +295,114 @@
                                FontWeight="SemiBold"
                                Foreground="White" />
                 </Border>
+            </Grid>
+
+            <!-- Editor mode host: file tab strip + editor swapchain. Shown in
+                 place of PaneHost while editor mode is on; terminal panes stay
+                 alive underneath (hidden, not destroyed). -->
+            <Grid x:Name="EditorHost"
+                  Grid.Row="1"
+                  Visibility="Collapsed"
+                  Background="Transparent">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="36" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <ListView x:Name="EditorTabs"
+                          Grid.Row="0"
+                          ItemsSource="{x:Bind EditorFiles}"
+                          SelectionMode="Single"
+                          SelectionChanged="EditorTabs_SelectionChanged"
+                          ScrollViewer.HorizontalScrollMode="Enabled"
+                          ScrollViewer.HorizontalScrollBarVisibility="Hidden">
+                    <ListView.Resources>
+                        <!-- Presenter backgrounds off entirely: it draws square
+                             fills that ignore CornerRadius. The rounded pill is a
+                             Border inside the item template instead. -->
+                        <SolidColorBrush x:Key="ListViewItemBackground" Color="Transparent" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="Transparent" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="Transparent" />
+                        <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="Transparent" />
+                    </ListView.Resources>
+                    <ListView.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <ItemsStackPanel Orientation="Horizontal" />
+                        </ItemsPanelTemplate>
+                    </ListView.ItemsPanel>
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="MinHeight" Value="30" />
+                            <Setter Property="MinWidth" Value="0" />
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="Margin" Value="2,0" />
+                            <Setter Property="CornerRadius" Value="6" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="local:EditorFileVM">
+                            <Border CornerRadius="6"
+                                    Padding="14,5,8,5"
+                                    Background="{x:Bind SelectedBrush, Mode=OneWay}">
+                            <Grid ColumnSpacing="6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="{x:Bind Name}"
+                                           VerticalAlignment="Center"
+                                           FontSize="12" />
+                                <Ellipse Grid.Column="1"
+                                         Width="7" Height="7"
+                                         Fill="{ThemeResource AccentFillColorDefaultBrush}"
+                                         Visibility="{x:Bind DirtyVisibility, Mode=OneWay}"
+                                         VerticalAlignment="Center" />
+                                <Button Grid.Column="2"
+                                        Content="&#xE711;"
+                                        FontFamily="Segoe MDL2 Assets"
+                                        FontSize="10"
+                                        Width="22" Height="22"
+                                        Padding="0"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Tag="{x:Bind Id}"
+                                        Click="EditorTabClose_Click" />
+                            </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <SwapChainPanel x:Name="EditorPanel"
+                                Grid.Row="1"
+                                IsTabStop="True"
+                                SizeChanged="EditorPanel_SizeChanged"
+                                KeyDown="EditorPanel_KeyDown"
+                                CharacterReceived="EditorPanel_CharacterReceived"
+                                PointerPressed="EditorPanel_PointerPressed"
+                                PointerMoved="EditorPanel_PointerMoved"
+                                PointerReleased="EditorPanel_PointerReleased"
+                                PointerWheelChanged="EditorPanel_PointerWheelChanged" />
+
+                <!-- Ctrl+J bottom terminal: shows the active tab's live session.
+                     Transparent Grid takes keyboard focus (SwapChainPanel can't),
+                     same pattern as PaneHost. -->
+                <Grid x:Name="EditorTermHost"
+                      Grid.Row="2"
+                      Height="220"
+                      Visibility="Collapsed"
+                      Background="Transparent"
+                      IsTabStop="True"
+                      KeyDown="EditorTerm_KeyDown"
+                      CharacterReceived="Panel_CharacterReceived"
+                      PointerPressed="EditorTerm_PointerPressed"
+                      PointerWheelChanged="EditorTerm_PointerWheelChanged">
+                    <SwapChainPanel x:Name="EditorTermPanel"
+                                    SizeChanged="EditorTerm_SizeChanged" />
+                </Grid>
             </Grid>
         </Grid>
 
@@ -256,7 +516,13 @@
                      NOT realized at window load — it only builds when the details panel
                      first opens (at 280px). Realizing ListView/ScrollViewer/TextBox in
                      the collapsed (Width=0) panel at startup crashed first layout. -->
-                <Grid x:Name="DetailsBodyHost" Grid.Row="1" x:Load="False">
+                <!-- Always built, but Collapsed at startup so its heavy controls
+                     (ListView/ScrollViewer/TextBox) skip first-layout measure — same
+                     crash-avoidance x:Load gave, WITHOUT relying on FindName to realize
+                     it (FindName never realizes x:Load in WinUI 3 → panels stayed empty).
+                     SetDetails flips this Visible on first open. -->
+                <Grid x:Name="DetailsBodyHost" Grid.Row="1" Visibility="Collapsed"
+                      Tapped="DetailsBody_Tapped">
 
                     <!-- INFO -->
                     <ScrollViewer x:Name="InfoPanel" Padding="16,8,16,16">
@@ -270,7 +536,6 @@
                                 <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,6,0,0">
                                     <Button Content="Copy Path" Click="InfoCopyPath_Click" />
                                     <Button Content="Reveal" Click="InfoReveal_Click" />
-                                    <Button Content="VS Code" Click="InfoOpenCode_Click" />
                                 </StackPanel>
                             </StackPanel>
                             <StackPanel Spacing="4">
@@ -285,12 +550,114 @@
                     <ListView x:Name="OutlineList" Visibility="Collapsed"
                               SelectionMode="None" Padding="6,4" />
 
-                    <!-- GIT: porcelain status of the cwd's repo. -->
-                    <ScrollViewer x:Name="GitPanel" Visibility="Collapsed" Padding="16,8,16,16">
-                        <StackPanel Spacing="8">
-                            <TextBlock x:Name="GitBranch" Text="—" FontWeight="SemiBold" FontSize="13" />
-                            <TextBlock x:Name="GitSummary" Text="" Opacity="0.6" FontSize="11" />
-                            <ItemsControl x:Name="GitFiles" />
+                    <!-- GIT: porcelain status of the cwd's repo. Layout mirrors a
+                         Fork-style sidebar: branch + diff stat, remote link, action
+                         buttons, then the changed-file list. -->
+                    <ScrollViewer x:Name="GitPanel" Visibility="Collapsed" Padding="16,12,16,16">
+                        <StackPanel Spacing="14">
+                            <!-- Branch + (+adds / −dels) -->
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="GitBranch" Grid.Column="0" Text="—"
+                                           FontWeight="SemiBold" FontSize="18"
+                                           TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8"
+                                            VerticalAlignment="Center">
+                                    <TextBlock x:Name="GitAdds" Text="" FontSize="13"
+                                               Foreground="#3FB950" FontFamily="Consolas, monospace" />
+                                    <TextBlock x:Name="GitDels" Text="" FontSize="13"
+                                               Foreground="#F85149" FontFamily="Consolas, monospace" />
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- Remote URL -->
+                            <HyperlinkButton x:Name="GitRemote" Content="" FontSize="12"
+                                             Padding="0" Margin="0,-8,0,0" Visibility="Collapsed" />
+
+                            <!-- Action buttons -->
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <SplitButton x:Name="GitCommitBtn" Grid.Column="0"
+                                             Content="Commit" HorizontalAlignment="Stretch"
+                                             HorizontalContentAlignment="Center"
+                                             Click="GitCommitBtn_Click">
+                                    <SplitButton.Flyout>
+                                        <MenuFlyout>
+                                            <MenuFlyoutItem Text="Commit" Click="GitCommit_Click" />
+                                            <MenuFlyoutItem Text="Commit &amp; Push" Click="GitCommitPush_Click" />
+                                            <MenuFlyoutItem Text="Amend last commit" Click="GitAmend_Click" />
+                                        </MenuFlyout>
+                                    </SplitButton.Flyout>
+                                </SplitButton>
+                                <SplitButton x:Name="GitForkBtn" Grid.Column="1"
+                                             HorizontalAlignment="Stretch"
+                                             HorizontalContentAlignment="Center"
+                                             Click="GitForkBtn_Click">
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <FontIcon Glyph="&#xE895;" FontSize="13"
+                                                  FontFamily="Segoe MDL2 Assets" />
+                                        <TextBlock Text="Sync" />
+                                    </StackPanel>
+                                    <SplitButton.Flyout>
+                                        <MenuFlyout>
+                                            <MenuFlyoutItem Text="Fetch" Click="GitFetch_Click" />
+                                            <MenuFlyoutItem Text="Pull" Click="GitPull_Click" />
+                                            <MenuFlyoutItem Text="Push" Click="GitPush_Click" />
+                                        </MenuFlyout>
+                                    </SplitButton.Flyout>
+                                </SplitButton>
+                            </Grid>
+
+                            <!-- Unstaged header + stage-all -->
+                            <Grid Margin="0,4,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="GitUnstagedLabel" Grid.Column="0" Text="Changes"
+                                           FontWeight="SemiBold" FontSize="13" Opacity="0.85"
+                                           VerticalAlignment="Center" />
+                                <Button Grid.Column="1" Style="{StaticResource IconButtonStyle}"
+                                        Content="&#xE710;" Click="GitStageAll_Click"
+                                        ToolTipService.ToolTip="Stage all" />
+                            </Grid>
+
+                            <!-- Changed files. Click a row to stage/unstage it. -->
+                            <ListView x:Name="GitFiles" SelectionMode="None"
+                                      IsItemClickEnabled="True" ItemClick="GitFiles_ItemClick"
+                                      Padding="0" Margin="0,-4,0,0">
+                                <ListView.ItemContainerStyle>
+                                    <Style TargetType="ListViewItem">
+                                        <Setter Property="MinHeight" Value="30" />
+                                        <Setter Property="Padding" Value="0" />
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    </Style>
+                                </ListView.ItemContainerStyle>
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="local:GitFileRow">
+                                        <Grid ColumnSpacing="8" ToolTipService.ToolTip="{x:Bind FullPath}">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="14" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{x:Bind Status}"
+                                                       Foreground="{x:Bind StatusBrush}"
+                                                       FontWeight="SemiBold" FontSize="12"
+                                                       FontFamily="Consolas, monospace"
+                                                       VerticalAlignment="Center" />
+                                            <TextBlock Grid.Column="1" Text="{x:Bind Display}"
+                                                       FontSize="12" VerticalAlignment="Center"
+                                                       TextTrimming="None" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
                         </StackPanel>
                     </ScrollViewer>
 
@@ -319,9 +686,34 @@
                                     Content="&#xE7B3;" Click="FilesHidden_Click"
                                     ToolTipService.ToolTip="Toggle hidden" />
                         </Grid>
-                        <ListView x:Name="FilesTree" Grid.Row="1"
-                                  SelectionMode="Single"
-                                  DoubleTapped="FilesList_DoubleTapped" />
+                        <!-- Single click on a folder reveals its contents inline
+                             (lazy-loaded on expand); double click sets it as the tree
+                             root. Phosphor icons swap closed/open per node. -->
+                        <muxc:TreeView x:Name="FilesTree" Grid.Row="1"
+                                       SelectionMode="Single"
+                                       CanDragItems="False" CanReorderItems="False"
+                                       Expanding="FilesTree_Expanding"
+                                       Collapsed="FilesTree_Collapsed"
+                                       ItemInvoked="FilesTree_ItemInvoked"
+                                       DoubleTapped="FilesList_DoubleTapped">
+                            <muxc:TreeView.ItemTemplate>
+                                <!-- Node mode: DataContext is the TreeViewNode; the
+                                     FileItem is its Content. -->
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Spacing="6" Height="28">
+                                        <!-- Classic Binding (not x:Bind): casting Content in an
+                                             x:Bind path crashes the WinUI 1.6 XamlCompiler. -->
+                                        <Path Data="{Binding Content.Icon, Mode=OneWay}"
+                                              Width="16" Height="16" Stretch="Uniform"
+                                              Fill="{ThemeResource TextFillColorSecondaryBrush}"
+                                              VerticalAlignment="Center" />
+                                        <TextBlock Text="{Binding Content.Name}" FontSize="13"
+                                                   VerticalAlignment="Center"
+                                                   TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </muxc:TreeView.ItemTemplate>
+                        </muxc:TreeView>
                     </Grid>
                 </Grid>
             </Grid>
@@ -372,6 +764,7 @@
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0"
                                Text="TABS"
@@ -380,15 +773,71 @@
                                FontWeight="SemiBold"
                                Opacity="0.55"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                    <Button x:Name="AddTabButton"
+                    <!-- New-tab split control: + (default shell) and a chevron (profile
+                         menu) read as one pill — the outer Border draws the unified
+                         rounded outline; the inner buttons are transparent with a
+                         hairline divider between them. -->
+                    <Border x:Name="NewTabSplit"
                             Grid.Column="1"
                             VerticalAlignment="Center"
-                            Style="{StaticResource IconButtonStyle}"
-                            Content="&#xE710;"
-                            Click="AddTab_Click"
-                            ToolTipService.ToolTip="New tab (Ctrl+Shift+T)" />
+                            Height="28"
+                            CornerRadius="6"
+                            BorderThickness="1"
+                            BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                            Background="{ThemeResource SubtleFillColorTransparentBrush}">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Stretch">
+                            <Button x:Name="AddTabButton"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    CornerRadius="5,0,0,5"
+                                    Padding="8,0"
+                                    VerticalAlignment="Stretch"
+                                    MinWidth="0"
+                                    MinHeight="0"
+                                    VerticalContentAlignment="Center"
+                                    HorizontalContentAlignment="Center"
+                                    Click="AddTab_Click"
+                                    ToolTipService.ToolTip="New tab (Ctrl+Shift+T)">
+                                <Viewbox Width="15" Height="15"
+                                         VerticalAlignment="Center" HorizontalAlignment="Center">
+                                    <!-- lucide plus (24x24 viewBox) -->
+                                    <Path Stroke="{ThemeResource TextFillColorSecondaryBrush}"
+                                          StrokeThickness="2"
+                                          StrokeStartLineCap="Round"
+                                          StrokeEndLineCap="Round"
+                                          Data="M12 5 V19 M5 12 H19" />
+                                </Viewbox>
+                            </Button>
+                            <Border Width="1"
+                                    Margin="0,5"
+                                    Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                            <Button x:Name="NewTabMenuButton"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    CornerRadius="0,5,5,0"
+                                    Padding="6,0"
+                                    VerticalAlignment="Stretch"
+                                    MinWidth="0"
+                                    MinHeight="0"
+                                    VerticalContentAlignment="Center"
+                                    HorizontalContentAlignment="Center"
+                                    Click="NewTabMenu_Click"
+                                    ToolTipService.ToolTip="New tab profile">
+                                <Viewbox Width="12" Height="12"
+                                         VerticalAlignment="Center" HorizontalAlignment="Center">
+                                    <!-- lucide chevron-down (24x24 viewBox) -->
+                                    <Path Stroke="{ThemeResource TextFillColorSecondaryBrush}"
+                                          StrokeThickness="2.5"
+                                          StrokeLineJoin="Round"
+                                          StrokeStartLineCap="Round"
+                                          StrokeEndLineCap="Round"
+                                          Data="M6 9 L12 15 L18 9" />
+                                </Viewbox>
+                            </Button>
+                        </StackPanel>
+                    </Border>
                     <Button x:Name="FilterButton"
-                            Grid.Column="2"
+                            Grid.Column="3"
                             VerticalAlignment="Center"
                             Style="{StaticResource IconButtonStyle}"
                             ToolTipService.ToolTip="Filter">
@@ -404,14 +853,28 @@
                     </Button>
                 </Grid>
 
+                <!-- IsTabStop=False on the list AND its item containers: selecting a
+                     tab (incl. programmatically on new-tab) must NOT pull keyboard
+                     focus into the ListView, else input focus sticks there and the
+                     terminal goes dead until the window is re-activated (the "can't
+                     type after new tab until alt-tab" bug). -->
                 <ListView x:Name="TabList"
                           Grid.Row="2"
-                          ItemsSource="{x:Bind Tabs}"
+                          Background="Transparent"
+                          ItemsSource="{x:Bind TabListItems}"
                           SelectionMode="Single"
-                          CanDragItems="False"
+                          CanDragItems="True"
+                          CanReorderItems="False"
+                          AllowDrop="True"
+                          IsTabStop="False"
                           AllowFocusOnInteraction="False"
                           SelectionChanged="TabList_SelectionChanged"
+                          DragItemsStarting="TabList_DragItemsStarting"
+                          DragItemsCompleted="TabList_DragItemsCompleted"
+                          DragOver="TabList_DragOver"
+                          Drop="TabList_Drop"
                           Tapped="TabList_Tapped"
+                          ContextRequested="TabList_ContextRequested"
                           Padding="6,8,6,4">
                     <!-- No add/reorder transitions: new tabs appear instantly
                          instead of the slow default entrance animation. -->
@@ -420,6 +883,7 @@
                     </ListView.ItemContainerTransitions>
                     <ListView.ItemContainerStyle>
                         <Style TargetType="ListViewItem">
+                            <Setter Property="IsTabStop" Value="False" />
                             <Setter Property="MinHeight" Value="38" />
                             <Setter Property="Margin" Value="0,2" />
                             <Setter Property="HorizontalContentAlignment" Value="Stretch" />
@@ -434,52 +898,18 @@
                                             CornerRadius="7"
                                             ContentMargin="10,0,8,0"
                                             HorizontalContentAlignment="Stretch"
-                                            VerticalContentAlignment="Center"
+                                            VerticalContentAlignment="Stretch"
                                             SelectionIndicatorBrush="Transparent"
-                                            PointerOverBackground="{ThemeResource ListViewItemBackgroundPointerOver}"
-                                            PressedBackground="{ThemeResource ListViewItemBackgroundPressed}"
-                                            SelectedBackground="{ThemeResource ListViewItemBackgroundSelected}"
-                                            SelectedPointerOverBackground="{ThemeResource ListViewItemBackgroundSelectedPointerOver}"
-                                            SelectedPressedBackground="{ThemeResource ListViewItemBackgroundSelectedPressed}" />
+                                            PointerOverBackground="Transparent"
+                                            PressedBackground="Transparent"
+                                            SelectedBackground="Transparent"
+                                            SelectedPointerOverBackground="Transparent"
+                                            SelectedPressedBackground="Transparent" />
                                     </ControlTemplate>
                                 </Setter.Value>
                             </Setter>
                         </Style>
                     </ListView.ItemContainerStyle>
-                    <ListView.ItemTemplate>
-                        <DataTemplate x:DataType="local:TabVM">
-                            <Grid ColumnSpacing="8"
-                                  PointerEntered="TabRow_PointerEntered"
-                                  PointerExited="TabRow_PointerExited">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Grid.Column="0"
-                                           Text="{x:Bind Title, Mode=OneWay}"
-                                           TextTrimming="CharacterEllipsis"
-                                           VerticalAlignment="Center" />
-                                <TextBlock Grid.Column="1"
-                                           Text="{x:Bind Badge, Mode=OneWay}"
-                                           VerticalAlignment="Center"
-                                           Opacity="0.7" />
-                                <!-- Close: hidden until the row is hovered. -->
-                                <Button Grid.Column="2"
-                                        Opacity="0"
-                                        Content="&#xE711;"
-                                        FontFamily="Segoe MDL2 Assets"
-                                        FontSize="11"
-                                        Width="24" Height="24"
-                                        Padding="0"
-                                        CornerRadius="6"
-                                        Background="Transparent"
-                                        BorderThickness="0"
-                                        Click="TabClose_Click"
-                                        Tag="{x:Bind Id}" />
-                            </Grid>
-                        </DataTemplate>
-                    </ListView.ItemTemplate>
                 </ListView>
 
                 <!-- Footer: settings (round, hover-only chrome), bottom-right. -->
@@ -570,12 +1000,12 @@
               Visibility="Collapsed"
               Background="#66000000"
               Tapped="PaletteOverlay_Tapped">
-            <Border Width="560"
+            <Border x:Name="PaletteCard"
+                    Width="560"
                     VerticalAlignment="Center"
                     HorizontalAlignment="Center"
                     Margin="0,-48,0,0"
                     Padding="8"
-                    Background="#F21D1F23"
                     BorderBrush="#22FFFFFF"
                     BorderThickness="1"
                     CornerRadius="14"

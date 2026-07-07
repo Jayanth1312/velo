@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use term_core::{palette, CursorShape, Frame, FrameDamage};
+use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell};
 
 const ATLAS_SIZE: u32 = 2048;
 /// Instances per cell: 0 = background/selection/cursor-block fill, 1 = glyph,
@@ -65,6 +65,73 @@ struct Glyph {
 /// Glyph cache key: char + bold + italic + sub-pixel x bin.
 type GlyphKey = (char, bool, bool, u8);
 
+/// Smooth-scroll easing state: a pixel displacement applied to the whole grid
+/// in the vertex shader, decaying exponentially to 0. Content that jumped N
+/// rows starts drawn N*cell_h px from its final position and glides in.
+#[derive(Default)]
+pub struct ScrollAnim {
+    /// Current visual y displacement in px (positive = grid drawn lower).
+    pub px: f32,
+}
+
+/// Extra slot rows kept above AND below the viewport. On a scroll bump the
+/// departing edge rows shift into overscan and stay visible during the glide,
+/// so no blank gap opens at the top/bottom. Also the displacement cap: a
+/// glide never shows content the overscan doesn't hold.
+pub const OVERSCAN_ROWS: u16 = 8;
+/// Exponential decay time constant (ms); ~4*tau ≈ 260ms to visually settle.
+const SCROLL_TAU_MS: f32 = 65.0;
+
+/// Shift slot rows vertically by `rows_up` (positive = content moved up),
+/// patching each instance's y so it keeps its on-screen position; vacated
+/// rows are zeroed. This replays the grid scroll inside the instance buffer,
+/// which is what lets departing rows glide through the overscan area.
+fn shift_slot_rows(slots: &mut [Instance], row_slots: usize, rows_up: i32, cell_h: f32) {
+    if row_slots == 0 || slots.is_empty() || rows_up == 0 {
+        return;
+    }
+    let total_rows = slots.len() / row_slots;
+    let n = rows_up.unsigned_abs() as usize;
+    if n >= total_rows {
+        slots.fill(ZERO_INSTANCE);
+        return;
+    }
+    let dy = rows_up as f32 * cell_h;
+    if rows_up > 0 {
+        // Row r takes old row r+n, drawn n cells higher.
+        slots.copy_within(n * row_slots.., 0);
+        for s in &mut slots[..(total_rows - n) * row_slots] {
+            s.rect[1] -= dy;
+        }
+        slots[(total_rows - n) * row_slots..].fill(ZERO_INSTANCE);
+    } else {
+        // Row r takes old row r-n, drawn n cells lower.
+        slots.copy_within(..(total_rows - n) * row_slots, n * row_slots);
+        for s in &mut slots[n * row_slots..] {
+            s.rect[1] -= dy; // dy is negative: y grows
+        }
+        slots[..n * row_slots].fill(ZERO_INSTANCE);
+    }
+}
+
+impl ScrollAnim {
+    /// Content moved `rows_up` rows up (negative = down) on a grid with
+    /// `cell_h`-px rows: displace so it starts where it was and eases home.
+    /// `max_px` bounds the displacement (viewport-aware, caller-supplied).
+    pub fn bump(&mut self, rows_up: i32, cell_h: f32, max_px: f32) {
+        self.px = (self.px + rows_up as f32 * cell_h).clamp(-max_px, max_px);
+    }
+
+    /// Advance by `dt_ms`. Returns true while still moving.
+    pub fn tick(&mut self, dt_ms: f32) -> bool {
+        self.px *= (-dt_ms.max(0.0) / SCROLL_TAU_MS).exp();
+        if self.px.abs() < 0.5 {
+            self.px = 0.0;
+        }
+        self.px != 0.0
+    }
+}
+
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     atlas: wgpu::Texture,
@@ -94,6 +161,11 @@ pub struct Renderer {
     bg: [u8; 3],
     /// Clear alpha (0 = fully transparent → blur shows through; 1 = opaque).
     bg_a: f32,
+    /// Smooth-scroll displacement state (applied in the vertex shader).
+    scroll: ScrollAnim,
+    /// Upload the whole instance buffer next draw (set after a slot-row shift,
+    /// an overscan wipe, or a metrics change — anything not row-damage-shaped).
+    full_upload: bool,
 }
 
 fn srgb(c: [u8; 3]) -> [f32; 3] {
@@ -112,6 +184,38 @@ fn srgb_to_linear(s: f64) -> f64 {
     } else {
         ((s + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Per-row `[start, end)` ranges into a row-major-sorted `cells` slice, one
+/// pass, indexed by row number. Rows with no cells get an empty `(i, i)`
+/// range. `cells` must already be sorted by `row` ascending (true of
+/// [`Frame::cells`], which comes from alacritty's row-ordered
+/// `renderable_content`).
+fn row_ranges(cells: &[RenderCell], rows: u16) -> Vec<(usize, usize)> {
+    let mut ranges = vec![(0usize, 0usize); rows as usize];
+    let mut current_row: u16 = 0;
+    let mut i = 0;
+    while i < cells.len() {
+        let row = cells[i].row;
+        if row as usize >= rows as usize {
+            break;
+        }
+        while current_row < row {
+            ranges[current_row as usize] = (i, i);
+            current_row += 1;
+        }
+        let start = i;
+        while i < cells.len() && cells[i].row == row {
+            i += 1;
+        }
+        ranges[row as usize] = (start, i);
+        current_row = row + 1;
+    }
+    while (current_row as usize) < rows as usize {
+        ranges[current_row as usize] = (cells.len(), cells.len());
+        current_row += 1;
+    }
+    ranges
 }
 
 impl Renderer {
@@ -298,6 +402,8 @@ impl Renderer {
             pad_y: 0.0,
             bg: palette::DEFAULT_BG,
             bg_a: 1.0,
+            scroll: ScrollAnim::default(),
+            full_upload: false,
         }
     }
 
@@ -317,6 +423,61 @@ impl Renderer {
     /// Set the background clear alpha (0 = transparent for blur-through .. 1 = opaque).
     pub fn set_bg_alpha(&mut self, a: f32) {
         self.bg_a = a.clamp(0.0, 1.0);
+    }
+
+    /// Content moved `rows_up` rows since the last frame: start the glide.
+    /// The departing rows are shifted into overscan so they stay visible while
+    /// the displacement eases home. A bump the overscan can't cover snaps.
+    pub fn scroll_bump(&mut self, rows_up: i32) {
+        let max_px = OVERSCAN_ROWS as f32 * self.cell_h;
+        let new_px = self.scroll.px + rows_up as f32 * self.cell_h;
+        if new_px.abs() > max_px {
+            self.scroll_reset();
+            return;
+        }
+        let row_slots = self.grid_cols as usize * SLOTS_PER_CELL;
+        shift_slot_rows(&mut self.slots, row_slots, rows_up, self.cell_h);
+        self.full_upload = true;
+        self.scroll.bump(rows_up, self.cell_h, max_px);
+    }
+
+    /// Kill any live glide and wipe the overscan rows (they may hold content
+    /// that no longer matches — e.g. after a resize repaint or a huge jump).
+    /// Viewport rows are left alone; frame damage keeps them correct.
+    pub fn scroll_reset(&mut self) {
+        self.scroll.px = 0.0;
+        let ov = OVERSCAN_ROWS as usize * self.grid_cols as usize * SLOTS_PER_CELL;
+        let len = self.slots.len();
+        if ov > 0 && len >= 2 * ov {
+            self.slots[..ov].fill(ZERO_INSTANCE);
+            self.slots[len - ov..].fill(ZERO_INSTANCE);
+            self.full_upload = true;
+        }
+    }
+
+    /// Advance the glide. Returns true while a redraw is still needed.
+    pub fn scroll_tick(&mut self, dt_ms: f32) -> bool {
+        self.scroll.tick(dt_ms)
+    }
+
+    pub fn scroll_active(&self) -> bool {
+        self.scroll.px != 0.0
+    }
+
+    /// Adopt new cell metrics (font size/DPI change) without recreating the
+    /// pipeline/atlas texture/buffers. Old glyphs are keyed to the old size, so
+    /// the cache is dropped and the shelf allocator reset to reclaim the atlas
+    /// space (stale pixels are simply overwritten as glyphs are re-rasterized).
+    pub fn set_font_metrics(&mut self, cell_w: f32, cell_h: f32, ascent: f32) {
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.ascent = ascent;
+        // Old displacement/overscan is in old-cell units; zoom mid-glide snaps.
+        self.scroll_reset();
+        self.glyphs.clear();
+        self.shelf_x = 1; // texel 0 is reserved white
+        self.shelf_y = 0;
+        self.shelf_h = 1;
     }
 
     /// Rasterize a (char, bold, italic, sub-pixel bin) into the atlas if absent.
@@ -408,10 +569,12 @@ impl Renderer {
         })
     }
 
-    /// Index of the first slot of cell (row, col).
+    /// Index of the first slot of viewport cell (row, col). Slot rows are
+    /// offset by [`OVERSCAN_ROWS`]: the buffer holds overscan rows above and
+    /// below the viewport for gap-free scroll glides.
     #[inline]
     fn slot_base(&self, row: u16, col: u16) -> usize {
-        (row as usize * self.grid_cols as usize + col as usize) * SLOTS_PER_CELL
+        ((row + OVERSCAN_ROWS) as usize * self.grid_cols as usize + col as usize) * SLOTS_PER_CELL
     }
 
     fn glyph_instance(&self, g: &Glyph, x: f32, y: f32, color: [u8; 3]) -> Instance {
@@ -441,14 +604,15 @@ impl Renderer {
         }
     }
 
-    /// Rebuild every slot of `row` from the cells belonging to it (and the
-    /// cursor, if it sits on this row).
+    /// Rebuild every slot of `row` from `cells` (just this row's slice, per
+    /// `row_ranges`) and the cursor, if it sits on this row.
     fn rebuild_row(
         &mut self,
         queue: &wgpu::Queue,
         font: &mut text::Font,
         frame: &Frame,
         row: u16,
+        cells: &[RenderCell],
     ) {
         // Clear the row's slots.
         let start = self.slot_base(row, 0);
@@ -459,7 +623,7 @@ impl Renderer {
 
         let cursor_here = frame.cursor_shape != CursorShape::Hidden && frame.cursor_row == row;
 
-        for cell in frame.cells.iter().filter(|c| c.row == row) {
+        for cell in cells {
             if cell.col >= self.grid_cols {
                 continue;
             }
@@ -501,12 +665,19 @@ impl Renderer {
         }
 
         if cursor_here {
-            self.apply_cursor(queue, font, frame);
+            self.apply_cursor(queue, font, frame, cells);
         }
     }
 
     /// Write the cursor into its cell's slots (already-cleared/rebuilt row).
-    fn apply_cursor(&mut self, queue: &wgpu::Queue, font: &mut text::Font, frame: &Frame) {
+    /// `row_cells` is the cursor row's slice (from `row_ranges`).
+    fn apply_cursor(
+        &mut self,
+        queue: &wgpu::Queue,
+        font: &mut text::Font,
+        frame: &Frame,
+        row_cells: &[RenderCell],
+    ) {
         let col = frame.cursor_col;
         let row = frame.cursor_row;
         if col >= self.grid_cols || row >= self.grid_rows {
@@ -516,11 +687,7 @@ impl Renderer {
         let x = self.pad_x + col as f32 * self.cell_w;
         let y = self.pad_y + row as f32 * self.cell_h;
         let cursor_color = palette::cursor();
-        let cell = frame
-            .cells
-            .iter()
-            .find(|c| c.row == row && c.col == col)
-            .copied();
+        let cell = row_cells.iter().find(|c| c.col == col).copied();
 
         match frame.cursor_shape {
             CursorShape::Block => {
@@ -572,8 +739,11 @@ impl Renderer {
         if resized {
             self.grid_cols = frame.cols;
             self.grid_rows = frame.rows;
-            let total = self.grid_cols as usize * self.grid_rows as usize * SLOTS_PER_CELL;
+            let total = self.grid_cols as usize
+                * (self.grid_rows + 2 * OVERSCAN_ROWS) as usize
+                * SLOTS_PER_CELL;
             self.slots = vec![ZERO_INSTANCE; total];
+            self.full_upload = true;
             let needed = total as u64;
             if needed > self.instance_cap {
                 let cap = needed.next_power_of_two().max(4096);
@@ -609,14 +779,28 @@ impl Renderer {
             Vec::new()
         };
 
+        // Skip the range pass entirely on no-damage frames.
+        let ranges = if dirty.is_empty() {
+            Vec::new()
+        } else {
+            row_ranges(&frame.cells, self.grid_rows)
+        };
         for &row in &dirty {
-            self.rebuild_row(queue, font, frame, row);
+            let (start, end) = ranges[row as usize];
+            self.rebuild_row(queue, font, frame, row, &frame.cells[start..end]);
         }
 
-        // Upload only dirty rows, coalescing contiguous runs into one write.
+        // Upload: whole buffer after a shift/wipe, else only dirty rows,
+        // coalescing contiguous runs into one write. Dirty-row offsets are in
+        // slot space (viewport row + OVERSCAN_ROWS).
         let stride = std::mem::size_of::<Instance>() as u64;
         let row_slots = self.grid_cols as usize * SLOTS_PER_CELL;
-        if !self.slots.is_empty() && !dirty.is_empty() {
+        if self.full_upload {
+            if !self.slots.is_empty() {
+                queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.slots));
+            }
+            self.full_upload = false;
+        } else if !self.slots.is_empty() && !dirty.is_empty() {
             let mut i = 0;
             while i < dirty.len() {
                 let run_start = dirty[i];
@@ -626,8 +810,8 @@ impl Renderer {
                     i += 1;
                 }
                 i += 1;
-                let first_slot = run_start as usize * row_slots;
-                let last_slot = (run_end as usize + 1) * row_slots;
+                let first_slot = (run_start + OVERSCAN_ROWS) as usize * row_slots;
+                let last_slot = ((run_end + OVERSCAN_ROWS) as usize + 1) * row_slots;
                 let byte_off = first_slot as u64 * stride;
                 queue.write_buffer(
                     &self.instances,
@@ -641,7 +825,7 @@ impl Renderer {
         queue.write_buffer(
             &self.uniform,
             0,
-            bytemuck::cast_slice(&[screen_w, screen_h, 0.0, 0.0]),
+            bytemuck::cast_slice(&[screen_w, screen_h, 0.0, self.scroll.px]),
         );
 
         let total_instances = self.slots.len() as u32;
@@ -680,6 +864,19 @@ impl Renderer {
                 multiview_mask: None,
             });
             if total_instances > 0 {
+                // Always clip to the grid rect: overscan rows sit outside the
+                // viewport and must never leak into the padding or the
+                // leftover strip below the last row (the clear ignores
+                // scissor, so the padding stays filled with bg either way).
+                let sx = self.pad_x.max(0.0) as u32;
+                let sy = self.pad_y.max(0.0) as u32;
+                let sw = ((self.grid_cols as f32 * self.cell_w).ceil() as u32)
+                    .min((screen_w as u32).saturating_sub(sx));
+                let sh = ((self.grid_rows as f32 * self.cell_h).ceil() as u32)
+                    .min((screen_h as u32).saturating_sub(sy));
+                if sw > 0 && sh > 0 {
+                    pass.set_scissor_rect(sx, sy, sw, sh);
+                }
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instances.slice(..));
@@ -692,7 +889,7 @@ impl Renderer {
 }
 
 const SHADER: &str = r#"
-struct Uniforms { screen: vec2<f32>, pad: vec2<f32> };
+struct Uniforms { screen: vec2<f32>, scroll: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -719,7 +916,7 @@ fn vs_main(
         vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vi];
-    let pos_px = rect.xy + corner * rect.zw;
+    let pos_px = rect.xy + corner * rect.zw + vec2<f32>(0.0, u.scroll.y);
     let ndc = vec2<f32>(
         pos_px.x / u.screen.x * 2.0 - 1.0,
         1.0 - pos_px.y / u.screen.y * 2.0,
@@ -754,3 +951,160 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s2l(in.color.rgb) * a, a);
 }
 "#;
+
+#[cfg(test)]
+mod row_ranges_tests {
+    use super::*;
+
+    fn cell(row: u16, col: u16) -> RenderCell {
+        RenderCell {
+            col,
+            row,
+            c: 'x',
+            fg: [0, 0, 0],
+            bg: [0, 0, 0],
+            bold: false,
+            italic: false,
+            underline: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_all_empty_ranges() {
+        let ranges = row_ranges(&[], 3);
+        assert_eq!(ranges, vec![(0, 0), (0, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn rows_with_cells_and_empty_rows_mixed() {
+        // Row 0: 2 cells, row 1: none, row 2: 1 cell.
+        let cells = vec![cell(0, 0), cell(0, 1), cell(2, 0)];
+        let ranges = row_ranges(&cells, 3);
+        assert_eq!(ranges, vec![(0, 2), (2, 2), (2, 3)]);
+        assert!(ranges[1].0 == ranges[1].1);
+    }
+
+    #[test]
+    fn all_rows_populated() {
+        let cells = vec![cell(0, 0), cell(1, 0), cell(1, 1), cell(2, 0)];
+        let ranges = row_ranges(&cells, 3);
+        assert_eq!(ranges, vec![(0, 1), (1, 3), (3, 4)]);
+        for (start, end) in &ranges {
+            assert!(start <= end);
+        }
+    }
+
+    #[test]
+    fn trailing_rows_beyond_last_cell_are_empty() {
+        let cells = vec![cell(0, 0)];
+        let ranges = row_ranges(&cells, 4);
+        assert_eq!(ranges, vec![(0, 1), (1, 1), (1, 1), (1, 1)]);
+    }
+}
+
+
+#[cfg(test)]
+mod overscan_tests {
+    use super::{shift_slot_rows, Instance, ZERO_INSTANCE};
+
+    fn marked(y: f32) -> Instance {
+        let mut i = ZERO_INSTANCE;
+        i.rect = [1.0, y, 8.0, 16.0];
+        i.color = [1.0, 1.0, 1.0, 1.0];
+        i
+    }
+
+    #[test]
+    fn shift_up_moves_rows_and_patches_y() {
+        let row_slots = 2;
+        let mut slots = vec![ZERO_INSTANCE; 4 * row_slots]; // 4 rows
+        slots[2 * row_slots] = marked(40.0); // row 2, first slot
+        shift_slot_rows(&mut slots, row_slots, 1, 20.0);
+        // Row 2 content now lives in row 1, drawn one cell higher.
+        assert_eq!(slots[row_slots].rect[1], 20.0);
+        assert_eq!(slots[row_slots].color[3], 1.0);
+        // Vacated bottom row is zeroed.
+        assert_eq!(slots[3 * row_slots].color[3], 0.0);
+        assert_eq!(slots[2 * row_slots].color[3], 0.0);
+    }
+
+    #[test]
+    fn shift_down_mirrors() {
+        let row_slots = 2;
+        let mut slots = vec![ZERO_INSTANCE; 4 * row_slots];
+        slots[row_slots] = marked(20.0); // row 1
+        shift_slot_rows(&mut slots, row_slots, -2, 20.0);
+        // Row 1 content now lives in row 3, drawn two cells lower.
+        assert_eq!(slots[3 * row_slots].rect[1], 60.0);
+        assert_eq!(slots[3 * row_slots].color[3], 1.0);
+        // Vacated top rows zeroed.
+        assert_eq!(slots[row_slots].color[3], 0.0);
+    }
+
+    #[test]
+    fn shift_larger_than_buffer_clears() {
+        let row_slots = 2;
+        let mut slots = vec![marked(0.0); 4 * row_slots];
+        shift_slot_rows(&mut slots, row_slots, 99, 20.0);
+        assert!(slots.iter().all(|s| s.color[3] == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod scroll_anim_tests {
+    use super::ScrollAnim;
+
+    #[test]
+    fn bump_sets_offset_and_tick_decays_to_zero() {
+        let mut a = ScrollAnim::default();
+        a.bump(3, 20.0, 600.0); // 3 rows up at 20px cells -> +60px
+        assert_eq!(a.px, 60.0);
+        let mut ticks = 0;
+        while a.tick(16.0) {
+            ticks += 1;
+            assert!(ticks < 100, "must settle");
+        }
+        assert_eq!(a.px, 0.0);
+        assert!(ticks > 2, "should take several frames, not snap");
+    }
+
+    #[test]
+    fn bump_is_clamped() {
+        let mut a = ScrollAnim::default();
+        a.bump(500, 20.0, 240.0); // cat flood: don't fly the grid off-screen
+        assert!(a.px <= 240.0 + f32::EPSILON);
+        a.bump(-500, 20.0, 240.0);
+        a.bump(-500, 20.0, 240.0);
+        assert!(a.px >= -240.0 - f32::EPSILON);
+    }
+
+    #[test]
+    fn bump_clamp_is_caller_supplied() {
+        let mut a = ScrollAnim::default();
+        a.bump(10, 20.0, 240.0); // 12-cell cap: 10 rows * 20px fits
+        assert_eq!(a.px, 200.0);
+        a.bump(10, 20.0, 240.0); // accumulates but clamps at 240
+        assert_eq!(a.px, 240.0);
+    }
+
+    #[test]
+    fn opposite_bumps_cancel() {
+        let mut a = ScrollAnim::default();
+        a.bump(2, 20.0, 600.0);
+        a.bump(-2, 20.0, 600.0);
+        assert_eq!(a.px, 0.0);
+        assert!(!a.tick(16.0));
+    }
+
+    #[test]
+    fn decay_is_monotonic() {
+        let mut a = ScrollAnim::default();
+        a.bump(2, 20.0, 600.0);
+        let mut prev = a.px;
+        while a.tick(16.0) {
+            assert!(a.px < prev && a.px >= 0.0);
+            prev = a.px;
+        }
+    }
+}

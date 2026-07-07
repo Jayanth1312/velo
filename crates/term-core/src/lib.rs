@@ -7,18 +7,20 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape as AnsiCursorShape, Processor};
 
+pub mod keys;
 pub mod palette;
 
 /// Grid dimensions passed to alacritty's `Term`. `TermSize` lives in a test-only
-/// submodule upstream, so we supply our own `Dimensions` impl (no scrollback:
-/// total_lines == screen_lines).
+/// submodule upstream, so we supply our own `Dimensions` impl. Scrollback
+/// history is separately sized via `Config::scrolling_history`; alacritty's
+/// grid tracks total_lines (screen + history) internally.
 struct WinSize {
     columns: usize,
     screen_lines: usize,
@@ -167,13 +169,15 @@ fn percent_decode(s: &str) -> String {
 fn parse_osc7(rest: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(rest).ok()?;
     let path = match s.strip_prefix("file://") {
-        Some(after) => match after.find('/') {
+        // Split host from path on the first separator (`/`, or `\` if a shell
+        // emitted a raw Windows path). No separator => treat the whole thing as path.
+        Some(after) => match after.find(['/', '\\']) {
             Some(i) => &after[i..],
             None => after,
         },
         None => s,
     };
-    let p = percent_decode(path);
+    let p = percent_decode(path).replace('\\', "/");
     let bytes = p.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
         Some(p[1..].to_string())
@@ -182,12 +186,32 @@ fn parse_osc7(rest: &[u8]) -> Option<String> {
     }
 }
 
+/// Snapshot of the app-controlled mouse-reporting DECSET bits. `reporting` is
+/// true when any report mode (click/drag/motion) is on; `motion`/`drag` say
+/// which move events to forward; `sgr` says whether the app asked for SGR
+/// (1006) extended coordinates (col/row > 223) as opposed to legacy X10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseMode {
+    pub reporting: bool,
+    pub motion: bool,
+    pub drag: bool,
+    pub sgr: bool,
+}
+
 pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
     /// Last selection range observed; a change forces a full redraw since
     /// alacritty's damage tracking deliberately excludes selection.
     last_selection: Option<SelectionRange>,
+    /// Last display offset observed; a change (scrollback) forces a full
+    /// redraw since viewport row->grid line mapping shifts entirely.
+    last_display_offset: usize,
+    /// History length at the last frame, to derive content motion.
+    last_history: usize,
+    /// Whether the last frame was on the alt screen (suppresses the motion
+    /// signal across screen switches, where history_size jumps to/from 0).
+    last_alt: bool,
     /// Latest OSC window title (shared with the `EventProxy`; `None` = default).
     title: Arc<Mutex<Option<String>>>,
     /// Shell-integration scanner + decoded-event queue (drained by the host).
@@ -203,8 +227,12 @@ impl Terminal {
             screen_lines: rows.max(1) as usize,
         };
         let title = Arc::new(Mutex::new(None));
+        let config = Config {
+            scrolling_history: 10_000,
+            ..Config::default()
+        };
         let term = Term::new(
-            Config::default(),
+            config,
             &size,
             EventProxy {
                 on_write,
@@ -215,6 +243,9 @@ impl Terminal {
             term,
             parser: Processor::new(),
             last_selection: None,
+            last_display_offset: 0,
+            last_history: 0,
+            last_alt: false,
             title,
             osc: OscTee::default(),
             pending_shell: Vec::new(),
@@ -298,6 +329,10 @@ impl Terminal {
             columns: cols.max(1) as usize,
             screen_lines: rows.max(1) as usize,
         });
+        // Reflow can change history length; re-baseline so the next frame's
+        // scrolled_up doesn't read the jump as content motion.
+        self.last_history = self.term.grid().history_size();
+        self.last_display_offset = self.term.grid().display_offset();
     }
 
     /// Begin a simple (character-granularity) selection at a viewport cell.
@@ -320,6 +355,40 @@ impl Terminal {
         self.term.selection = None;
     }
 
+    /// Scroll the viewport into scrollback history by `delta_lines` (positive
+    /// = toward history / up, negative = toward the present / down).
+    pub fn scroll_display(&mut self, delta_lines: i32) {
+        self.term.scroll_display(Scroll::Delta(delta_lines));
+    }
+
+    /// How many lines the viewport is currently scrolled back into history
+    /// (0 = viewport shows the live bottom of the screen).
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Snap the viewport back to the live bottom of the screen. Alacritty
+    /// doesn't do this automatically for bytes written straight to the PTY
+    /// (only for its own input path), so callers should invoke this before
+    /// forwarding keystrokes/paste while scrolled back.
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Whether the alternate screen (e.g. vim, less) is active. Callers use
+    /// this to decide whether mouse wheel input should scroll history or be
+    /// translated into arrow-key sequences.
+    pub fn alt_screen_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether the app has enabled application cursor-key mode (DECCKM).
+    /// When set, arrow/Home/End keys (with no modifiers) send `ESC O <letter>`
+    /// instead of `CSI <letter>`.
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// Selected text, if any (for clipboard copy).
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
@@ -331,13 +400,31 @@ impl Terminal {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// Map a viewport (col, row) to a grid point. No scrollback => display
-    /// offset is zero, so the viewport row is the grid line directly.
+    /// Which mouse-reporting modes the app has enabled via DECSET, so the host
+    /// knows whether raw pointer events should be encoded to the PTY (SGR 1006)
+    /// instead of driving local text selection.
+    pub fn mouse_mode(&self) -> MouseMode {
+        let mode = self.term.mode();
+        MouseMode {
+            reporting: mode.intersects(
+                TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+            ),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            drag: mode.contains(TermMode::MOUSE_DRAG),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+        }
+    }
+
+    /// Map a viewport (col, row) to a grid point. When scrolled back into
+    /// history (`display_offset > 0`), viewport row 0 is grid line
+    /// `-display_offset`, so subtract the offset to land on the right line.
     fn viewport_point(&self, col: u16, row: u16) -> Point {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
+        let offset = self.display_offset() as i32;
+        let row = (row as usize).min(rows.saturating_sub(1)) as i32;
         Point::new(
-            Line((row as usize).min(rows.saturating_sub(1)) as i32),
+            Line(row - offset),
             Column((col as usize).min(cols.saturating_sub(1))),
         )
     }
@@ -347,6 +434,10 @@ impl Terminal {
     pub fn frame(&mut self) -> Frame {
         let cols = self.term.columns() as u16;
         let rows = self.term.screen_lines() as u16;
+        // Sampled before `renderable_content()` takes its borrow; consumed by
+        // the scrolled_up computation at the end of this fn.
+        let history = self.term.grid().history_size();
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
 
         // Collect content/cursor damage first (mutable borrow), then reset it.
         let mut base_damage = match self.term.damage() {
@@ -361,15 +452,25 @@ impl Terminal {
 
         let content = self.term.renderable_content();
         let selection = content.selection;
+        let display_offset = content.display_offset;
 
         // Selection isn't part of damage; a change repaints everything.
         if selection != self.last_selection {
             base_damage = FrameDamage::Full;
         }
+        // Scrolling shifts every viewport row -> grid line mapping; alacritty's
+        // own damage tracking doesn't account for that, so force a full repaint.
+        if display_offset != self.last_display_offset {
+            base_damage = FrameDamage::Full;
+        }
 
         let mut cells = Vec::new();
         for indexed in content.display_iter {
-            let line = indexed.point.line.0;
+            // Grid lines are relative to the live screen bottom (0 = bottom-most
+            // live row, negative = scrollback); shift by the display offset to
+            // get the viewport-relative row alacritty's iterator already scoped
+            // its range to.
+            let line = indexed.point.line.0 + display_offset as i32;
             if line < 0 || line >= rows as i32 {
                 continue;
             }
@@ -424,15 +525,37 @@ impl Terminal {
         }
 
         let cursor = content.cursor;
+        // The cursor's grid line is always within the live screen (never
+        // negative); while scrolled back into history it'd land outside the
+        // viewport, so hide it rather than draw it at a bogus row.
+        let cursor_shape = if display_offset > 0 {
+            CursorShape::Hidden
+        } else {
+            map_cursor(cursor.shape)
+        };
+        // Content motion = change of (history above viewport top). New lines
+        // grow history (content up); scrolling back grows the offset (down);
+        // lines arriving while scrolled back grow both and cancel out.
+        let scrolled_up = if alt || self.last_alt {
+            0
+        } else {
+            ((history as i64 - display_offset as i64)
+                - (self.last_history as i64 - self.last_display_offset as i64))
+                .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        };
         self.last_selection = selection;
+        self.last_display_offset = display_offset;
+        self.last_history = history;
+        self.last_alt = alt;
         Frame {
             cols,
             rows,
             cells,
             cursor_col: cursor.point.column.0 as u16,
             cursor_row: cursor.point.line.0.max(0) as u16,
-            cursor_shape: map_cursor(cursor.shape),
+            cursor_shape,
             damage: base_damage,
+            scrolled_up,
         }
     }
 }
@@ -455,6 +578,11 @@ pub struct Frame {
     pub cursor_row: u16,
     pub cursor_shape: CursorShape,
     pub damage: FrameDamage,
+    /// Rows the viewport content moved *up* since the last frame (new output
+    /// scrolls content up; scrolling back into history moves it down =
+    /// negative). 0 on the alt screen and across alt-screen transitions.
+    /// Drives the renderer's smooth-scroll offset.
+    pub scrolled_up: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -478,6 +606,61 @@ mod tests {
 
     fn term() -> Terminal {
         Terminal::new(4, 2, Arc::new(|_: &[u8]| {}))
+    }
+
+    #[test]
+    fn scrolled_up_counts_lines_pushed_to_history() {
+        let mut t = term(); // 4 cols x 2 rows
+        let _ = t.frame(); // settle initial state
+        // 4 newlines on a 2-row screen -> lines pushed into history.
+        t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+        let f = t.frame();
+        assert!(f.scrolled_up > 0, "expected positive shift, got {}", f.scrolled_up);
+        // Second frame with no new data: no motion.
+        assert_eq!(t.frame().scrolled_up, 0);
+    }
+
+    #[test]
+    fn wide_char_emits_single_leading_cell() {
+        let mut t = term(); // 4 cols x 2 rows
+        t.advance("😀".to_string().as_bytes());
+        let f = t.frame();
+        let emoji: Vec<_> = f.cells.iter().filter(|c| c.c == '😀').collect();
+        assert_eq!(emoji.len(), 1, "emoji must render exactly once");
+        assert_eq!(emoji[0].col, 0);
+        // The spacer cell (col 1) must not emit a glyph.
+        assert!(!f.cells.iter().any(|c| c.col == 1 && c.c != '\0'));
+    }
+
+    #[test]
+    fn scrolled_up_negative_on_scrollback() {
+        let mut t = term();
+        t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+        let _ = t.frame();
+        t.scroll_display(2); // toward history -> content moves down
+        assert_eq!(t.frame().scrolled_up, -2);
+        t.scroll_to_bottom(); // back to present -> content moves up
+        assert_eq!(t.frame().scrolled_up, 2);
+    }
+
+    #[test]
+    fn scrolled_up_zero_on_alt_screen() {
+        let mut t = term();
+        let _ = t.frame();
+        t.advance(b"\x1b[?1049h"); // enter alt screen
+        t.advance(b"x\r\ny\r\nz\r\nw");
+        assert_eq!(t.frame().scrolled_up, 0);
+        t.advance(b"\x1b[?1049l"); // leave alt screen: transition frame also 0
+        assert_eq!(t.frame().scrolled_up, 0);
+    }
+
+    #[test]
+    fn scrolled_up_zero_after_resize() {
+        let mut t = term();
+        t.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+        let _ = t.frame();
+        t.resize(6, 3); // reflow may change history size; must not read as motion
+        assert_eq!(t.frame().scrolled_up, 0);
     }
 
     #[test]
@@ -583,6 +766,15 @@ mod tests {
     }
 
     #[test]
+    fn osc7_powershell_style_backslash_path() {
+        // Real PowerShell emitter: file://HOST + /C:\Users\me (backslashes).
+        let mut t = term();
+        t.advance(b"\x1b]7;file://DESKTOP/C:\\Users\\me\x07");
+        let ev = t.take_shell_events();
+        assert!(matches!(&ev[0], ShellEvent::Cwd(p) if p == "C:/Users/me"));
+    }
+
+    #[test]
     fn osc_split_across_advance_calls() {
         let mut t = term();
         // OSC 7 cut mid-path between two PTY reads.
@@ -590,6 +782,63 @@ mod tests {
         t.advance(b"jects\x07");
         let ev = t.take_shell_events();
         assert!(matches!(&ev[0], ShellEvent::Cwd(p) if p == "C:/Projects"));
+    }
+
+    #[test]
+    fn scroll_display_moves_offset_into_history() {
+        let mut t = term();
+        // 2 rows visible; push well past that so there's scrollback.
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.display_offset(), 0);
+        t.scroll_display(5);
+        assert!(t.display_offset() > 0, "scrolling up should move into history");
+        t.scroll_display(-1000);
+        assert_eq!(t.display_offset(), 0, "large negative delta snaps back to bottom");
+    }
+
+    #[test]
+    fn frame_reflects_scrolled_content() {
+        let mut t = term();
+        for i in 0..20 {
+            t.advance(format!("L{i}\r\n").as_bytes());
+        }
+        let _ = t.frame(); // consume damage from feeding
+        t.scroll_display(20); // scroll to the very top
+        let f = t.frame();
+        // Top-of-scrollback content ("L0") should now be visible somewhere.
+        let has_l0 = f.cells.iter().any(|c| c.c == 'L') ;
+        assert!(has_l0, "scrolled-back content should render");
+    }
+
+    #[test]
+    fn scrolling_forces_full_damage() {
+        let mut t = term();
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        let _ = t.frame(); // consume initial full damage
+        // Idle frame (no scroll) is incremental.
+        match t.frame().damage {
+            FrameDamage::Full => panic!("unrelated frame should not be full"),
+            FrameDamage::Rows(_) => {}
+        }
+        t.scroll_display(3);
+        let f = t.frame();
+        assert!(matches!(f.damage, FrameDamage::Full), "scrolling forces full damage");
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_offset() {
+        let mut t = term();
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        t.scroll_display(10);
+        assert!(t.display_offset() > 0);
+        t.scroll_to_bottom();
+        assert_eq!(t.display_offset(), 0);
     }
 
     #[test]
@@ -605,5 +854,25 @@ mod tests {
             }
             FrameDamage::Full => panic!("idle frame must not be fully damaged"),
         }
+    }
+
+    #[test]
+    fn mouse_mode_tracks_decset() {
+        let mut t = term();
+        assert_eq!(t.mouse_mode(), MouseMode::default(), "everything off initially");
+
+        t.advance(b"\x1b[?1000h"); // click reporting
+        let mm = t.mouse_mode();
+        assert!(mm.reporting && !mm.drag && !mm.motion && !mm.sgr);
+
+        t.advance(b"\x1b[?1002h\x1b[?1006h"); // + drag tracking, SGR coords
+        let mm = t.mouse_mode();
+        assert!(mm.reporting && mm.drag && mm.sgr);
+
+        t.advance(b"\x1b[?1003h"); // any-motion tracking
+        assert!(t.mouse_mode().motion);
+
+        t.advance(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l");
+        assert_eq!(t.mouse_mode(), MouseMode::default(), "all DECSET bits reset");
     }
 }

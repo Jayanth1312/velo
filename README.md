@@ -5,6 +5,21 @@ vertical tabs. It renders the grid through wgpu (DirectX 12, with a Vulkan
 fallback) and shapes text with cosmic-text, wrapping `alacritty_terminal` for
 parsing and ConPTY for the process backend.
 
+## Features
+
+- GPU cell grid with smooth scrolling (pixel glide with overscan rows, no
+  edge gaps or jitter during fast output)
+- Vertical tab pane with rename, theme-tinted chrome, and the active tab
+  title centered in the title bar
+- Built-in editor mode: multi-file tabs (Ctrl+W to close), tree-sitter
+  syntax highlighting for 8 languages, autosave, and a toggleable bottom
+  terminal (Ctrl+J)
+- Files sidebar: single click opens any file in the editor; Reveal opens
+  the containing folder (WSL paths translated to Windows)
+- Live themes: switching recolors the terminal, editor, and open files
+  immediately
+- Zoom (Ctrl+scroll / Ctrl+=/-) without scroll bounce
+
 ## Target
 
 Targets Windows 10 1809+ / `x86_64-pc-windows-msvc`. ConPTY requires
