@@ -64,6 +64,19 @@ public sealed partial class MainWindow : Window
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    // Window-class background brush: Windows fills freshly exposed window area
+    // (maximize, fast resize) with this brush BEFORE the app paints a frame.
+    // Default is null → black flash on every maximize. Kept in sync with the
+    // terminal bg in ApplySettings.
+    private const int GCLP_HBRBACKGROUND = -10;
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SetClassLongPtrW")]
+    private static extern IntPtr SetClassLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern IntPtr CreateSolidBrush(uint colorRef);   // 0x00BBGGRR
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr handle);
+    private IntPtr _classBgBrush;
+
     // ---- Split view (up to 4 panes in a 2x2 grid) ----
     private const uint InvalidId = uint.MaxValue;
     private const int MaxPanes = 4;
@@ -71,10 +84,13 @@ public sealed partial class MainWindow : Window
     private readonly uint[] _slotCore = { 0, InvalidId, InvalidId, InvalidId };   // core pane id per slot
     private readonly uint[] _slotTab = { InvalidId, InvalidId, InvalidId, InvalidId }; // tab shown per slot
     private readonly IntPtr[] _slotSwap = new IntPtr[MaxPanes];  // pending swapchain to bind once visible
-    private int _paneCount = 1;          // active panes
-    private bool _splitVertical;         // 2-pane orientation (true = top/bottom)
+    private int _paneCount = 1;          // active panes (= visible leaves of the shown tree)
+    // Absolute rect of each slot's panel in PaneHost coords (multi-pane tree layout).
+    private readonly double[] _slotX = new double[MaxPanes], _slotY = new double[MaxPanes],
+                             _slotW = new double[MaxPanes], _slotH = new double[MaxPanes];
     private int _focusedPane;            // slot with focus
     private TabVM? _dragTab;             // tab being dragged from the list
+    private uint _dragAnchorTab = InvalidId; // split/tab the body showed before the drag selected _dragTab
     private enum Edge { Left, Right, Top, Bottom }
 
     private OverlappedPresenter? _presenter;
@@ -83,6 +99,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         Log.Write("ctor: enter [build:geom-unparent+simple-backdrop]");
+        PaneTree.SelfCheck();   // pane-tree op sanity (throws on regression)
         InitializeComponent();
         Log.Write($"ctor: InitializeComponent done. Content={Content?.GetType().Name ?? "null"}");
 
@@ -94,6 +111,7 @@ public sealed partial class MainWindow : Window
         {
             TabTemplate = (DataTemplate)RootGrid.Resources["TabRowTemplate"],
             GroupHeaderTemplate = (DataTemplate)RootGrid.Resources["GroupHeaderTemplate"],
+            SplitTemplate = (DataTemplate)RootGrid.Resources["SplitRowTemplate"],
         };
 
         // DEBUG: bracket the first-layout crash. These fire in order:
@@ -125,7 +143,17 @@ public sealed partial class MainWindow : Window
         Log.Write("ctor: ApplyBackdrop done");
 
         _nonClient = InputNonClientPointerSource.GetForWindowId(AppWindow.Id);
-        AppWindow.Changed += (_, args) => { if (args.DidPresenterChange || args.DidSizeChange) UpdateMaxGlyph(); };
+        AppWindow.Changed += (_, args) =>
+        {
+            if (args.DidPresenterChange || args.DidSizeChange)
+            {
+                UpdateMaxGlyph();
+                // Maximize/restore must not wait out the 33ms resize throttle:
+                // push any parked pane size now so the swapchain fills the new
+                // area on the next frame instead of showing the class-brush fill.
+                FlushPendingResizes();
+            }
+        };
 
         _selfHandle = GCHandle.Alloc(this);
         Closed += OnClosed;
@@ -160,6 +188,9 @@ public sealed partial class MainWindow : Window
     private void PaneHost_Loaded(object sender, RoutedEventArgs e)
     {
         Log.Write($"PaneHost_Loaded: size={PaneHost.ActualWidth}x{PaneHost.ActualHeight}");
+        // Split panes are absolutely positioned from the tree; recompute their rects
+        // whenever the body resizes (window resize, sidebar toggle).
+        PaneHost.SizeChanged += PaneHost_SizeChanged;
         // XAML KeyDown="..." registers with handledEventsToo:false, so if the
         // framework marks the key event Handled (accelerators / focus internals)
         // before it reaches us, the handler is silently skipped — the "can't type"
@@ -284,8 +315,62 @@ public sealed partial class MainWindow : Window
     /// Push pane 0's size to the core (used by Loaded + scale changes).
     private void PushSize() => PushPaneSize(TerminalPanel);
 
+    // A native resize is expensive: it flushes the GPU (buffer release before
+    // ResizeBuffers), rewraps the scrollback, and repaints. Per-frame layout
+    // changes (sidebar width animation, the maximize/restore transition) fired
+    // it every frame → visible jank. Coalesce: first call goes through
+    // immediately, further calls within 33ms park in _pendingPanes and flush on
+    // the timer tick. Storyboard-driven layout suppresses pushes entirely and
+    // flushes once on Completed.
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _resizeThrottle;
+    private readonly HashSet<SwapChainPanel> _pendingPanes = new();
+    private bool _pendingEditorResize;
+    private bool _suppressPaneResize;
+
+    private void FlushPendingResizes()
+    {
+        foreach (var p in _pendingPanes)
+            PushPaneSizeNow(p);
+        _pendingPanes.Clear();
+        if (_pendingEditorResize)
+        {
+            _pendingEditorResize = false;
+            PushEditorSizeNow();
+        }
+    }
+
+    /// True → caller should park the resize; false → push now (throttle armed).
+    private bool DeferResize()
+    {
+        if (_suppressPaneResize)
+            return true;
+        if (_resizeThrottle is null)
+        {
+            _resizeThrottle = DispatcherQueue.CreateTimer();
+            _resizeThrottle.Interval = TimeSpan.FromMilliseconds(33);
+            _resizeThrottle.IsRepeating = false;
+            _resizeThrottle.Tick += (_, _) => FlushPendingResizes();
+        }
+        if (_resizeThrottle.IsRunning)
+            return true;
+        _resizeThrottle.Start();
+        return false;
+    }
+
     /// Push a panel's physical pixel size to its core pane (resize + reflow).
     private void PushPaneSize(SwapChainPanel panel)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        if (DeferResize())
+        {
+            _pendingPanes.Add(panel);
+            return;
+        }
+        PushPaneSizeNow(panel);
+    }
+
+    private void PushPaneSizeNow(SwapChainPanel panel)
     {
         if (_engine == IntPtr.Zero)
             return;
@@ -297,9 +382,56 @@ public sealed partial class MainWindow : Window
         Native.velo_pane_resize(_engine, id, w, h);
     }
 
+    /// Called BEFORE a sidebar-close animation: push every visible pane's
+    /// post-animation width to the core now, so the widening column reveals an
+    /// already-rendered terminal instead of a bg strip (the swapchain buffer is
+    /// never smaller than the visible panel). The animation's own SizeChanged
+    /// storm stays suppressed; the exact size lands on the Completed flush.
+    /// ponytail: extra width prorated by the pane's share of PaneHost — ±1px
+    /// off for splits, corrected by that same Completed flush.
+    private void PreGrowPaneSizes(double delta)
+    {
+        if (_engine == IntPtr.Zero || delta <= 0)
+            return;
+        if (_editorMode)
+        {
+            if (_editorAttached && EditorPanel.ActualWidth > 0)
+            {
+                double esx = EditorPanel.CompositionScaleX > 0 ? EditorPanel.CompositionScaleX : _lastScale;
+                double esy = EditorPanel.CompositionScaleY > 0 ? EditorPanel.CompositionScaleY : _lastScale;
+                Native.velo_editor_resize(_engine,
+                    (uint)Math.Max(1, Math.Round((EditorPanel.ActualWidth + delta) * esx)),
+                    (uint)Math.Max(1, Math.Round(EditorPanel.ActualHeight * esy)));
+            }
+            return;
+        }
+        double host = PaneHost.ActualWidth;
+        if (host <= 0)
+            return;
+        foreach (var p in _panels)
+        {
+            if (p is null || p.Visibility != Visibility.Visible || p.ActualWidth <= 0)
+                continue;
+            double sx = p.CompositionScaleX > 0 ? p.CompositionScaleX : _lastScale;
+            double sy = p.CompositionScaleY > 0 ? p.CompositionScaleY : _lastScale;
+            double w = p.ActualWidth + delta * p.ActualWidth / host;
+            Native.velo_pane_resize(_engine, PaneId(p),
+                (uint)Math.Max(1, Math.Round(w * sx)),
+                (uint)Math.Max(1, Math.Round(p.ActualHeight * sy)));
+        }
+    }
+
     /// Core pane id stored in each SwapChainPanel's Tag (defaults to pane 0).
     private static uint PaneId(object panel)
         => panel is FrameworkElement fe && fe.Tag is uint id ? id : 0u;
+
+    /// Core id of the split pane that currently holds focus. Key/char events arrive
+    /// on PaneHost (the swapchains aren't hit-testable), whose Tag is unset — so we
+    /// must resolve the focused slot ourselves, else input always lands on slot 0.
+    private uint FocusedCore()
+        => (_focusedPane >= 0 && _focusedPane < MaxPanes && _slotCore[_focusedPane] != InvalidId)
+            ? _slotCore[_focusedPane]
+            : 0u;
 
     private void OnCompositionScaleChanged(SwapChainPanel sender, object args)
     {
@@ -369,13 +501,24 @@ public sealed partial class MainWindow : Window
         // exposes a misaligned strip at the terminal↔sidebar seam (the swapchain's
         // DComp present lags the XAML column commit by a frame → the color flash). At
         // ~a few px per frame that desync is sub-pixel and reads as motion, not a flash.
-        AnimateWidth(SidebarSurface, open ? SidebarWidth : 0);
+        // Native resizes stay muted while the storyboard runs (one push at the end):
+        // a swapchain resize per animation frame stalls the GPU + rewraps scrollback
+        // and dragged the whole animation to slideshow speed.
+        _suppressPaneResize = true;
+        // Closing → the terminal column GROWS: pre-size the panes to their final
+        // width so the reveal shows rendered terminal, not a background strip.
+        PreGrowPaneSizes(SidebarSurface.ActualWidth - (open ? SidebarWidth : 0));
+        AnimateWidth(SidebarSurface, open ? SidebarWidth : 0, () =>
+        {
+            _suppressPaneResize = false;
+            FlushPendingResizes();
+        });
         FocusTerminal();
     }
 
     /// Animate a FrameworkElement.Width (a layout/dependent property, hence
     /// EnableDependentAnimation). Drives both the panel columns and the toggle glyph.
-    private static void AnimateWidth(FrameworkElement el, double to)
+    private static void AnimateWidth(FrameworkElement el, double to, Action? completed = null)
     {
         var sb = new Storyboard();
         var anim = new DoubleAnimation
@@ -388,6 +531,8 @@ public sealed partial class MainWindow : Window
         Storyboard.SetTarget(anim, el);
         Storyboard.SetTargetProperty(anim, "Width");
         sb.Children.Add(anim);
+        if (completed is not null)
+            sb.Completed += (_, _) => completed();
         sb.Begin();
     }
 
@@ -413,7 +558,13 @@ public sealed partial class MainWindow : Window
         Log.Write($"SetDetails: open={open} tab={_activeDetailsTab} realized={_detailsRealized}");
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
-        AnimateWidth(DetailsSurface, open ? SidebarWidth : 0);   // animated, see SetSidebar
+        _suppressPaneResize = true;                              // see SetSidebar
+        PreGrowPaneSizes(DetailsSurface.ActualWidth - (open ? SidebarWidth : 0));
+        AnimateWidth(DetailsSurface, open ? SidebarWidth : 0, () =>
+        {
+            _suppressPaneResize = false;
+            FlushPendingResizes();
+        });
         if (open)
             EnsureDetailsRealized();   // build + fill the panels on first open
         FocusTerminal();
@@ -1216,6 +1367,11 @@ public sealed partial class MainWindow : Window
     /// it drifted somewhere that would otherwise swallow input (the dead-terminal bug).
     private bool ShouldRouteKeysToTerminal()
     {
+        // Editor mode owns its own routing (EditorPanel / EditorTermHost handlers).
+        // Without this, typing in the Ctrl+J terminal hits both its own handler AND
+        // this root net → every char sent to the PTY twice, and Root_KeyDown steals
+        // focus back to PaneHost on every keystroke.
+        if (_editorMode) return false;
         var xr = Content?.XamlRoot;
         if (xr is null) return false;
         var focused = FocusManager.GetFocusedElement(xr) as DependencyObject;
@@ -1256,9 +1412,8 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
 
-        // Route input to the pane that actually holds XAML focus (core no-ops if
-        // already focused, so this just keeps the two in sync for splits).
-        Native.velo_pane_focus(_engine, PaneId(sender));
+        // Route input to the focused split pane (keeps core + slot in sync).
+        Native.velo_pane_focus(_engine, FocusedCore());
 
         // Ctrl++ / Ctrl+- / Ctrl+0: zoom the terminal body (intercept before forwarding).
         if (IsDown(VirtualKey.Control))
@@ -1324,7 +1479,7 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
-        Native.velo_pane_focus(_engine, PaneId(sender)); // route to the focused pane
+        Native.velo_pane_focus(_engine, FocusedCore()); // route to the focused pane
         Native.velo_char(_engine, e.Character, Modifiers());
     }
 
@@ -1347,6 +1502,13 @@ public sealed partial class MainWindow : Window
         _focusedPane = i;
         PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
         Native.velo_pane_focus(_engine, PaneId(_panels[i]));
+        // Clicking a split pane makes its tab the active one in the list
+        // (suppressed selection: no ShowView relayout, the view is already up).
+        if (_slotTab[i] != InvalidId && (TabList.SelectedItem as TabVM)?.Id != _slotTab[i])
+        {
+            Native.velo_tab_set_active(_engine, _slotTab[i]);
+            SelectById(_slotTab[i]);
+        }
         _mousePane = i;
         PaneHost.CapturePointer(e.Pointer);
         ForwardMouse(_panels[i], 0, e);
@@ -1356,10 +1518,90 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
-        int i = _mousePane >= 0 ? _mousePane : PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        var pos = e.GetCurrentPoint(PaneHost).Position;
+        UpdatePaneCtl(pos);
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(pos);
         if (i < 0)
             return;
         ForwardMouse(_panels[i], 1, e);
+    }
+
+    private void PaneHost_PointerExited(object sender, PointerRoutedEventArgs e)
+        => PaneCtl.Visibility = Visibility.Collapsed;
+
+    // ---- Per-pane split controls (swap position / make full screen) --------
+
+    private int _ctlSlot;   // slot the PaneCtl bar currently floats over
+
+    /// Move the control bar to the hovered pane; hidden outside split mode.
+    private void UpdatePaneCtl(Point pos)
+    {
+        if (_paneCount < 2)
+        {
+            PaneCtl.Visibility = Visibility.Collapsed;
+            return;
+        }
+        int i = PaneAt(pos);
+        if (i < 0)
+        {
+            PaneCtl.Visibility = Visibility.Collapsed;
+            return;
+        }
+        _ctlSlot = i;
+        // Float the bar at the top-centre of the hovered pane's rect (panels are
+        // absolutely positioned in the split layout, so read the stored rect).
+        double cw = PaneCtl.ActualWidth > 0 ? PaneCtl.ActualWidth : 66;
+        PaneCtl.HorizontalAlignment = HorizontalAlignment.Left;
+        PaneCtl.VerticalAlignment = VerticalAlignment.Top;
+        PaneCtl.Margin = new Thickness(_slotX[i] + _slotW[i] / 2 - cw / 2, _slotY[i] + 6, 0, 0);
+        PaneCtl.Visibility = Visibility.Visible;
+    }
+
+    /// Exchange this pane's tab with the next slot (cycles positions). The
+    /// order persists in the split group so re-showing the view keeps it.
+    private void PaneCtlSwap_Click(object sender, RoutedEventArgs e)
+    {
+        if (_paneCount < 2 || _ctlSlot >= _paneCount || _viewRoot is null)
+            return;
+        int next = (_ctlSlot + 1) % _paneCount;
+        uint a = _slotTab[_ctlSlot], b = _slotTab[next];
+        // Exchange the two leaves' tabs in the tree; re-showing rebuilds slots/pills.
+        var la = PaneTree.Find(_viewRoot, a);
+        var lb = PaneTree.Find(_viewRoot, b);
+        if (la is null || lb is null)
+            return;
+        (la.TabId, lb.TabId) = (lb.TabId, la.TabId);
+        uint active = _slotTab[_focusedPane];
+        ShowView(active);
+        RefreshTabList();              // pill order follows the pane order
+        FocusTerminal();
+    }
+
+    /// Pull this pane's tab out of its split group and show it full-size; the
+    /// group survives with the remaining tabs (dissolving below 2 members).
+    private void PaneCtlFull_Click(object sender, RoutedEventArgs e)
+    {
+        if (_paneCount < 2 || _ctlSlot >= _paneCount)
+            return;
+        uint keep = _slotTab[_ctlSlot];
+        if (keep == InvalidId)
+            return;
+        // Pull `keep` out of its tree (siblings promote, tree survives); show it full.
+        if (RootContaining(keep) is PaneNode root)
+        {
+            var promoted = PaneTree.Remove(root, keep);
+            int oi = _trees.IndexOf(root);
+            if (promoted is null or Leaf) { if (oi >= 0) _trees.RemoveAt(oi); }
+            else if (oi >= 0) _trees[oi] = promoted;
+        }
+        // ponytail: hidden core panes keep their old bindings until the next
+        // split re-binds them. Add an unbind FFI call if idle renders of hidden
+        // panes ever show up in profiles.
+        Native.velo_tab_set_active(_engine, keep);
+        ShowView(keep);
+        RefreshTabList();              // pill row shrinks (or dissolves back to rows)
+        SelectById(keep);
+        FocusTerminal();
     }
 
     private void PaneHost_PointerReleased(object sender, PointerRoutedEventArgs e)
@@ -1505,17 +1747,21 @@ public sealed partial class MainWindow : Window
             command.Contains("powershell", StringComparison.OrdinalIgnoreCase))
         {
             vm.ShellKind = "pwsh";
+            vm.IconFile = "powershell.svg";
             return;
         }
         if (command.Contains("cmd", StringComparison.OrdinalIgnoreCase))
         {
             vm.ShellKind = "cmd";
+            vm.IconFile = "cmd.svg";
             return;
         }
         var dIdx = command.IndexOf("-d ", StringComparison.OrdinalIgnoreCase);
         if (dIdx < 0)
             return;
         var distro = command[(dIdx + 3)..].Trim();
+        vm.IconFile = distro.Contains("ubuntu", StringComparison.OrdinalIgnoreCase)
+            ? "ubuntu.svg" : "linux.svg";
         _ = ShellProfiles.DefaultShellForAsync(distro).ContinueWith(t =>
         {
             var kind = t.Result;
@@ -1578,7 +1824,6 @@ public sealed partial class MainWindow : Window
         foreach (var child in g.Children)
         {
             if (child is Button b) b.Opacity = opacity;
-            else if (child is TextBlock { Name: "ShellKindText" } tb) tb.Opacity = (1 - opacity) * 0.5;
         }
     }
 
@@ -1596,42 +1841,41 @@ public sealed partial class MainWindow : Window
     /// closed pane goes away (the others keep their split).
     private void HandleTabGone(uint id)
     {
+        // Was the closed tab showing in the current view's panes?
+        bool wasShown = false;
+        for (int i = 0; i < _paneCount; i++)
+            if (_slotTab[i] == id) { wasShown = true; break; }
+
+        // Drop it from its split tree first (siblings promote; a lone leaf dissolves).
+        if (RootContaining(id) is PaneNode root)
+        {
+            var promoted = PaneTree.Remove(root, id);
+            int oi = _trees.IndexOf(root);
+            if (promoted is null or Leaf) { if (oi >= 0) _trees.RemoveAt(oi); }
+            else if (oi >= 0) _trees[oi] = promoted;
+        }
         RemoveTab(id);
-        bool wasInPane = RemovePaneTab(id);
         if (Tabs.Count == 0)
         {
             Close();
             return;
         }
-        if (!wasInPane)
+        if (!wasShown)
             return;
-        // Pane 0 must always show a tab; backfill from selection / first tab.
-        if (_slotTab[0] == InvalidId)
-            _slotTab[0] = (TabList.SelectedItem as TabVM)?.Id ?? Tabs[0].Id;
-        ApplyLayout();
+        // The visible tab went away: re-show the view anchored on a survivor (a
+        // remaining pane of this view, else the selection, else the first tab).
+        uint show = InvalidId;
         for (int i = 0; i < _paneCount; i++)
-            if (_slotTab[i] != InvalidId)
-                Native.velo_pane_bind(_engine, _slotCore[i], _slotTab[i]);
-        if (_slotTab[_focusedPane] != InvalidId)
-            SelectById(_slotTab[_focusedPane]);
-    }
-
-    /// Remove `id` from the active pane set and compact the slots below it. Returns
-    /// whether it was shown in a pane.
-    private bool RemovePaneTab(uint id)
-    {
-        int k = -1;
-        for (int i = 0; i < _paneCount; i++)
-            if (_slotTab[i] == id) { k = i; break; }
-        if (k < 0)
-            return false;
-        for (int i = k; i < _paneCount - 1; i++)
-            _slotTab[i] = _slotTab[i + 1];
-        _slotTab[_paneCount - 1] = InvalidId;
-        _paneCount = Math.Max(1, _paneCount - 1);
-        if (_focusedPane >= _paneCount)
-            _focusedPane = 0;
-        return true;
+            if (_slotTab[i] != InvalidId && _slotTab[i] != id) { show = _slotTab[i]; break; }
+        if (show == InvalidId)
+            show = (TabList.SelectedItem as TabVM)?.Id ?? InvalidId;
+        if (show == InvalidId || show == id)
+            show = Tabs.Count > 0 ? Tabs[0].Id : InvalidId;
+        if (show == InvalidId)
+            return;
+        Native.velo_tab_set_active(_engine, show);
+        ShowView(show);
+        SelectById(show);
     }
 
     private void RemoveTab(uint id)
@@ -1661,17 +1905,18 @@ public sealed partial class MainWindow : Window
             // Picking a terminal tab leaves editor mode (workspace state
             // survives in the engine; re-entering shows the same files).
             SetEditorMode(false);
-            // Binds the focused pane to this tab (core), so track it per pane.
             Native.velo_tab_set_active(_engine, t.Id);
-            _slotTab[_focusedPane] = t.Id;
+            // Browser-style: show this tab's whole view (its split group, or the
+            // tab alone) instead of swapping it into the focused pane.
+            ShowView(t.Id);
             _filesDir = null;            // Files panel follows the new tab's cwd
             if (_detailsOpen) RefreshDetails();
             FocusTerminal();
         }
-        else if (TabList.SelectedItem is TabGroup)
+        else if (TabList.SelectedItem is TabGroup or SplitRowVM)
         {
-            // Group-header rows aren't a tab: bounce selection back to the active tab so
-            // the header doesn't show the selected fill.
+            // Header/pill rows aren't a tab themselves: bounce selection back so
+            // the row doesn't show the selected fill (pills handle their own taps).
             _suppressSelection = true;
             TabList.SelectedItem = e.RemovedItems.Count > 0 ? e.RemovedItems[0] : null;
             _suppressSelection = false;
@@ -1679,23 +1924,120 @@ public sealed partial class MainWindow : Window
     }
 
     // ---- Split view (drag a tab onto an edge → up to 4 panes) ------------
+    //
+    // Browser-style split groups: a tab belongs to at most ONE group; selecting
+    // any member shows the whole group, selecting a non-member shows that tab
+    // alone. Multiple groups coexist; the pane slots only ever show the active
+    // tab's view.
+
+    // Active split trees (binary PaneNode). Only one is shown at a time (the view
+    // of the active tab); a tab with no tree is a lone pane.
+    private readonly List<PaneNode> _trees = new();
+    private PaneNode _viewRoot = null!;     // the tree the body currently shows
+    private uint _viewTab = InvalidId;      // tab whose view the body shows
+    private uint _prevViewTab = InvalidId;  // the view before it (drop-anchor rescue)
+    // Per-pane drop preview: the leaf to split + its edge, captured during DragOver.
+    private uint _previewTargetTab = InvalidId;
+    private Edge _previewEdge;
+
+    /// The tree whose leaves include `tabId`, or null when the tab is a lone pane.
+    private PaneNode? RootContaining(uint tabId) => _trees.Find(t => PaneTree.Contains(t, tabId));
+
+    /// Lay the pane slots out for `activeId`'s view (its split group, or the tab
+    /// alone) and bind every visible pane. The single authority for what the
+    /// terminal body shows.
+    private void ShowView(uint activeId)
+    {
+        if (_engine == IntPtr.Zero || activeId == InvalidId)
+            return;
+        if (activeId != _viewTab)
+        {
+            _prevViewTab = _viewTab;
+            _viewTab = activeId;
+        }
+        var root = RootContaining(activeId);
+        if (root is null)
+        {
+            _viewRoot = new Leaf(activeId);
+            _paneCount = 1;
+            _slotTab[0] = activeId;
+            for (int i = 1; i < MaxPanes; i++)
+                _slotTab[i] = InvalidId;
+            _focusedPane = 0;
+            PaneCtl.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            _viewRoot = root;
+            var leaves = PaneTree.Leaves(root).ToList();   // in-order = slot order
+            _paneCount = Math.Min(leaves.Count, MaxPanes);
+            for (int i = 0; i < MaxPanes; i++)
+                _slotTab[i] = i < _paneCount ? leaves[i] : InvalidId;
+            _focusedPane = Math.Max(0, leaves.IndexOf(activeId));
+            for (int i = 1; i < _paneCount; i++)
+                CreateCorePane(i);          // no-op if the slot already has one
+        }
+        BuildLayout();
+        for (int i = 1; i < _paneCount; i++)
+            BindSwapchain(i);               // no-op once bound
+        for (int i = 0; i < _paneCount; i++)
+            if (_slotTab[i] != InvalidId && _slotCore[i] != InvalidId)
+                Native.velo_pane_bind(_engine, _slotCore[i], _slotTab[i]);
+        Native.velo_pane_focus(_engine, _slotCore[_focusedPane]);
+    }
+
+    /// Tap on a split-row pill: activate that member tab (shows the whole split).
+    private void SplitPill_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not TabVM t)
+            return;
+        e.Handled = true;
+        if (_engine == IntPtr.Zero)
+            return;
+        SetEditorMode(false);
+        Native.velo_tab_set_active(_engine, t.Id);
+        ShowView(t.Id);
+        SelectById(t.Id);          // split branch: clears row selection, sets IsActive
+        _filesDir = null;
+        if (_detailsOpen) RefreshDetails();
+        FocusTerminal();
+    }
 
     private void TabList_DragItemsStarting(object sender, DragItemsStartingEventArgs e)
     {
         _dragTab = e.Items.Count > 0 ? e.Items[0] as TabVM : null;
-        if (_dragTab is not null)
-            e.Data.RequestedOperation = DataPackageOperation.Move;
+        if (_dragTab is null)
+            return;
+        e.Data.RequestedOperation = DataPackageOperation.Move;
+        // Selecting a tab to drag it switched the body to that tab. Restore the view
+        // that was showing before (the split we're dropping INTO) so the preview
+        // shrinks those panes — not the dragged tab. _prevViewTab was set by that
+        // selection's ShowView; keep it as the anchor for PreviewSplit / AddPane.
+        _dragAnchorTab = _prevViewTab != InvalidId && _prevViewTab != _dragTab.Id
+            ? _prevViewTab
+            : InvalidId;
+        if (_dragAnchorTab != InvalidId)
+            ShowView(_dragAnchorTab);
     }
 
     private void TabList_DragItemsCompleted(ListViewBase sender, DragItemsCompletedEventArgs args)
     {
         _dragTab = null;
+        _dragAnchorTab = InvalidId;
         HideDropZone();
     }
 
     private void PaneHost_DragOver(object sender, DragEventArgs e)
     {
-        if (_dragTab is null || _paneCount >= MaxPanes)
+        if (_dragTab is null || Tabs.Count < 2)
+            return;
+        var pos = e.GetPosition(PaneHost);
+        int slot = PaneAt(pos);
+        if (slot < 0)
+            return;
+        uint target = _slotTab[slot];
+        // Pointer over the dragged tab's own pane in a real split → nothing to do.
+        if (target == _dragTab.Id && _paneCount > 1)
             return;
         e.AcceptedOperation = DataPackageOperation.Move;
         if (e.DragUIOverride is not null)
@@ -1703,18 +2045,69 @@ public sealed partial class MainWindow : Window
             e.DragUIOverride.IsCaptionVisible = false;
             e.DragUIOverride.IsGlyphVisible = false;
         }
-        ShowDropZone(EdgeFromPoint(e.GetPosition(PaneHost)));
+        // Target pane's tree already full → can't subdivide it; whole-body hint.
+        var root = RootContaining(target);
+        int leaves = root is null ? 1 : PaneTree.Count(root);
+        if (leaves >= MaxPanes)
+        {
+            ShowDropRect(0, 0, PaneHost.ActualWidth, PaneHost.ActualHeight);
+            _previewTargetTab = InvalidId;
+            return;
+        }
+        PreviewSplit(slot, pos);
     }
 
-    private void PaneHost_DragLeave(object sender, DragEventArgs e) => HideDropZone();
+    /// Live drop preview: shrink ONLY the pane under the pointer into the half
+    /// opposite the nearest edge, and highlight the incoming half. Pure XAML
+    /// relayout (DComp scales the swapchain) — no native resize, which would wedge
+    /// the drag's modal input loop. Real reflow happens on drop. This per-pane
+    /// targeting is what produces mixed layouts.
+    private void PreviewSplit(int slot, Point pos)
+    {
+        double px = _slotX[slot], py = _slotY[slot], pw = _slotW[slot], ph = _slotH[slot];
+        Edge edge = EdgeInRect(pos, px, py, pw, ph);
+        _previewTargetTab = _slotTab[slot];
+        _previewEdge = edge;
+        // Highlight-only preview: mark the half of the target pane the new pane will
+        // take. We deliberately DON'T shrink the existing pane during the drag —
+        // a layout resize detaches the swapchain content, and a RenderTransform
+        // scales the font. The real reflow (normal text, correct size) happens on
+        // drop. This matches how Windows Terminal previews a split.
+        bool vertical = edge is Edge.Top or Edge.Bottom;
+        bool front = edge is Edge.Left or Edge.Top;
+        double dx, dy, dw, dh;
+        if (vertical)
+        {
+            double half = ph / 2;
+            dx = px; dw = pw; dh = half;
+            dy = front ? py : py + half;
+        }
+        else
+        {
+            double half = pw / 2;
+            dy = py; dh = ph; dw = half;
+            dx = front ? px : px + half;
+        }
+        ShowDropRect(dx, dy, dw, dh);
+    }
+
+    private void PaneHost_DragLeave(object sender, DragEventArgs e)
+    {
+        HideDropZone();
+        _previewTargetTab = InvalidId;
+    }
 
     private void PaneHost_Drop(object sender, DragEventArgs e)
     {
         var t = _dragTab;
         _dragTab = null;
-        var edge = EdgeFromPoint(e.GetPosition(PaneHost));
+        // Capture the preview target now: DragItemsCompleted / a relayout clears it
+        // before the deferred AddPane below runs.
+        uint target = _previewTargetTab;
+        Edge edge = _previewEdge;
         HideDropZone();
-        if (t is null)
+        _previewTargetTab = InvalidId;
+        if (t is null || target == InvalidId)
             return;
         // Defer (Low priority = after the drag's modal loop fully unwinds): the OS
         // drag-drop is still completing on this thread. Doing the swapchain create +
@@ -1722,14 +2115,14 @@ public sealed partial class MainWindow : Window
         // app.
         DispatcherQueue.TryEnqueue(
             Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
-            () => AddPane(t, edge));
+            () => AddPane(t, edge, target));
     }
 
-    /// Nearest edge to the pointer (Windows-snap style).
-    private Edge EdgeFromPoint(Point p)
+    /// Nearest edge of a rect to the pointer (rect in the same coord space as p).
+    private static Edge EdgeInRect(Point p, double x, double y, double w, double h)
     {
-        double rx = PaneHost.ActualWidth > 0 ? p.X / PaneHost.ActualWidth : 0.5;
-        double ry = PaneHost.ActualHeight > 0 ? p.Y / PaneHost.ActualHeight : 0.5;
+        double rx = w > 0 ? (p.X - x) / w : 0.5;
+        double ry = h > 0 ? (p.Y - y) / h : 0.5;
         double dl = rx, dr = 1 - rx, dt = ry, db = 1 - ry;
         double m = Math.Min(Math.Min(dl, dr), Math.Min(dt, db));
         if (m == dl) return Edge.Left;
@@ -1738,30 +2131,17 @@ public sealed partial class MainWindow : Window
         return Edge.Bottom;
     }
 
-    private void ShowDropZone(Edge edge)
+    /// Highlight one cell of the previewed layout (PaneHost coords; SplitOverlay
+    /// stretches over PaneHost so a top-left margin lands in the same space).
+    private void ShowDropRect(double x, double y, double w, double h)
     {
         SplitOverlay.Visibility = Visibility.Visible;
         DropZone.Opacity = 1;
-        double w = PaneHost.ActualWidth, h = PaneHost.ActualHeight;
-        switch (edge)
-        {
-            case Edge.Left:
-                DropZone.HorizontalAlignment = HorizontalAlignment.Left;
-                DropZone.VerticalAlignment = VerticalAlignment.Stretch;
-                DropZone.Width = w / 2; DropZone.Height = double.NaN; break;
-            case Edge.Right:
-                DropZone.HorizontalAlignment = HorizontalAlignment.Right;
-                DropZone.VerticalAlignment = VerticalAlignment.Stretch;
-                DropZone.Width = w / 2; DropZone.Height = double.NaN; break;
-            case Edge.Top:
-                DropZone.HorizontalAlignment = HorizontalAlignment.Stretch;
-                DropZone.VerticalAlignment = VerticalAlignment.Top;
-                DropZone.Height = h / 2; DropZone.Width = double.NaN; break;
-            default:
-                DropZone.HorizontalAlignment = HorizontalAlignment.Stretch;
-                DropZone.VerticalAlignment = VerticalAlignment.Bottom;
-                DropZone.Height = h / 2; DropZone.Width = double.NaN; break;
-        }
+        DropZone.HorizontalAlignment = HorizontalAlignment.Left;
+        DropZone.VerticalAlignment = VerticalAlignment.Top;
+        DropZone.Margin = new Thickness(x, y, 0, 0);
+        DropZone.Width = w;
+        DropZone.Height = h;
     }
 
     private void HideDropZone()
@@ -1770,67 +2150,281 @@ public sealed partial class MainWindow : Window
         DropZone.Opacity = 0;
     }
 
-    /// Add a pane showing the dropped tab. The first split's orientation comes from
-    /// the drop edge; further panes fill the 2x2 grid. Capped at 4 panes.
-    private void AddPane(TabVM dropped, Edge edge)
+    /// Drop `dropped` against one edge of the pane showing `targetTab`: split ONLY
+    /// that leaf into a branch (orientation + child order from the edge), leaving the
+    /// rest of the tree untouched — this is what makes mixed layouts possible. The
+    /// dropped tab leaves any other tree first.
+    private void AddPane(TabVM dropped, Edge edge, uint targetTab)
     {
-        if (_engine == IntPtr.Zero || _paneCount >= MaxPanes)
+        if (_engine == IntPtr.Zero)
+            return;
+        if (targetTab == InvalidId || targetTab == dropped.Id)
+            targetTab = _prevViewTab;
+        if (targetTab == InvalidId || targetTab == dropped.Id)
             return;
 
-        int slot = _paneCount;
-        if (!CreateCorePane(slot))
+        // Pull the dropped tab out of whatever tree it was in (promote its sibling).
+        var oldRoot = RootContaining(dropped.Id);
+        if (oldRoot is not null)
+        {
+            var promoted = PaneTree.Remove(oldRoot, dropped.Id);
+            int oi = _trees.IndexOf(oldRoot);
+            if (promoted is null or Leaf) { if (oi >= 0) _trees.RemoveAt(oi); }
+            else if (oi >= 0) _trees[oi] = promoted;
+        }
+
+        // Resolve the target's tree fresh (removal above may have changed it).
+        var root = RootContaining(targetTab);
+        if (root is null)
+        {
+            root = new Leaf(targetTab);
+            _trees.Add(root);
+        }
+        if (PaneTree.Count(root) >= MaxPanes)
             return;
-        if (_paneCount == 1)
-            _splitVertical = edge is Edge.Top or Edge.Bottom;
+        bool vertical = edge is Edge.Top or Edge.Bottom;
+        bool front = edge is Edge.Left or Edge.Top;
+        var newRoot = PaneTree.SplitLeaf(root, targetTab, dropped.Id, vertical, front);
+        int ri = _trees.IndexOf(root);
+        if (ri >= 0) _trees[ri] = newRoot; else _trees.Add(newRoot);
 
-        _paneCount++;
-        _slotTab[slot] = dropped.Id;
-        if (_slotTab[0] == InvalidId)
-            _slotTab[0] = (TabList.SelectedItem as TabVM)?.Id ?? (Tabs.Count > 0 ? Tabs[0].Id : InvalidId);
-
-        ApplyLayout();                 // make slot visible + size every pane
-        BindSwapchain(slot);           // SetSwapChain now the panel is realized
-        PushPaneSize(_panels[slot]);   // size once more with the swapchain bound
-
-        // Bind sessions to panes (backbuffers now exist → renders real content).
-        for (int i = 0; i < _paneCount; i++)
-            if (_slotTab[i] != InvalidId)
-                Native.velo_pane_bind(_engine, _slotCore[i], _slotTab[i]);
+        Native.velo_tab_set_active(_engine, dropped.Id);
+        ShowView(dropped.Id);
+        RefreshTabList();              // members collapse into their pill row
+        SelectById(dropped.Id);        // suppressed handler: no double ShowView
+        FocusTerminal();
     }
 
-    /// Arrange the active panels in the 2x2 grid per pane count + orientation.
-    private void ApplyLayout()
+    /// Right-click a split pill: rename / unjoin the whole split / close this tab.
+    private void SplitPill_ContextRequested(UIElement sender, ContextRequestedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not TabVM t)
+            return;
+        var flyout = new MenuFlyout();
+        Add(flyout, "Rename", () => BeginRename(t));
+        if (RootContaining(t.Id) is PaneNode root)
+            Add(flyout, "Unjoin tabs", () => UnjoinSplit(root));
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add(flyout, "Close", () => CloseTab(t.Id));
+        ShowFlyout(flyout, fe, e);
+    }
+
+    /// Split a set of tabs into one side-by-side (columns) tree, capped at MaxPanes.
+    /// Each tab leaves any tree it was already in.
+    private void JoinTabs(List<TabVM> tabs)
+    {
+        if (_engine == IntPtr.Zero || tabs.Count < 2)
+            return;
+        var members = tabs.Take(MaxPanes).Select(t => t.Id).ToList();
+        foreach (var id in members)
+        {
+            if (RootContaining(id) is PaneNode old)
+            {
+                var promoted = PaneTree.Remove(old, id);
+                int oi = _trees.IndexOf(old);
+                if (promoted is null or Leaf) { if (oi >= 0) _trees.RemoveAt(oi); }
+                else if (oi >= 0) _trees[oi] = promoted;
+            }
+        }
+        _trees.Add(PaneTree.Columns(members));
+        Native.velo_tab_set_active(_engine, members[0]);
+        ShowView(members[0]);
+        RefreshTabList();
+        SelectById(members[0]);
+        FocusTerminal();
+    }
+
+    /// Dissolve a split tree back into separate tabs; the first leaf becomes active.
+    private void UnjoinSplit(PaneNode root)
+    {
+        if (_engine == IntPtr.Zero)
+            return;
+        uint first = PaneTree.Leaves(root).FirstOrDefault(InvalidId);
+        _trees.Remove(root);
+        if (first != InvalidId)
+        {
+            Native.velo_tab_set_active(_engine, first);
+            ShowView(first);
+            SelectById(first);
+        }
+        RefreshTabList();
+        FocusTerminal();
+    }
+
+    /// Build a split-group row body: one equal-width pill per member (icon + title
+    /// + hover-reveal close), filling the row. Assembled in code because a nested
+    /// DataTemplate can't distribute row width evenly or wire per-pill close cleanly.
+    private Microsoft.UI.Xaml.UIElement BuildSplitPills(SplitRowVM row)
+    {
+        var grid = new Grid { ColumnSpacing = 4, HorizontalAlignment = HorizontalAlignment.Stretch };
+        foreach (var member in row.Members)
+        {
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var close = new Button
+            {
+                Content = "",
+                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Segoe MDL2 Assets"),
+                FontSize = 10,
+                Width = 20,
+                Height = 20,
+                Padding = new Thickness(0),
+                CornerRadius = new CornerRadius(5),
+                Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                BorderThickness = new Thickness(0),
+                Opacity = 0,
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = member.Id,
+            };
+            close.Click += TabClose_Click;
+
+            var icon = new Image { Width = 13, Height = 13, VerticalAlignment = VerticalAlignment.Center, Source = member.IconSource };
+            var title = new TextBlock
+            {
+                Text = member.Title,
+                FontSize = 12,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            Grid.SetColumn(icon, 0);
+            Grid.SetColumn(title, 1);
+            Grid.SetColumn(close, 2);
+
+            var inner = new Grid { ColumnSpacing = 5 };
+            inner.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            inner.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            inner.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            inner.Children.Add(icon);
+            inner.Children.Add(title);
+            inner.Children.Add(close);
+
+            // Active-member fill (same brush as full tab rows), bound live so it
+            // follows focus without a rebuild.
+            var fillBrush = Application.Current.Resources.TryGetValue("ListViewItemBackgroundSelected", out var res)
+                && res is Microsoft.UI.Xaml.Media.Brush b
+                ? b
+                : new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(0x40, 0xFF, 0xFF, 0xFF));
+            var fill = new Border
+            {
+                CornerRadius = new CornerRadius(6),
+                Background = fillBrush,
+                IsHitTestVisible = false,
+            };
+            fill.SetBinding(UIElement.OpacityProperty, new Microsoft.UI.Xaml.Data.Binding
+            {
+                Path = new Microsoft.UI.Xaml.PropertyPath("FillOpacity"),
+                Source = member,
+                Mode = Microsoft.UI.Xaml.Data.BindingMode.OneWay,
+            });
+
+            var body = new Grid();
+            body.Children.Add(fill);
+            body.Children.Add(inner);
+
+            var pill = new Border
+            {
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(8, 5, 6, 5),
+                Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(0x14, 0xFF, 0xFF, 0xFF)),
+                Child = body,
+                DataContext = member,
+            };
+            pill.Tapped += SplitPill_Tapped;
+            pill.ContextRequested += SplitPill_ContextRequested;
+            pill.PointerEntered += (_, _) => close.Opacity = 1;
+            pill.PointerExited += (_, _) => close.Opacity = 0;
+            Grid.SetColumn(pill, grid.ColumnDefinitions.Count - 1);
+            grid.Children.Add(pill);
+        }
+        return grid;
+    }
+
+    /// Realize the current view (`_viewRoot`) into panel geometry. Single pane
+    /// stretches (auto-resizes with the window). Splits use absolute rects computed
+    /// from the tree so arbitrary nesting works; a PaneHost SizeChanged recomputes
+    /// them. Slot order = in-order leaves (matches how ShowView fills `_slotTab`).
+    private void BuildLayout()
     {
         for (int i = 0; i < MaxPanes; i++)
             _panels[i].Visibility = i < _paneCount ? Visibility.Visible : Visibility.Collapsed;
 
-        void Place(int i, int r, int c, int rs, int cs)
+        // Single container cell: panels position themselves absolutely (multi) or
+        // stretch (single) inside it, regardless of any legacy grid tracks.
+        PaneHost.RowDefinitions.Clear();
+        PaneHost.ColumnDefinitions.Clear();
+        PaneHost.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        PaneHost.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        double W = PaneHost.ActualWidth, H = PaneHost.ActualHeight;
+
+        if (_paneCount <= 1 || _viewRoot is null)
         {
-            var p = _panels[i];
-            Grid.SetRow(p, r); Grid.SetColumn(p, c);
-            Grid.SetRowSpan(p, rs); Grid.SetColumnSpan(p, cs);
+            var p = _panels[0];
+            Grid.SetRow(p, 0); Grid.SetColumn(p, 0);
+            p.HorizontalAlignment = HorizontalAlignment.Stretch;
+            p.VerticalAlignment = VerticalAlignment.Stretch;
+            p.Width = double.NaN; p.Height = double.NaN;
+            p.Margin = new Thickness(0);
+            _slotX[0] = 0; _slotY[0] = 0; _slotW[0] = W; _slotH[0] = H;
+            PaneHost.UpdateLayout();
+            PushPaneSize(p);
+            return;
         }
 
-        switch (_paneCount)
-        {
-            case 1:
-                Place(0, 0, 0, 2, 2);
-                break;
-            case 2:
-                if (_splitVertical) { Place(0, 0, 0, 1, 2); Place(1, 1, 0, 1, 2); }
-                else { Place(0, 0, 0, 2, 1); Place(1, 0, 1, 2, 1); }
-                break;
-            case 3: // left full height, right column split top/bottom
-                Place(0, 0, 0, 2, 1); Place(1, 0, 1, 1, 1); Place(2, 1, 1, 1, 1);
-                break;
-            default: // 4 quadrants
-                Place(0, 0, 0, 1, 1); Place(1, 0, 1, 1, 1); Place(2, 1, 0, 1, 1); Place(3, 1, 1, 1, 1);
-                break;
-        }
+        if (W <= 0 || H <= 0)
+            return;                     // PaneHost not measured yet; SizeChanged reruns us
 
-        PaneHost.UpdateLayout();        // force layout so ActualWidth is valid below
+        int slot = 0;
+        PlaceNode(_viewRoot, 0, 0, W, H, ref slot);
+        PaneHost.UpdateLayout();
         for (int i = 0; i < _paneCount; i++)
             PushPaneSize(_panels[i]);
+    }
+
+    private const double SplitGap = 1;   // seam between panes
+
+    /// Recursively assign each leaf a rect and position its panel absolutely.
+    private void PlaceNode(PaneNode node, double x, double y, double w, double h, ref int slot)
+    {
+        if (node is Leaf)
+        {
+            int i = slot++;
+            if (i >= MaxPanes) return;
+            var p = _panels[i];
+            Grid.SetRow(p, 0); Grid.SetColumn(p, 0);
+            p.HorizontalAlignment = HorizontalAlignment.Left;
+            p.VerticalAlignment = VerticalAlignment.Top;
+            p.Width = Math.Max(1, w);
+            p.Height = Math.Max(1, h);
+            p.Margin = new Thickness(x, y, 0, 0);
+            _slotX[i] = x; _slotY[i] = y; _slotW[i] = w; _slotH[i] = h;
+            return;
+        }
+        var b = (Branch)node;
+        double g = SplitGap / 2;
+        // Weight the split by each child's LEAF COUNT, not a fixed 0.5, so a chain
+        // of same-orientation splits comes out with equal-sized panes instead of
+        // halving each time (1/2, 1/4, 1/8…). ponytail: ignores b.Ratio — manual
+        // drag-resize (Phase 3) will reintroduce it, blended with these weights.
+        double fa = (double)PaneTree.Count(b.A) / PaneTree.Count(node);
+        if (b.Vertical)
+        {
+            double ha = h * fa;
+            PlaceNode(b.A, x, y, w, ha - g, ref slot);
+            PlaceNode(b.B, x, y + ha + g, w, h - ha - g, ref slot);
+        }
+        else
+        {
+            double wa = w * fa;
+            PlaceNode(b.A, x, y, wa - g, h, ref slot);
+            PlaceNode(b.B, x + wa + g, y, w - wa - g, h, ref slot);
+        }
+    }
+
+    private void PaneHost_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (_engine != IntPtr.Zero && _paneCount > 1)
+            BuildLayout();
     }
 
     /// Lazily create the core pane backing slot `i`; stashes its swapchain to bind
@@ -1872,6 +2466,20 @@ public sealed partial class MainWindow : Window
 
     private void SelectById(uint id)
     {
+        // Split members have no own row (they live in a pill row): drive the
+        // active flag + title directly and clear the list selection.
+        if (RootContaining(id) is not null)
+        {
+            // Deselect FIRST: the SelectionChanged handler clears the removed
+            // item's IsActive, which would wipe the flag set below.
+            _suppressSelection = true;
+            TabList.SelectedItem = null;
+            _suppressSelection = false;
+            foreach (var t in Tabs)
+                t.IsActive = t.Id == id;
+            UpdateTitleBarTitle();
+            return;
+        }
         foreach (var t in Tabs)
         {
             if (t.Id == id)
@@ -1919,6 +2527,26 @@ public sealed partial class MainWindow : Window
 
         _suppressSelection = true;
         TabListItems.Clear();
+        // Split-group members collapse into ONE pill row, emitted where the
+        // first member sits; the remaining members vanish from their own rows.
+        var seenTrees = new HashSet<PaneNode>();
+        void Emit(TabVM m)
+        {
+            var root = RootContaining(m.Id);
+            if (root is null)
+            {
+                TabListItems.Add(m);
+                return;
+            }
+            if (!seenTrees.Add(root))
+                return;
+            var row = new SplitRowVM();
+            foreach (var tid in PaneTree.Leaves(root))
+                foreach (var tv in Tabs)
+                    if (tv.Id == tid) { row.Members.Add(tv); break; }
+            row.Content = BuildSplitPills(row);
+            TabListItems.Add(row);
+        }
         // Groups first (header + members), then all ungrouped tabs below.
         bool firstGroup = true;
         foreach (var entry in _layout)
@@ -1929,12 +2557,12 @@ public sealed partial class MainWindow : Window
                 firstGroup = false;
                 TabListItems.Add(g);
                 if (!g.IsCollapsed)
-                    foreach (var m in g.Members) TabListItems.Add(m);
+                    foreach (var m in g.Members) Emit(m);
             }
         }
         foreach (var entry in _layout)
             if (entry is TabVM t)
-                TabListItems.Add(t);
+                Emit(t);
         // Restore the active highlight if its row is still visible (not in a collapsed
         // group). Core binding is independent of ListView selection, so a hidden active
         // tab keeps rendering in its pane regardless.
@@ -1995,7 +2623,10 @@ public sealed partial class MainWindow : Window
         args.Handled = true;
         if (_selected.Count == 0)
             return;
-        GroupTabs(OrderedTabs().Where(_selected.Contains).ToList());
+        // The active tab joins the group even if it was never Ctrl+Clicked.
+        var set = new HashSet<TabVM>(_selected);
+        if (CurrentTab() is TabVM cur) set.Add(cur);
+        GroupTabs(OrderedTabs().Where(set.Contains).ToList());
     }
 
     /// Pull `tabs` (in display order) out of their current slots into a new group,
@@ -2208,12 +2839,30 @@ public sealed partial class MainWindow : Window
             return;
         var flyout = new MenuFlyout();
         Add(flyout, "Rename", () => BeginRename(t));
-        // New group from the current selection (≥2 selected) or just this tab.
-        var groupTabs = _selected.Count >= 2 && _selected.Contains(t)
-            ? OrderedTabs().Where(_selected.Contains).ToList()
-            : new List<TabVM> { t };
+        // New group from the current selection + the ACTIVE tab (the open tab is
+        // part of the working set even though it was never Ctrl+Clicked), or just
+        // this tab when nothing is selected.
+        List<TabVM> groupTabs;
+        if (_selected.Count > 0 && (_selected.Contains(t) || t.IsActive))
+        {
+            var set = new HashSet<TabVM>(_selected) { t };
+            if (CurrentTab() is TabVM cur) set.Add(cur);
+            groupTabs = OrderedTabs().Where(set.Contains).ToList();
+        }
+        else
+        {
+            groupTabs = new List<TabVM> { t };
+        }
         Add(flyout, groupTabs.Count > 1 ? $"New group ({groupTabs.Count} tabs)" : "New group",
             () => { GroupTabs(groupTabs); ClearMultiSelect(); });
+        // Join = split-view the working set side-by-side (capped at MaxPanes).
+        if (groupTabs.Count > 1)
+        {
+            int n = Math.Min(groupTabs.Count, MaxPanes);
+            Add(flyout, $"Join tabs ({n})", () => { JoinTabs(groupTabs); ClearMultiSelect(); });
+        }
+        if (RootContaining(t.Id) is PaneNode splitRoot)
+            Add(flyout, "Unjoin tabs", () => UnjoinSplit(splitRoot));
         if (t.Group is not null)
         {
             Add(flyout, "Remove from group", () => RemoveFromGroup(t));
@@ -2395,11 +3044,24 @@ public sealed partial class MainWindow : Window
         Native.velo_set_bg(_engine, r, g, b);
         Native.velo_set_bg_alpha(_engine, (float)_settings.BackgroundOpacity);
 
-        // One brush drives the title bar + both panels so they share a single tint
-        // layer that exactly matches the terminal (which the swapchain composites as
-        // ONE layer over the backdrop). ContentRoot stays transparent — see its XAML
-        // note — so the terminal isn't darkened by a second tint layer behind it.
-        ContentRoot.Background = null;            // transparent: swapchain owns the body tint
+        // With an OPAQUE terminal bg, the whole XAML root gets the same solid
+        // color: any hole the swapchain / panels don't cover (sidebar-animation
+        // seam, freshly exposed area on maximize) reads as terminal instead of
+        // the default #2C2C2C window fill. RootGrid, not ContentRoot: the seam
+        // can land on grid areas outside the center column. A translucent
+        // terminal keeps it null — an opaque brush under the swapchain would
+        // kill the backdrop blur-through (see the XAML note on ContentRoot).
+        RootGrid.Background = _settings.BackgroundOpacity >= 0.999
+            ? new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, r, g, b))
+            : null;
+
+        // Same color as the Win32 class brush: Windows uses it to pre-fill the
+        // region a maximize exposes, killing the black flash before first paint.
+        var brush = CreateSolidBrush((uint)(r | (g << 8) | (b << 16)));
+        SetClassLongPtr(WinRT.Interop.WindowNative.GetWindowHandle(this), GCLP_HBRBACKGROUND, brush);
+        if (_classBgBrush != IntPtr.Zero)
+            DeleteObject(_classBgBrush);
+        _classBgBrush = brush;
         UpdatePanelTint();                        // title bar tint + panels (transparent if backdrop-tinted)
         // NOTE: SwapChainPanel does NOT support the Background property — setting
         // it throws COMException 0x80004005 and aborts the entire Loaded handler,
@@ -2636,11 +3298,31 @@ public sealed partial class MainWindow : Window
         if (on && !_editorAttached)
             AttachEditorPane();
         if (!on && _engine != IntPtr.Zero)
+        {
             Native.velo_editor_save_all(_engine);   // flush on exit
+            // Close the bottom terminal via its own path: it reflows the shared
+            // session back to the main pane's grid (see ToggleEditorTerminal).
+            if (EditorTermHost.Visibility == Visibility.Visible)
+                ToggleEditorTerminal();
+        }
         PaneHost.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
         EditorHost.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        UpdateEditorPill();
         if (on) EditorPanel.Focus(FocusState.Programmatic);
         else FocusTerminal();
+    }
+
+    private void EditorPill_Click(object sender, RoutedEventArgs e) => SetEditorMode(true);
+
+    /// Sidebar "Editor" pill: visible while any file is open, filled while editor
+    /// mode is active — the way back after a terminal tab click left editor mode.
+    private void UpdateEditorPill()
+    {
+        EditorPillButton.Visibility =
+            EditorFiles.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        EditorPillButton.Background = _editorMode
+            ? (Brush)Application.Current.Resources["SubtleFillColorSecondaryBrush"]
+            : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
     }
 
     private unsafe void AttachEditorPane()
@@ -2662,6 +3344,17 @@ public sealed partial class MainWindow : Window
         => PushEditorSize();
 
     private void PushEditorSize()
+    {
+        if (!_editorAttached || _engine == IntPtr.Zero) return;
+        if (DeferResize())
+        {
+            _pendingEditorResize = true;
+            return;
+        }
+        PushEditorSizeNow();
+    }
+
+    private void PushEditorSizeNow()
     {
         if (!_editorAttached || _engine == IntPtr.Zero) return;
         double sx = EditorPanel.CompositionScaleX > 0 ? EditorPanel.CompositionScaleX : _lastScale;
@@ -2686,6 +3379,7 @@ public sealed partial class MainWindow : Window
         {
             vm = new EditorFileVM { Id = fid, Path = path };
             EditorFiles.Add(vm);
+            UpdateEditorPill();
         }
         _suppressEditorTab = true;
         EditorTabs.SelectedItem = vm;
@@ -2718,6 +3412,7 @@ public sealed partial class MainWindow : Window
         Native.velo_editor_close_file(_engine, id);
         var vm = EditorFiles.FirstOrDefault(f => f.Id == id);
         if (vm is not null) EditorFiles.Remove(vm);
+        UpdateEditorPill();
         if (EditorFiles.Count == 0) SetEditorMode(false);
         else if (EditorTabs.SelectedItem is null)
             EditorTabs.SelectedIndex = EditorFiles.Count - 1;
@@ -2787,9 +3482,23 @@ public sealed partial class MainWindow : Window
         else
         {
             EditorTermHost.Visibility = Visibility.Collapsed;
+            // The bind above reflowed the SESSION (shared with the main pane) to
+            // this small grid. Reflow it back to the main pane's grid, or leaving
+            // editor mode shows a 12-row terminal squashed into a full-size pane.
+            if (CurrentTab() is TabVM cur)
+                Native.velo_pane_bind(_engine, MainPaneFor(cur.Id), cur.Id);
             Native.velo_pane_focus(_engine, 0);
             EditorPanel.Focus(FocusState.Programmatic);
         }
+    }
+
+    /// Core pane id of the split slot showing tab `tabId` (pane 0 if none does).
+    private uint MainPaneFor(uint tabId)
+    {
+        for (int i = 0; i < _paneCount; i++)
+            if (_slotTab[i] == tabId && _slotCore[i] != InvalidId)
+                return _slotCore[i];
+        return 0;
     }
 
     private void EditorTerm_KeyDown(object sender, KeyRoutedEventArgs e)
