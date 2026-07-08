@@ -43,12 +43,25 @@ public sealed class TabVM : INotifyPropertyChanged
     }
 
     private string _shellKind = "";
-    /// <summary>Short shell label shown at the row's right edge (e.g. "pwsh", "cmd", "bash", "zsh").</summary>
+    /// <summary>Short shell label (e.g. "pwsh", "cmd", "bash", "zsh").</summary>
     public string ShellKind
     {
         get => _shellKind;
         set { if (_shellKind != value) { _shellKind = value; Raise(); } }
     }
+
+    private string _iconFile = "powershell.svg";
+    /// <summary>SVG filename under Assets/ShellIcons — the same brand icons the
+    /// new-tab dropdown shows (ShellProfile.Icon).</summary>
+    public string IconFile
+    {
+        get => _iconFile;
+        set { if (_iconFile != value) { _iconFile = value; Raise(); Raise(nameof(IconSource)); } }
+    }
+
+    public Microsoft.UI.Xaml.Media.ImageSource IconSource =>
+        new Microsoft.UI.Xaml.Media.Imaging.SvgImageSource(
+            new Uri($"ms-appx:///Assets/ShellIcons/{_iconFile}"));
 
     // Shell integration (OSC 7 / 133). Cwd updates on `cd`; CommandHistory
     // grows as commands run. The detail panels (later phases) bind to these.
@@ -109,10 +122,12 @@ public sealed class TabVM : INotifyPropertyChanged
         set { if (_isHovered != value) { _isHovered = value; Raise(); Raise(nameof(FillOpacity)); } }
     }
 
-    /// <summary>The single row-fill opacity for active, hover, and multi-select.
-    /// Never stacked: any combination is still just one fill (ctrl-clicking the
-    /// active tab changes nothing).</summary>
-    public double FillOpacity => (_isActive || _isMultiSelected || _isHovered) ? 1.0 : 0.0;
+    /// <summary>The single row-fill opacity. Never stacked: any combination is
+    /// still just one fill. Multi-select is deliberately dimmer than the active
+    /// tab so a pending Ctrl+Click set reads differently from the open tab.</summary>
+    public double FillOpacity =>
+        (_isActive || _isHovered) ? 1.0 :
+        _isMultiSelected ? 0.45 : 0.0;
 
     private bool _isEditing;
     /// <summary>Inline rename in progress: the row swaps its title TextBlock for a TextBox.</summary>
@@ -165,4 +180,15 @@ public sealed class TabVM : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
     private void Raise([CallerMemberName] string? name = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
+
+/// <summary>One tab-list row representing a split group: its member tabs render
+/// as side-by-side mini pills (browser-style). Rebuilt by RefreshTabList.</summary>
+public sealed class SplitRowVM
+{
+    public ObservableCollection<TabVM> Members { get; } = new();
+
+    /// <summary>Row body built by MainWindow.BuildSplitPills (equal-width pills with
+    /// hover-close). Rebuilt on every RefreshTabList so order/fill stay current.</summary>
+    public UIElement? Content { get; set; }
 }

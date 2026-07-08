@@ -713,6 +713,10 @@ mod imp {
             if sid != NO_SESSION {
                 self.reflow_session(sid, dims.0, dims.1);
             }
+            // Paint now: without this the pane keeps its stale frame (or stays
+            // blank) until the session's next PTY output — the "empty Ctrl+J
+            // terminal until you type" bug.
+            self.render_pane(idx);
         }
 
         /// Rebuild the font + every pane's renderer for the current

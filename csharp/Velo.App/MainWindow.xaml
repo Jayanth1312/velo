@@ -35,6 +35,7 @@
                       ContextRequested="TabRow_ContextRequested">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
@@ -42,7 +43,7 @@
                     <!-- The ONLY row fill: active, hover, and ctrl-select all share
                          this one Border (presenter draws no background), so every
                          state is identical brush + geometry and can never stack. -->
-                    <Border Grid.ColumnSpan="4"
+                    <Border Grid.ColumnSpan="5"
                             Margin="-10,0,-8,0"
                             CornerRadius="7"
                             Background="{ThemeResource ListViewItemBackgroundSelected}"
@@ -55,12 +56,18 @@
                             VerticalAlignment="Center"
                             Background="{Binding AccentBrush, Mode=OneWay}"
                             Visibility="{Binding AccentVisibility, Mode=OneWay}" />
-                    <TextBlock Grid.Column="1"
+                    <!-- Favicon-style shell brand icon (Assets/ShellIcons SVGs,
+                         same set as the new-tab dropdown). -->
+                    <Image Grid.Column="1"
+                           Width="15" Height="15"
+                           VerticalAlignment="Center"
+                           Source="{Binding IconSource, Mode=OneWay}" />
+                    <TextBlock Grid.Column="2"
                                Text="{Binding Title, Mode=OneWay}"
                                Visibility="{Binding TitleVisibility, Mode=OneWay}"
                                TextTrimming="CharacterEllipsis"
                                VerticalAlignment="Center" />
-                    <TextBox Grid.Column="1"
+                    <TextBox Grid.Column="2"
                              Name="RenameBox"
                              Text="{Binding Title, Mode=OneWay}"
                              Visibility="{Binding EditVisibility, Mode=OneWay}"
@@ -69,18 +76,11 @@
                              Padding="6,2"
                              KeyDown="RenameBox_KeyDown"
                              LostFocus="RenameBox_LostFocus" />
-                    <TextBlock Grid.Column="2"
+                    <TextBlock Grid.Column="3"
                                Text="{Binding Badge, Mode=OneWay}"
                                VerticalAlignment="Center"
                                Opacity="0.7" />
-                    <TextBlock Grid.Column="3"
-                               Name="ShellKindText"
-                               Text="{Binding ShellKind, Mode=OneWay}"
-                               VerticalAlignment="Center"
-                               HorizontalAlignment="Right"
-                               FontSize="11"
-                               Opacity="0.5" />
-                    <Button Grid.Column="3"
+                    <Button Grid.Column="4"
                             Opacity="0"
                             Content="&#xE711;"
                             FontFamily="Segoe MDL2 Assets"
@@ -93,6 +93,18 @@
                             Tag="{Binding Id}"
                             Click="TabClose_Click" />
                 </Grid>
+            </DataTemplate>
+
+            <!-- Split group row: member tabs as side-by-side mini pills
+                 (browser-style). Clicking a pill activates that tab, which shows
+                 the whole split. -->
+            <DataTemplate x:Key="SplitRowTemplate">
+                <!-- Equal-width pills built in code (BuildSplitPills): a nested
+                     DataTemplate can't split the row width evenly or wire per-pill
+                     hover-close cleanly, so the row content is a Grid we assemble. -->
+                <ContentPresenter Content="{Binding Content, Mode=OneWay}"
+                                  HorizontalAlignment="Stretch"
+                                  HorizontalContentAlignment="Stretch" />
             </DataTemplate>
 
             <DataTemplate x:Key="GroupHeaderTemplate">
@@ -223,10 +235,15 @@
                   IsTabStop="True"
                   ColumnSpacing="1"
                   RowSpacing="1"
+                  AllowDrop="True"
+                  DragOver="PaneHost_DragOver"
+                  DragLeave="PaneHost_DragLeave"
+                  Drop="PaneHost_Drop"
                   Loaded="PaneHost_Loaded"
                   PointerPressed="PaneHost_PointerPressed"
                   PointerMoved="PaneHost_PointerMoved"
                   PointerReleased="PaneHost_PointerReleased"
+                  PointerExited="PaneHost_PointerExited"
                   PointerWheelChanged="PaneHost_PointerWheelChanged">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" />
@@ -266,7 +283,7 @@
 
                 <!-- Drop-zone overlay (a single highlight repositioned per edge). -->
                 <Grid x:Name="SplitOverlay"
-                      Grid.RowSpan="2" Grid.ColumnSpan="2"
+                      Grid.RowSpan="4" Grid.ColumnSpan="4"
                       Visibility="Collapsed"
                       IsHitTestVisible="False">
                     <Border x:Name="DropZone"
@@ -277,10 +294,40 @@
                             CornerRadius="4" />
                 </Grid>
 
+                <!-- Per-pane controls (split mode only): floats top-center of the
+                     hovered pane, like a browser split. Swap = exchange this pane's
+                     tab with the next slot; full = collapse the split, keeping
+                     this pane's tab full-size (others stay as normal tabs). -->
+                <Border x:Name="PaneCtl"
+                        Visibility="Collapsed"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Top"
+                        Margin="0,6,0,0"
+                        Padding="3"
+                        CornerRadius="8"
+                        Background="#CC2E2E2E">
+                    <StackPanel Orientation="Horizontal" Spacing="2">
+                        <Button Content="&#xE8AB;"
+                                FontFamily="Segoe MDL2 Assets"
+                                FontSize="12"
+                                Width="28" Height="24" Padding="0"
+                                Background="Transparent" BorderThickness="0"
+                                ToolTipService.ToolTip="Swap position"
+                                Click="PaneCtlSwap_Click" />
+                        <Button Content="&#xE740;"
+                                FontFamily="Segoe MDL2 Assets"
+                                FontSize="12"
+                                Width="28" Height="24" Padding="0"
+                                Background="Transparent" BorderThickness="0"
+                                ToolTipService.ToolTip="Make full screen"
+                                Click="PaneCtlFull_Click" />
+                    </StackPanel>
+                </Border>
+
                 <!-- Zoom-level toast: floats over the body, bottom-centered, fades
                      out shortly after each Ctrl++/Ctrl+- step. -->
                 <Border x:Name="ZoomToast"
-                        Grid.RowSpan="2" Grid.ColumnSpan="2"
+                        Grid.RowSpan="4" Grid.ColumnSpan="4"
                         HorizontalAlignment="Center"
                         VerticalAlignment="Bottom"
                         Margin="0,0,0,48"
@@ -317,6 +364,10 @@
                           SelectionChanged="EditorTabs_SelectionChanged"
                           ScrollViewer.HorizontalScrollMode="Enabled"
                           ScrollViewer.HorizontalScrollBarVisibility="Hidden">
+                    <!-- No entrance/add animation: opened files appear instantly. -->
+                    <ListView.ItemContainerTransitions>
+                        <TransitionCollection />
+                    </ListView.ItemContainerTransitions>
                     <ListView.Resources>
                         <!-- Presenter backgrounds off entirely: it draws square
                              fills that ignore CornerRadius. The rounded pill is a
@@ -394,6 +445,8 @@
                       Grid.Row="2"
                       Height="220"
                       Visibility="Collapsed"
+                      BorderThickness="0,1,0,0"
+                      BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}"
                       Background="Transparent"
                       IsTabStop="True"
                       KeyDown="EditorTerm_KeyDown"
@@ -440,6 +493,18 @@
                     <RowDefinition Height="34" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
+
+                <!-- Title-bar behavior for the details panel's top strip: drag to
+                     move, double-click to maximize. Sits under the icon row, so
+                     the buttons keep their own clicks. -->
+                <Border Grid.Row="0"
+                        Background="Transparent"
+                        PointerEntered="Chrome_PointerEntered"
+                        PointerExited="Chrome_PointerExited"
+                        PointerPressed="TitleBarHover_PointerPressed"
+                        PointerMoved="TitleBarHover_PointerMoved"
+                        PointerReleased="TitleBarHover_PointerReleased"
+                        DoubleTapped="TitleBarHover_DoubleTapped" />
 
                 <!-- Row 0: detail-section icon row (hover-only chrome). Each button
                      shows its icon always; the selected one also reveals its text
@@ -733,12 +798,24 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="34" />
                     <RowDefinition Height="40" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <!-- Row 0: window controls (the toggle now lives in the title bar). -->
-                <Grid Grid.Row="0">
+                <!-- Row 0: window controls (the toggle now lives in the title bar).
+                     Transparent background + drag handlers: the strip left of the
+                     window controls behaves like the title bar (drag to move,
+                     double-click to maximize) — the buttons sit on top and keep
+                     their own clicks. -->
+                <Grid Grid.Row="0"
+                      Background="Transparent"
+                      PointerEntered="Chrome_PointerEntered"
+                      PointerExited="Chrome_PointerExited"
+                      PointerPressed="TitleBarHover_PointerPressed"
+                      PointerMoved="TitleBarHover_PointerMoved"
+                      PointerReleased="TitleBarHover_PointerReleased"
+                      DoubleTapped="TitleBarHover_DoubleTapped">
                     <StackPanel x:Name="WindowControls"
                                 Orientation="Horizontal"
                                 HorizontalAlignment="Right"
@@ -858,8 +935,40 @@
                      focus into the ListView, else input focus sticks there and the
                      terminal goes dead until the window is re-activated (the "can't
                      type after new tab until alt-tab" bug). -->
+                <!-- Editor pill: visible while files are open in the editor. Gives a
+                     way back after clicking a terminal tab kicked you out of editor
+                     mode. Highlighted while editor mode is active. -->
+                <Button x:Name="EditorPillButton"
+                        Grid.Row="2"
+                        Visibility="Collapsed"
+                        Margin="6,0,6,2"
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Left"
+                        MinHeight="34"
+                        Padding="10,0"
+                        CornerRadius="7"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Click="EditorPill_Click"
+                        ToolTipService.ToolTip="Back to editor">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Viewbox Width="14" Height="14" VerticalAlignment="Center">
+                            <!-- lucide code (24x24 viewBox) -->
+                            <Path Stroke="{ThemeResource TextFillColorSecondaryBrush}"
+                                  StrokeThickness="2"
+                                  StrokeLineJoin="Round"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  Data="M16 18 L22 12 L16 6 M8 6 L2 12 L8 18" />
+                        </Viewbox>
+                        <TextBlock Text="Editor"
+                                   VerticalAlignment="Center"
+                                   FontSize="13" />
+                    </StackPanel>
+                </Button>
+
                 <ListView x:Name="TabList"
-                          Grid.Row="2"
+                          Grid.Row="3"
                           Background="Transparent"
                           ItemsSource="{x:Bind TabListItems}"
                           SelectionMode="Single"
@@ -913,7 +1022,7 @@
                 </ListView>
 
                 <!-- Footer: settings (round, hover-only chrome), bottom-right. -->
-                <Grid Grid.Row="3" Padding="8,6">
+                <Grid Grid.Row="4" Padding="8,6">
                     <Button x:Name="SettingsButton"
                             HorizontalAlignment="Right"
                             Style="{StaticResource IconButtonStyle}"
