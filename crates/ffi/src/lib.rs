@@ -1476,6 +1476,17 @@ mod imp {
                         }
                     }
                 }
+                3 => {
+                    // Pointer left the pane: drop any pending click and stop
+                    // reporting a hover, but leave selection state untouched.
+                    self.press_pos = None;
+                    if self.link_hover {
+                        self.link_hover = false;
+                        if let Some(f) = self.cb.on_link_hover {
+                            f(self.cb.ctx, 0);
+                        }
+                    }
+                }
                 _ => {
                     let clicked = self.press_pos.take().is_some_and(|(px, py)| {
                         (px - x).abs() < 4.0 && (py - y).abs() < 4.0
@@ -1890,10 +1901,12 @@ mod imp {
     }
 
     /// Forward a pointer event to the focused pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside the panel. `button` is 0 left,
-    /// 1 middle, 2 right. `mods` is the same live bitset as `velo_key`
-    /// (bit1 = Shift; shift overrides app mouse reporting to force local
-    /// text selection).
+    /// 2 = up, 3 = leave (pointer left the pane; clears any pending click and
+    /// stale link hover, but does not touch selection state). `(x, y)` are
+    /// physical px inside the panel (ignored for `kind == 3`; pass 0, 0).
+    /// `button` is 0 left, 1 middle, 2 right. `mods` is the same live bitset
+    /// as `velo_key` (bit1 = Shift; shift overrides app mouse reporting to
+    /// force local text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
@@ -2004,10 +2017,12 @@ mod imp {
     }
 
     /// Forward a pointer event to a specific pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside that pane. `button` is 0 left,
-    /// 1 middle, 2 right. `mods` is the same live bitset as `velo_key`
-    /// (bit1 = Shift; shift overrides app mouse reporting to force local
-    /// text selection).
+    /// 2 = up, 3 = leave (pointer left the pane; clears any pending click and
+    /// stale link hover, but does not touch selection state). `(x, y)` are
+    /// physical px inside that pane (ignored for `kind == 3`; pass 0, 0).
+    /// `button` is 0 left, 1 middle, 2 right. `mods` is the same live bitset
+    /// as `velo_key` (bit1 = Shift; shift overrides app mouse reporting to
+    /// force local text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.

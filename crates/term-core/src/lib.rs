@@ -605,12 +605,18 @@ impl Terminal {
         // Rebuild the row's text (char-per-column, same iteration as `frame()`)
         // alongside each column's hyperlink, so a click can resolve either an
         // OSC 8 link or fall back to a heuristic scan of the plain text.
-        let mut text = String::new();
-        let mut hyperlinks: Vec<Option<alacritty_terminal::term::cell::Hyperlink>> = Vec::new();
+        let mut text = String::with_capacity(cols as usize);
+        let mut hyperlinks: Vec<Option<alacritty_terminal::term::cell::Hyperlink>> =
+            Vec::with_capacity(cols as usize);
+        // `display_iter` is line-ordered, so skip rows before the target and
+        // stop as soon as we pass it instead of scanning the whole viewport.
         for indexed in content.display_iter {
             let line = indexed.point.line.0 + display_offset as i32;
-            if line != row as i32 {
+            if line < row as i32 {
                 continue;
+            }
+            if line > row as i32 {
+                break;
             }
             let cell = indexed.cell;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {

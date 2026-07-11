@@ -1527,7 +1527,18 @@ public sealed partial class MainWindow : Window
     }
 
     private void PaneHost_PointerExited(object sender, PointerRoutedEventArgs e)
-        => PaneCtl.Visibility = Visibility.Collapsed;
+    {
+        PaneCtl.Visibility = Visibility.Collapsed;
+        if (_engine == IntPtr.Zero)
+            return;
+        var pos = e.GetCurrentPoint(PaneHost).Position;
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(pos);
+        if (i < 0)
+            return;
+        // Leave event: clears any pending click + stale link hover in the
+        // engine (see velo_pane_mouse kind == 3), coordinates are unused.
+        Native.velo_pane_mouse(_engine, PaneId(_panels[i]), 3, 0, 0, 0, 0);
+    }
 
     // ---- Per-pane split controls (swap position / make full screen) --------
 

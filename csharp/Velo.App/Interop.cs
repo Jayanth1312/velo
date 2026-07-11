@@ -98,8 +98,9 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_pane_resize(IntPtr eng, uint pane, uint w, uint h);
 
-    /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up.
-    /// button: 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
+    /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up,
+    /// 3=leave (pointer left the pane; x,y unused, pass 0,0). button:
+    /// 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
     /// Shift; shift forces local selection even when the app has enabled
     /// mouse reporting).
     [LibraryImport(Core)]
