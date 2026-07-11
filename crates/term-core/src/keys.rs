@@ -235,4 +235,21 @@ mod tests {
     fn sgr_mouse_wheel_down() {
         assert_eq!(sgr_mouse_seq(65, 3, 4, true), b"\x1b[<65;3;4M".to_vec());
     }
+
+    #[test]
+    fn ctrl_delete_kills_word_sequence() {
+        assert_eq!(key_seq(VK_DELETE, true, false, false, false).unwrap(), b"\x1b[3;5~");
+    }
+
+    #[test]
+    fn ctrl_home_end() {
+        assert_eq!(key_seq(VK_HOME, true, false, false, false).unwrap(), b"\x1b[1;5H");
+        assert_eq!(key_seq(VK_END, true, false, false, false).unwrap(), b"\x1b[1;5F");
+    }
+
+    #[test]
+    fn alt_arrows() {
+        assert_eq!(key_seq(VK_LEFT, false, false, true, false).unwrap(), b"\x1b[1;3D");
+        assert_eq!(key_seq(VK_RIGHT, false, false, true, false).unwrap(), b"\x1b[1;3C");
+    }
 }

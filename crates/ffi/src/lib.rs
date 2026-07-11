@@ -1337,6 +1337,19 @@ mod imp {
                 }
                 return;
             }
+            if cu == 0x7f {
+                // Ctrl+Backspace arrives as the DEL char; send ^W so the shell
+                // kills the previous word (PSReadLine, bash, zsh all bind it).
+                if let Some(s) = self.active_session() {
+                    s.terminal.scroll_to_bottom();
+                    let w = s.pty.writer();
+                    if alt {
+                        let _ = w.write_all(b"\x1b");
+                    }
+                    let _ = w.write_all(b"\x17");
+                }
+                return;
+            }
             let units: Vec<u16> = match self.pending_high.take() {
                 Some(hi) => vec![hi, cu],
                 None => {
