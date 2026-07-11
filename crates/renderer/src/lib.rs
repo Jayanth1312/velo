@@ -1,8 +1,8 @@
 //! renderer: wgpu glyph atlas + instanced-quad pipeline.
 //!
 //! The whole visible grid is drawn in a single draw call: every cell owns a
-//! fixed run of [`SLOTS_PER_CELL`] instances (fill, glyph, decoration) in a
-//! persistent instance buffer. Each frame only the *damaged rows* are rebuilt
+//! fixed run of [`SLOTS_PER_CELL`] instances (fill, glyph, underline,
+//! strikeout) in a persistent instance buffer. Each frame only the *damaged rows* are rebuilt
 //! and re-uploaded (`queue.write_buffer` on contiguous sub-ranges); unchanged
 //! rows keep their GPU bytes. Glyphs are rasterized on demand into an RGBA atlas
 //! (mask glyphs stored as white + coverage-in-alpha, color/emoji as straight
@@ -16,8 +16,9 @@ use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell, UnderlineK
 
 const ATLAS_SIZE: u32 = 2048;
 /// Instances per cell: 0 = background/selection/cursor-block fill, 1 = glyph,
-/// 2 = decoration (text underline, or bar/underline cursor).
-const SLOTS_PER_CELL: usize = 3;
+/// 2 = underline, 3 = strikeout (also where the bar/underline cursor overlay
+/// is drawn, so it doesn't collide with the text underline).
+const SLOTS_PER_CELL: usize = 4;
 /// Number of sub-pixel x bins (matches cosmic-text's `SubpixelBin`).
 const SUBPX_BINS: u32 = 4;
 /// UV of the reserved opaque white texel at atlas (0,0); used for solid quads.
@@ -29,6 +30,10 @@ const WHITE_UV: [f32; 4] = {
 /// Instance kinds (the `kind` vertex attribute).
 const KIND_SOLID: u32 = 0; // solid/mask: tint by `color`, coverage from atlas alpha
 const KIND_COLOR: u32 = 1; // color glyph: use atlas rgba directly
+const KIND_DOUBLE: u32 = 2; // double underline: two lines split by a gap
+const KIND_CURLY: u32 = 3; // curly underline: sine-ish wave
+const KIND_DOTTED: u32 = 4; // dotted underline: on/off dots along x
+const KIND_DASHED: u32 = 5; // dashed underline: dashes along x
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,7 +44,8 @@ struct Instance {
     uv: [f32; 4],
     /// rgba, 0..1.
     color: [f32; 4],
-    /// `KIND_SOLID` or `KIND_COLOR`.
+    /// `KIND_SOLID`, `KIND_COLOR`, or a `KIND_DOUBLE`/`KIND_CURLY`/
+    /// `KIND_DOTTED`/`KIND_DASHED` procedural decoration pattern.
     kind: u32,
     _pad: [u32; 3],
 }
@@ -611,6 +617,21 @@ impl Renderer {
         }
     }
 
+    /// Quad whose pattern is drawn procedurally in the fragment shader
+    /// (`KIND_DOUBLE`/`KIND_CURLY`/`KIND_DOTTED`/`KIND_DASHED`). `uv` is
+    /// repurposed to carry the quad's pixel size — pattern kinds never sample
+    /// the atlas.
+    fn pattern(&self, x: f32, y: f32, w: f32, h: f32, color: [u8; 3], kind: u32) -> Instance {
+        let c = srgb(color);
+        Instance {
+            rect: [x, y, w, h],
+            uv: [w, h, 0.0, 0.0],
+            color: [c[0], c[1], c[2], 1.0],
+            kind,
+            _pad: [0; 3],
+        }
+    }
+
     /// Rebuild every slot of `row` from `cells` (just this row's slice, per
     /// `row_ranges`) and the cursor, if it sits on this row.
     fn rebuild_row(
@@ -663,13 +684,35 @@ impl Renderer {
                 }
             }
 
-            // Slot 2: text underline. TODO(task 4): render per-kind
-            // (single/double/curly/dotted/dashed); for now every non-None
-            // kind draws the same single-line rect, colored with SGR 58.
+            // Slot 2: underline (kind decides rect vs procedural pattern).
             if cell.underline != UnderlineKind::None {
                 let thick = (self.cell_h * 0.07).max(1.0);
                 let uy = y + self.ascent + (self.cell_h - self.ascent) * 0.4;
-                self.slots[base + 2] = self.solid(x, uy, self.cell_w, thick, cell.underline_color);
+                let uc = cell.underline_color;
+                self.slots[base + 2] = match cell.underline {
+                    UnderlineKind::Single => self.solid(x, uy, self.cell_w, thick, uc),
+                    UnderlineKind::Double => {
+                        // One quad tall enough for both lines; shader draws the split.
+                        self.pattern(x, uy - thick, self.cell_w, thick * 3.0, uc, KIND_DOUBLE)
+                    }
+                    UnderlineKind::Curly => {
+                        self.pattern(x, uy - thick, self.cell_w, thick * 3.0, uc, KIND_CURLY)
+                    }
+                    UnderlineKind::Dotted => {
+                        self.pattern(x, uy, self.cell_w, thick, uc, KIND_DOTTED)
+                    }
+                    UnderlineKind::Dashed => {
+                        self.pattern(x, uy, self.cell_w, thick, uc, KIND_DASHED)
+                    }
+                    UnderlineKind::None => unreachable!(),
+                };
+            }
+
+            // Slot 3: strikeout.
+            if cell.strike {
+                let thick = (self.cell_h * 0.07).max(1.0);
+                let sy = y + self.ascent * 0.65;
+                self.slots[base + 3] = self.solid(x, sy, self.cell_w, thick, cell.fg);
             }
         }
 
@@ -720,11 +763,11 @@ impl Renderer {
             }
             CursorShape::Bar => {
                 let w = (self.cell_w * 0.12).max(1.0);
-                self.slots[base + 2] = self.solid(x, y, w, self.cell_h, cursor_color);
+                self.slots[base + 3] = self.solid(x, y, w, self.cell_h, cursor_color);
             }
             CursorShape::Underline => {
                 let h = (self.cell_h * 0.12).max(2.0);
-                self.slots[base + 2] =
+                self.slots[base + 3] =
                     self.solid(x, y + self.cell_h - h, self.cell_w, h, cursor_color);
             }
             CursorShape::Hidden => {}
@@ -908,6 +951,11 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) kind: u32,
+    // Position within the quad in px (0..size), and the quad's px size.
+    // Only meaningful for kind >= 2 (procedural decoration patterns), which
+    // never sample the atlas.
+    @location(3) local: vec2<f32>,
+    @location(4) @interpolate(flat) size: vec2<f32>,
 };
 
 @vertex
@@ -935,6 +983,8 @@ fn vs_main(
     out.uv = mix(uvr.xy, uvr.zw, corner);
     out.color = color;
     out.kind = kind;
+    out.local = corner * rect.zw;
+    out.size = rect.zw;
     return out;
 }
 
@@ -949,6 +999,39 @@ fn s2l(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.kind >= 2u) {
+        // Procedural decoration patterns: no atlas sample, `in.local` is the
+        // px position within the quad and `in.size` its px extent.
+        if (in.kind == 2u) {
+            // Double underline: two lines (top third / bottom third), gap
+            // in the middle third.
+            let fy = in.local.y / in.size.y;
+            if (fy > 0.33 && fy < 0.67) {
+                discard;
+            }
+        } else if (in.kind == 3u) {
+            // Curly underline: distance to a sine wave, one period per ~4x
+            // the quad height, amplitude filling the quad.
+            let period = in.size.y * 4.0;
+            let mid = in.size.y * 0.5 * (1.0 + sin(in.local.x * 6.2832 / period));
+            if (abs(in.local.y - mid) > in.size.y * 0.25) {
+                discard;
+            }
+        } else if (in.kind == 4u) {
+            // Dotted underline: 50% duty, pitch ~2x the quad height.
+            let pitch = in.size.y * 2.0;
+            if (fract(in.local.x / pitch) > 0.5) {
+                discard;
+            }
+        } else if (in.kind == 5u) {
+            // Dashed underline: 2/3 duty, ~9px period.
+            if (fract(in.local.x / 9.0) > 0.667) {
+                discard;
+            }
+        }
+        let a = in.color.a;
+        return vec4<f32>(s2l(in.color.rgb) * a, a);
+    }
     let texel = textureSample(atlas, samp, in.uv);
     if (in.kind == 1u) {
         // Color glyph: straight RGBA from the atlas, decoded to linear.
@@ -960,6 +1043,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s2l(in.color.rgb) * a, a);
 }
 "#;
+
+#[cfg(test)]
+mod shader_tests {
+    use super::SHADER;
+
+    /// Parse + validate the inline WGSL with `naga` (wgpu's own frontend, via
+    /// its `pub use naga` re-export) so a syntax/type error is caught here
+    /// instead of only at pipeline-creation time on a machine with a GPU.
+    #[test]
+    fn shader_wgsl_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("WGSL parse");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        validator.validate(&module).expect("WGSL validate");
+    }
+}
 
 #[cfg(test)]
 mod row_ranges_tests {
