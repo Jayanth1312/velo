@@ -480,7 +480,10 @@ impl Terminal {
             let flags = cell.flags;
 
             // Skip the trailing spacer of a wide glyph; the wide cell overflows
-            // into it visually.
+            // into it visually. NB: the "gap after a pasted emoji" and the
+            // 3-backspace erase dance in PowerShell are PSReadLine/ConPTY redraw
+            // behavior over this 2-column layout (Windows Terminal shows the
+            // same); the grid here just reflects what ConPTY sends.
             if flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
@@ -630,6 +633,31 @@ mod tests {
         assert_eq!(emoji[0].col, 0);
         // The spacer cell (col 1) must not emit a glyph.
         assert!(!f.cells.iter().any(|c| c.col == 1 && c.c != '\0'));
+    }
+
+    #[test]
+    fn emoji_backspace_erase_sequence_clears_cleanly() {
+        // What a shell sends to erase a 2-col emoji: BS BS, two spaces, BS BS.
+        let mut t = term();
+        t.advance("😀".as_bytes());
+        t.advance(b"\x08\x08  \x08\x08");
+        let f = t.frame();
+        assert!(
+            !f.cells.iter().any(|c| c.c != '\0'),
+            "grid must be empty after erase, found {:?}",
+            f.cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replacement_char_renders_as_itself() {
+        // ConPTY hands us U+FFFD mid-edit on a half-erased surrogate pair.
+        // We render the grid faithfully (hiding data would be worse); this
+        // test pins that the char passes through rather than crashing/blanking.
+        let mut t = term();
+        t.advance("\u{FFFD}".to_string().as_bytes());
+        let f = t.frame();
+        assert!(f.cells.iter().any(|c| c.c == '\u{FFFD}'));
     }
 
     #[test]
