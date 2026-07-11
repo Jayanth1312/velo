@@ -734,6 +734,19 @@ mod imp {
         /// `font_pt` * `dpi_scale`, then recompute grids and reflow + repaint.
         fn rebuild_font(&mut self) {
             self.font.set_size(self.font_pt * self.dpi_scale);
+            self.apply_font();
+        }
+
+        /// Swap the primary font family (`None` = bundled default), then
+        /// rebuild renderers exactly like a size change does.
+        fn set_font_family(&mut self, family: Option<&str>) {
+            self.font = text::Font::with_family(self.font_pt * self.dpi_scale, family);
+            self.apply_font();
+        }
+
+        /// Push the current `self.font` metrics into every pane (clears glyph
+        /// atlases), recompute grids, reflow bound sessions, repaint.
+        fn apply_font(&mut self) {
             let dpi = self.dpi_scale;
             let (cell_w, cell_h, ascent) = (self.font.cell_w, self.font.cell_h, self.font.ascent);
             for i in 0..self.panes.len() {
@@ -2289,6 +2302,55 @@ mod imp {
     pub unsafe extern "C" fn velo_set_font_size(eng: *mut Engine, pt: f32) {
         if let Some(e) = eng.as_mut() {
             e.set_font_size(pt);
+        }
+    }
+
+    /// Set the terminal font family (rebuilds font + renderers, reflows).
+    /// `len == 0` (or null `ptr`) restores the bundled default font.
+    ///
+    /// # Safety
+    /// `eng` must be live; `ptr` must point to `len` valid UTF-16 code units
+    /// (or be null when `len` is 0).
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_font_family(eng: *mut Engine, ptr: *const u16, len: usize) {
+        let Some(e) = eng.as_mut() else { return };
+        if ptr.is_null() || len == 0 {
+            e.set_font_family(None);
+            return;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let name = String::from_utf16_lossy(slice);
+        e.set_font_family(Some(&name));
+    }
+
+    /// List every installed font family as one UTF-16 buffer, families joined
+    /// by '\n'. Writes the code-unit count to `out_len` and returns the buffer;
+    /// caller frees it with [`velo_free_utf16`]. Returns null on empty.
+    ///
+    /// # Safety
+    /// `out_len` must be a valid pointer.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_list_fonts(out_len: *mut usize) -> *mut u16 {
+        let joined = text::list_families().join("\n");
+        let utf16: Vec<u16> = joined.encode_utf16().collect();
+        if out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        *out_len = utf16.len();
+        if utf16.is_empty() {
+            return std::ptr::null_mut();
+        }
+        Box::into_raw(utf16.into_boxed_slice()) as *mut u16
+    }
+
+    /// Free a buffer returned by [`velo_list_fonts`].
+    ///
+    /// # Safety
+    /// `ptr`/`len` must be exactly what `velo_list_fonts` returned, freed once.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_free_utf16(ptr: *mut u16, len: usize) {
+        if !ptr.is_null() && len > 0 {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
         }
     }
 

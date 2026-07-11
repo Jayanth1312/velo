@@ -131,6 +131,17 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_set_shell(IntPtr eng, ushort* ptr, nuint len);
 
+    /// Terminal font family; len == 0 restores the bundled default.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_font_family(IntPtr eng, ushort* ptr, nuint len);
+
+    /// Installed font families, '\n'-joined UTF-16; free with velo_free_utf16.
+    [LibraryImport(Core)]
+    internal static partial ushort* velo_list_fonts(nuint* outLen);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_free_utf16(ushort* ptr, nuint len);
+
     [LibraryImport(Core)]
     internal static partial void velo_set_bg(IntPtr eng, byte r, byte g, byte b);
 

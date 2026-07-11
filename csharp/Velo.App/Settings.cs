@@ -8,6 +8,10 @@ namespace Velo.App;
 public sealed class Settings
 {
     public double FontSize { get; set; } = 13.0;
+    /// Terminal font family; "" = bundled Cascadia Code NF default.
+    public string FontFamily { get; set; } = "";
+    /// Also use FontFamily for the app chrome (tabs, dialogs), not just the grid.
+    public bool ApplyFontToApp { get; set; } = false;
     public string Shell { get; set; } = "powershell.exe";
     /// "#RRGGBB" terminal background (surface clear color / tint).
     public string BackgroundHex { get; set; } = "#1E1E1E";

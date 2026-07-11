@@ -3042,6 +3042,10 @@ public sealed partial class MainWindow : Window
 
     // ---- Settings ---------------------------------------------------------
 
+    /// Last font family pushed into the core ("" = bundled default, which the
+    /// engine starts with — so the startup ApplySettings skips the rebuild).
+    private string _appliedFontFamily = "";
+
     /// Push the current settings into the core + chrome. The titlebar background
     /// tracks the terminal background so they read as one blended surface.
     private void ApplySettings()
@@ -3049,6 +3053,21 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         Native.velo_set_font_size(_engine, (float)(_settings.FontSize * _zoom));
+        // Font family: pushing rebuilds the font + every atlas, so only on change.
+        if (_appliedFontFamily != _settings.FontFamily)
+        {
+            var fam = _settings.FontFamily ?? "";
+            unsafe
+            {
+                fixed (char* p = fam)
+                    Native.velo_set_font_family(_engine, (ushort*)p, (nuint)fam.Length);
+            }
+            _appliedFontFamily = _settings.FontFamily;
+        }
+        // Chrome font: inherited by everything under RootGrid.
+        RootGrid.FontFamily = _settings.ApplyFontToApp && !string.IsNullOrWhiteSpace(_settings.FontFamily)
+            ? new FontFamily(_settings.FontFamily)
+            : FontFamily.XamlAutoFontFamily;
         SetShell(_settings.Shell);
         PushPalette(Themes.ByName(_settings.ThemeName));
         var (r, g, b) = _settings.BackgroundRgb();
@@ -3149,8 +3168,23 @@ public sealed partial class MainWindow : Window
         PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
     }
 
+    /// Installed font families from the core's font db (sorted, deduped).
+    private static unsafe string[] ListInstalledFonts()
+    {
+        nuint len = 0;
+        ushort* p = Native.velo_list_fonts(&len);
+        if (p == null || len == 0)
+            return Array.Empty<string>();
+        var joined = new string((char*)p, 0, (int)len);
+        Native.velo_free_utf16(p, len);
+        return joined.Split('\n');
+    }
+
+    private const string DefaultFontLabel = "Default (Cascadia Code NF, bundled)";
+
     private async void Settings_Click(object sender, RoutedEventArgs e)
     {
+        // ---- Appearance page -------------------------------------------
         var fontBox = new NumberBox
         {
             Header = "Font size (pt)",
@@ -3159,15 +3193,48 @@ public sealed partial class MainWindow : Window
             Maximum = 72,
             SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
         };
-        var shellBox = new ComboBox
+
+        // Terminal font: search box + list of installed families, each row
+        // previewed in its own face (Windows-settings style).
+        string selectedFont = _settings.FontFamily ?? "";
+        var allFonts = ListInstalledFonts();
+        var fontSearch = new TextBox { PlaceholderText = "Search fonts" };
+        var fontList = new ListView
         {
-            Header = "Shell",
-            IsEditable = true,
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            Text = _settings.Shell,
+            Height = 200,
+            SelectionMode = ListViewSelectionMode.Single,
         };
-        foreach (var s in new[] { "powershell.exe", "pwsh.exe", "cmd.exe", "wsl.exe" })
-            shellBox.Items.Add(s);
+        void FillFonts()
+        {
+            var filter = fontSearch.Text?.Trim() ?? "";
+            var items = new List<TextBlock>();
+            if (filter.Length == 0
+                || DefaultFontLabel.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                items.Add(new TextBlock { Text = DefaultFontLabel, Tag = "" });
+            foreach (var f in allFonts)
+                if (filter.Length == 0 || f.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                    items.Add(new TextBlock { Text = f, Tag = f, FontFamily = new FontFamily(f) });
+            fontList.ItemsSource = items;
+            fontList.SelectedItem = items.FirstOrDefault(t => (string)t.Tag == selectedFont);
+        }
+        fontSearch.TextChanged += (_, _) => FillFonts();
+        fontList.SelectionChanged += (_, _) =>
+        {
+            if (fontList.SelectedItem is TextBlock tb)
+                selectedFont = (string)tb.Tag;
+        };
+        FillFonts();
+
+        var applyAppBox = new CheckBox
+        {
+            Content = "Apply this font to the entire app",
+            IsChecked = _settings.ApplyFontToApp,
+        };
+
+        var backdropBox = new ComboBox { Header = "Backdrop", HorizontalAlignment = HorizontalAlignment.Stretch };
+        foreach (var s in new[] { "Mica", "MicaAlt", "Acrylic", "None" })
+            backdropBox.Items.Add(s);
+        backdropBox.SelectedItem = _settings.Backdrop;
 
         var bgBox = new TextBox { Header = "Terminal background / tint (#RRGGBB)", Text = _settings.BackgroundHex };
 
@@ -3180,18 +3247,16 @@ public sealed partial class MainWindow : Window
             StepFrequency = 5,
         };
 
-        var backdropBox = new ComboBox { Header = "Backdrop", HorizontalAlignment = HorizontalAlignment.Stretch };
-        foreach (var s in new[] { "Mica", "MicaAlt", "Acrylic", "None" })
-            backdropBox.Items.Add(s);
-        backdropBox.SelectedItem = _settings.Backdrop;
-
-        var panel = new StackPanel { Spacing = 12, MinWidth = 320 };
-        panel.Children.Add(fontBox);
-        panel.Children.Add(shellBox);
-        panel.Children.Add(bgBox);
-        panel.Children.Add(opacityBox);
-        panel.Children.Add(backdropBox);
-        panel.Children.Add(new TextBlock
+        var appearance = new StackPanel { Spacing = 12 };
+        appearance.Children.Add(fontBox);
+        appearance.Children.Add(new TextBlock { Text = "Terminal font" });
+        appearance.Children.Add(fontSearch);
+        appearance.Children.Add(fontList);
+        appearance.Children.Add(applyAppBox);
+        appearance.Children.Add(backdropBox);
+        appearance.Children.Add(bgBox);
+        appearance.Children.Add(opacityBox);
+        appearance.Children.Add(new TextBlock
         {
             Text = "Lower the terminal opacity to let the backdrop blur show "
                  + "through the terminal (0 = full blur, 100 = solid).",
@@ -3200,15 +3265,70 @@ public sealed partial class MainWindow : Window
             FontSize = 12,
         });
 
+        // ---- Terminal page ----------------------------------------------
+        var shellBox = new ComboBox
+        {
+            Header = "Shell",
+            IsEditable = true,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Text = _settings.Shell,
+        };
+        foreach (var s in new[] { "powershell.exe", "pwsh.exe", "cmd.exe", "wsl.exe" })
+            shellBox.Items.Add(s);
+
+        var shellIntBox = new ToggleSwitch
+        {
+            Header = "Shell integration (cwd + per-command tracking)",
+            IsOn = _settings.ShellIntegration,
+        };
+
+        var terminal = new StackPanel { Spacing = 12 };
+        terminal.Children.Add(shellBox);
+        terminal.Children.Add(shellIntBox);
+        terminal.Children.Add(new TextBlock
+        {
+            Text = "Shell integration injects OSC 7/133 markers into the shell "
+                 + "profile on startup. Changes apply to new tabs.",
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.6,
+            FontSize = 12,
+        });
+
+        // ---- Sidebar + content ------------------------------------------
+        var content = new ScrollViewer
+        {
+            Content = appearance,
+            Height = 460,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Padding = new Thickness(0, 0, 12, 0),
+        };
+        var nav = new ListView { SelectionMode = ListViewSelectionMode.Single, Width = 150 };
+        nav.Items.Add("Appearance");
+        nav.Items.Add("Terminal");
+        nav.SelectedIndex = 0;
+        nav.SelectionChanged += (_, _) =>
+            content.Content = nav.SelectedIndex == 1 ? (UIElement)terminal : appearance;
+
+        var root = new Grid { ColumnSpacing = 16, MinWidth = 560 };
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        Grid.SetColumn(nav, 0);
+        root.Children.Add(nav);
+        Grid.SetColumn(content, 1);
+        root.Children.Add(content);
+
         var dialog = new ContentDialog
         {
             Title = "Settings",
-            Content = panel,
+            Content = root,
             PrimaryButtonText = "Save",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = Content.XamlRoot,
         };
+        // Default ContentDialog caps content at ~548px; the two-pane layout
+        // needs more room.
+        dialog.Resources["ContentDialogMaxWidth"] = 720.0;
 
         if (await dialog.ShowAsync() != ContentDialogResult.Primary)
         {
@@ -3217,7 +3337,10 @@ public sealed partial class MainWindow : Window
         }
 
         _settings.FontSize = double.IsNaN(fontBox.Value) ? _settings.FontSize : fontBox.Value;
+        _settings.FontFamily = selectedFont;
+        _settings.ApplyFontToApp = applyAppBox.IsChecked == true;
         _settings.Shell = string.IsNullOrWhiteSpace(shellBox.Text) ? _settings.Shell : shellBox.Text;
+        _settings.ShellIntegration = shellIntBox.IsOn;
         _settings.BackgroundHex = bgBox.Text;
         _settings.BackgroundOpacity = opacityBox.Value / 100.0;
         _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;

@@ -101,8 +101,30 @@ pub struct Raster {
     pub color: bool,
 }
 
+/// Every installed font family, sorted, deduped. Scans the full system font
+/// set (one-off cost; only called when the settings UI needs the list).
+pub fn list_families() -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    let mut names: Vec<String> = db
+        .faces()
+        .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 impl Font {
     pub fn new(font_size: f32) -> Self {
+        Self::with_family(font_size, None)
+    }
+
+    /// Like [`Font::new`], but shape with a user-chosen installed family.
+    /// `requested = None` (or an unknown name) keeps the bundled Nerd Font;
+    /// a matching system family becomes the primary face, with the bundled
+    /// NF + curated faces still in the db as the fallback chain.
+    pub fn with_family(font_size: f32, requested: Option<&str>) -> Self {
         let mut db = fontdb::Database::new();
         // Bundled Nerd Font first: covers Latin + icon glyphs out of the box.
         db.load_font_data(BUNDLED_NF.to_vec());
@@ -133,8 +155,19 @@ impl Font {
         }
         // Backstop: with no primary or no curated fallback, scan all system
         // fonts so any codepoint can still find a face.
-        if family.is_none() || !have_fallback {
+        if family.is_none() || !have_fallback || requested.is_some() {
             db.load_system_fonts();
+        }
+        // A requested system family overrides the bundled primary when it
+        // exists in the db (case-insensitive); otherwise keep the bundled NF.
+        if let Some(req) = requested {
+            let hit = db
+                .faces()
+                .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+                .find(|name| name.eq_ignore_ascii_case(req));
+            if hit.is_some() {
+                family = hit;
+            }
         }
         if let Some(name) = &family {
             db.set_monospace_family(name.clone());
@@ -316,6 +349,23 @@ mod tests {
         assert_eq!(font.cell_w, fresh.cell_w);
         assert_eq!(font.cell_h, fresh.cell_h);
         assert_eq!(font.ascent, fresh.ascent);
+    }
+
+    #[test]
+    fn with_family_unknown_falls_back_to_bundled() {
+        let a = Font::new(16.0);
+        let b = Font::with_family(16.0, Some("No Such Font Family 123"));
+        assert_eq!(a.family, b.family, "unknown family keeps bundled primary");
+        assert_eq!(a.cell_w, b.cell_w);
+        assert_eq!(a.cell_h, b.cell_h);
+    }
+
+    #[test]
+    fn list_families_sorted_and_deduped() {
+        let names = list_families();
+        for w in names.windows(2) {
+            assert!(w[0] < w[1], "sorted + deduped: {:?} !< {:?}", w[0], w[1]);
+        }
     }
 
     #[test]
