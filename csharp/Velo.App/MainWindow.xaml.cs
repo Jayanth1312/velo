@@ -3303,19 +3303,30 @@ public sealed partial class MainWindow : Window
         catch (Exception ex) { Log.Write($"SetPaneCursor failed: {ex.Message}"); }
     }
 
-    /// Open a link target reported by the core. URLs go to the default browser;
-    /// paths are converted from a possible WSL form and revealed in Explorer
-    /// (reusing InfoReveal_Click's ToWindowsPath helper).
+    /// Open a link target reported by the core. http/https URLs go to the
+    /// default browser; everything else (bare paths, and `file://` URIs with
+    /// their scheme stripped) is a path — never handed to ShellExecute
+    /// directly, since a malicious `file://…/evil.exe` OSC 8 hyperlink must
+    /// not be able to execute on click. Paths are converted from a possible
+    /// WSL form and revealed in Explorer (reusing InfoReveal_Click's
+    /// ToWindowsPath helper).
     private void OpenLink(string target)
     {
         try
         {
             if (target.StartsWith("http://", StringComparison.Ordinal)
-                || target.StartsWith("https://", StringComparison.Ordinal)
-                || target.StartsWith("file://", StringComparison.Ordinal))
+                || target.StartsWith("https://", StringComparison.Ordinal))
             {
                 Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
                 return;
+            }
+            if (target.StartsWith("file://", StringComparison.Ordinal))
+            {
+                // Uri.LocalPath percent-decodes and handles UNC (file://host/share/x)
+                // as well as local (file:///mnt/d/x) forms.
+                if (!Uri.TryCreate(target, UriKind.Absolute, out var uri))
+                    return;
+                target = uri.LocalPath;
             }
             var win = ToWindowsPath(target);
             if (win is null)

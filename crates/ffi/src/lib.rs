@@ -1458,7 +1458,11 @@ mod imp {
 
             match kind {
                 0 => {
-                    self.press_pos = Some((x, y));
+                    // Only track left-button presses for click-to-open-link;
+                    // right/middle release must not open a link.
+                    if button == 0 {
+                        self.press_pos = Some((x, y));
+                    }
                     let (c, r, l) = self.pixel_to_cell(x, y, cols, rows);
                     if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
                         s.terminal.start_selection(c, r, l);
