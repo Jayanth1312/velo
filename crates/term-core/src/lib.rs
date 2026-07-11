@@ -15,7 +15,10 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape as AnsiCursorShape, Processor};
 
 pub mod keys;
+mod links;
 pub mod palette;
+
+pub use links::{Link, link_in_row};
 
 /// Grid dimensions passed to alacritty's `Term`. `TermSize` lives in a test-only
 /// submodule upstream, so we supply our own `Dimensions` impl. Scrollback
@@ -586,6 +589,58 @@ impl Terminal {
             scrolled_up,
         }
     }
+
+    /// Link under (col, row) in the visible viewport: an OSC 8 hyperlink on the
+    /// cell if the app set one, else a heuristic scan of the row's text.
+    pub fn link_at(&self, col: u16, row: u16) -> Option<Link> {
+        let cols = self.term.columns() as u16;
+        let rows = self.term.screen_lines() as u16;
+        if col >= cols || row >= rows {
+            return None;
+        }
+
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+
+        // Rebuild the row's text (char-per-column, same iteration as `frame()`)
+        // alongside each column's hyperlink, so a click can resolve either an
+        // OSC 8 link or fall back to a heuristic scan of the plain text.
+        let mut text = String::new();
+        let mut hyperlinks: Vec<Option<alacritty_terminal::term::cell::Hyperlink>> = Vec::new();
+        for indexed in content.display_iter {
+            let line = indexed.point.line.0 + display_offset as i32;
+            if line != row as i32 {
+                continue;
+            }
+            let cell = indexed.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                text.push(' ');
+                hyperlinks.push(None);
+                continue;
+            }
+            text.push(cell.c);
+            hyperlinks.push(cell.hyperlink());
+        }
+
+        if let Some(hl) = hyperlinks.get(col as usize).and_then(|h| h.clone()) {
+            let idx = col as usize;
+            let mut start = idx;
+            while start > 0 && hyperlinks[start - 1].as_ref() == Some(&hl) {
+                start -= 1;
+            }
+            let mut end = idx;
+            while end + 1 < hyperlinks.len() && hyperlinks[end + 1].as_ref() == Some(&hl) {
+                end += 1;
+            }
+            return Some(Link {
+                col_start: start as u16,
+                col_end: end as u16,
+                target: hl.uri().to_string(),
+            });
+        }
+
+        link_in_row(&text, col)
+    }
 }
 
 /// What changed since the previous [`Frame`], for incremental GPU upload.
@@ -1007,5 +1062,22 @@ mod tests {
 
         t.advance(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l");
         assert_eq!(t.mouse_mode(), MouseMode::default(), "all DECSET bits reset");
+    }
+
+    #[test]
+    fn osc8_hyperlink_wins() {
+        // default term() is 4x2 — too narrow; use a wider one
+        let mut t = Terminal::new(40, 4, Arc::new(|_: &[u8]| {}));
+        t.advance(b"\x1b]8;;https://osc8.example\x1b\\click\x1b]8;;\x1b\\");
+        let l = t.link_at(2, 0).expect("osc8 link");
+        assert_eq!(l.target, "https://osc8.example");
+    }
+
+    #[test]
+    fn link_at_scans_row_text() {
+        let mut t = Terminal::new(40, 4, Arc::new(|_: &[u8]| {}));
+        t.advance(b"see https://example.com");
+        assert_eq!(t.link_at(8, 0).unwrap().target, "https://example.com");
+        assert!(t.link_at(1, 0).is_none());
     }
 }

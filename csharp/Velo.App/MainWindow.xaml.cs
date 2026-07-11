@@ -3236,6 +3236,8 @@ public sealed partial class MainWindow : Window
         OnCommand = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, int, ulong, ushort*, nuint, void>)&OnCommand,
         OnAnim = (IntPtr)(delegate* unmanaged<IntPtr, void>)&OnAnim,
         OnEditorDirty = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, void>)&OnEditorDirty,
+        OnLinkHover = (IntPtr)(delegate* unmanaged<IntPtr, byte, void>)&OnLinkHover,
+        OnOpenLink = (IntPtr)(delegate* unmanaged<IntPtr, ushort*, nuint, void>)&OnOpenLink,
     };
 
     private static MainWindow? FromCtx(IntPtr ctx)
@@ -3254,6 +3256,65 @@ public sealed partial class MainWindow : Window
         // Fired on the UI thread (subclass proc) whenever a render leaves a
         // scroll glide in flight; StartAnimPump is idempotent.
         FromCtx(ctx)?.StartAnimPump();
+    }
+
+    [UnmanagedCallersOnly]
+    private static void OnLinkHover(IntPtr ctx, byte over)
+    {
+        var w = FromCtx(ctx);
+        w?.DispatcherQueue.TryEnqueue(() => w.SetPaneCursor(over != 0));
+    }
+
+    [UnmanagedCallersOnly]
+    private static unsafe void OnOpenLink(IntPtr ctx, ushort* text, nuint len)
+    {
+        string target = new string((char*)text, 0, (int)len);
+        var w = FromCtx(ctx);
+        w?.DispatcherQueue.TryEnqueue(() => w.OpenLink(target));
+    }
+
+    /// Reflection workaround: `UIElement.ProtectedCursor` is `protected`, so an
+    /// arbitrary element outside a UIElement subclass can't set it directly —
+    /// there is no public WinUI 3 API for per-element pointer cursors.
+    private static readonly System.Reflection.PropertyInfo? s_protectedCursorProp =
+        typeof(UIElement).GetProperty("ProtectedCursor", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+    /// Set the hand/I-beam cursor over the pane area (PaneHost is the actual
+    /// pointer hit-test target; the SwapChainPanels themselves are not
+    /// hit-test-visible, see PaneHost_PointerMoved).
+    private void SetPaneCursor(bool hand)
+    {
+        try
+        {
+            var cursor = InputSystemCursor.Create(hand ? InputSystemCursorShape.Hand : InputSystemCursorShape.IBeam);
+            s_protectedCursorProp?.SetValue(PaneHost, cursor);
+        }
+        catch (Exception ex) { Log.Write($"SetPaneCursor failed: {ex.Message}"); }
+    }
+
+    /// Open a link target reported by the core. URLs go to the default browser;
+    /// paths are converted from a possible WSL form and revealed in Explorer
+    /// (reusing InfoReveal_Click's ToWindowsPath helper).
+    private void OpenLink(string target)
+    {
+        try
+        {
+            if (target.StartsWith("http://", StringComparison.Ordinal)
+                || target.StartsWith("https://", StringComparison.Ordinal)
+                || target.StartsWith("file://", StringComparison.Ordinal))
+            {
+                Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                return;
+            }
+            var win = ToWindowsPath(target);
+            if (win is null)
+                return;
+            if (Directory.Exists(win))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{win}\"") { UseShellExecute = true });
+            else if (File.Exists(win))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{win}\"") { UseShellExecute = true });
+        }
+        catch (Exception ex) { Log.Write($"open link failed: {ex.Message}"); }
     }
 
     private bool _animPumping;

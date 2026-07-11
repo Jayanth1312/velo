@@ -126,6 +126,10 @@ mod imp {
         pub on_anim: Option<extern "C" fn(*mut c_void)>,
         /// (ctx, file_id, dirty) — an editor buffer's dirty state flipped.
         pub on_editor_dirty: Option<extern "C" fn(*mut c_void, u32, u8)>,
+        /// (ctx, over) — pointer is hovering a link (1) or left it (0); host sets the cursor.
+        pub on_link_hover: Option<extern "C" fn(*mut c_void, u8)>,
+        /// (ctx, utf16_ptr, utf16_len) — open a link target. URLs -> browser, paths -> reveal.
+        pub on_open_link: Option<extern "C" fn(*mut c_void, *const u16, usize)>,
     }
 
     impl Default for VeloCallbacks {
@@ -142,6 +146,8 @@ mod imp {
                 on_command: None,
                 on_anim: None,
                 on_editor_dirty: None,
+                on_link_hover: None,
+                on_open_link: None,
             }
         }
     }
@@ -372,6 +378,11 @@ mod imp {
         swallow_next_char: bool,
         /// Buffered lone high surrogate awaiting its low surrogate.
         pending_high: Option<u16>,
+
+        /// Pointer-press origin (physical px) for click-vs-drag discrimination.
+        press_pos: Option<(f32, f32)>,
+        /// Whether the pointer is currently over a link (dedupes hover callbacks).
+        link_hover: bool,
 
         cb: VeloCallbacks,
     }
@@ -1434,6 +1445,7 @@ mod imp {
 
             match kind {
                 0 => {
+                    self.press_pos = Some((x, y));
                     let (c, r, l) = self.pixel_to_cell(x, y, cols, rows);
                     if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
                         s.terminal.start_selection(c, r, l);
@@ -1448,9 +1460,41 @@ mod imp {
                             s.terminal.update_selection(c, r, l);
                         }
                         self.render_pane(idx);
+                    } else {
+                        let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                        let over = self
+                            .sessions
+                            .get(sid)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|s| s.terminal.link_at(c, r))
+                            .is_some();
+                        if over != self.link_hover {
+                            self.link_hover = over;
+                            if let Some(f) = self.cb.on_link_hover {
+                                f(self.cb.ctx, over as u8);
+                            }
+                        }
                     }
                 }
                 _ => {
+                    let clicked = self.press_pos.take().is_some_and(|(px, py)| {
+                        (px - x).abs() < 4.0 && (py - y).abs() < 4.0
+                    });
+                    if clicked {
+                        let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                        if let Some(link) = self
+                            .sessions
+                            .get(sid)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|s| s.terminal.link_at(c, r))
+                        {
+                            if let Some(f) = self.cb.on_open_link {
+                                let w: Vec<u16> = link.target.encode_utf16().collect();
+                                f(self.cb.ctx, w.as_ptr(), w.len());
+                            }
+                        }
+                    }
+                    self.press_pos = None;
                     self.mouse_down = false;
                 }
             }
@@ -1767,6 +1811,8 @@ mod imp {
             sgr_gesture: false,
             swallow_next_char: false,
             pending_high: None,
+            press_pos: None,
+            link_hover: false,
             cb: VeloCallbacks::default(),
         });
 

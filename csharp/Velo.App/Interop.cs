@@ -29,6 +29,8 @@ internal static unsafe partial class Native
         public IntPtr OnCommand;          // (ctx, id, phase, exit, dur_ms, utf16*, len)
         public IntPtr OnAnim;             // (ctx) — start driving velo_tick
         public IntPtr OnEditorDirty;      // (ctx, file_id, dirty)
+        public IntPtr OnLinkHover;        // (ctx, over) — 1 = hovering a link, 0 = left it
+        public IntPtr OnOpenLink;         // (ctx, utf16*, len) — open a link target
     }
 
     /// Init GPU + composition swapchain + the core's internal wakeup window.
