@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell};
+use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell, UnderlineKind};
 
 const ATLAS_SIZE: u32 = 2048;
 /// Instances per cell: 0 = background/selection/cursor-block fill, 1 = glyph,
@@ -663,11 +663,13 @@ impl Renderer {
                 }
             }
 
-            // Slot 2: text underline.
-            if cell.underline {
+            // Slot 2: text underline. TODO(task 4): render per-kind
+            // (single/double/curly/dotted/dashed); for now every non-None
+            // kind draws the same single-line rect, colored with SGR 58.
+            if cell.underline != UnderlineKind::None {
                 let thick = (self.cell_h * 0.07).max(1.0);
                 let uy = y + self.ascent + (self.cell_h - self.ascent) * 0.4;
-                self.slots[base + 2] = self.solid(x, uy, self.cell_w, thick, cell.fg);
+                self.slots[base + 2] = self.solid(x, uy, self.cell_w, thick, cell.underline_color);
             }
         }
 
@@ -972,7 +974,9 @@ mod row_ranges_tests {
             bg: [0, 0, 0],
             bold: false,
             italic: false,
-            underline: false,
+            underline: UnderlineKind::None,
+            underline_color: [0, 0, 0],
+            strike: false,
             selected: false,
         }
     }

@@ -5,7 +5,7 @@
 //! demand it.
 
 use crate::Document;
-use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell};
+use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell, UnderlineKind};
 
 pub const TAB_WIDTH: usize = 4;
 
@@ -129,7 +129,9 @@ impl View {
                     bg: palette::DEFAULT_BG,
                     bold: false,
                     italic: false,
-                    underline: false,
+                    underline: UnderlineKind::None,
+                    underline_color: gutter_fg,
+                    strike: false,
                     selected: false,
                 });
             }
@@ -170,7 +172,9 @@ impl View {
                         bg: palette::DEFAULT_BG,
                         bold: false,
                         italic: false,
-                        underline: false,
+                        underline: UnderlineKind::None,
+                        underline_color: color,
+                        strike: false,
                         selected,
                     });
                 }

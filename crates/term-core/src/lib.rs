@@ -490,7 +490,20 @@ impl Terminal {
 
             let bold = flags.intersects(Flags::BOLD | Flags::BOLD_ITALIC);
             let italic = flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC);
-            let underline = flags.intersects(Flags::UNDERLINE | Flags::DOUBLE_UNDERLINE);
+            let underline = if flags.contains(Flags::UNDERCURL) {
+                UnderlineKind::Curly
+            } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                UnderlineKind::Dotted
+            } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                UnderlineKind::Dashed
+            } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                UnderlineKind::Double
+            } else if flags.contains(Flags::UNDERLINE) {
+                UnderlineKind::Single
+            } else {
+                UnderlineKind::None
+            };
+            let strike = flags.contains(Flags::STRIKEOUT);
 
             // Bold brightens named foreground colors.
             let mut fg_color = cell.fg;
@@ -504,14 +517,24 @@ impl Terminal {
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+                fg = fg.map(|c| (c as u16 * 2 / 3) as u8);
+            }
+            let underline_color = cell.underline_color().map(palette::resolve).unwrap_or(fg);
 
             let selected = selection.is_some_and(|r| r.contains(indexed.point));
             let hidden = flags.contains(Flags::HIDDEN);
             let glyph = if cell.c == ' ' || hidden { '\0' } else { cell.c };
 
             // Keep a cell only if it draws something: a glyph, a non-default
-            // background, or a selection highlight.
-            if glyph == '\0' && bg == palette::DEFAULT_BG && !selected {
+            // background, a selection highlight, or a decoration (underline
+            // or strikeout) on an otherwise-blank cell.
+            if glyph == '\0'
+                && bg == palette::DEFAULT_BG
+                && !selected
+                && underline == UnderlineKind::None
+                && !strike
+            {
                 continue;
             }
             cells.push(RenderCell {
@@ -523,6 +546,8 @@ impl Terminal {
                 bold,
                 italic,
                 underline,
+                underline_color,
+                strike,
                 selected,
             });
         }
@@ -588,6 +613,19 @@ pub struct Frame {
     pub scrolled_up: i32,
 }
 
+/// Underline style, as distinguished by SGR 4 (with the `:n` subparameter)
+/// and SGR 21.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UnderlineKind {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 #[derive(Clone, Copy)]
 pub struct RenderCell {
     pub col: u16,
@@ -598,7 +636,10 @@ pub struct RenderCell {
     pub bg: [u8; 3],
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: UnderlineKind,
+    /// SGR 58 underline color; defaults to `fg` when unset.
+    pub underline_color: [u8; 3],
+    pub strike: bool,
     pub selected: bool,
 }
 
@@ -748,7 +789,71 @@ mod tests {
         t.advance(b"\x1b[1;3;4mZ");
         let f = t.frame();
         let cell = f.cells.iter().find(|c| c.c == 'Z').expect("Z present");
-        assert!(cell.bold && cell.italic && cell.underline);
+        assert!(cell.bold && cell.italic && cell.underline == UnderlineKind::Single);
+    }
+
+    #[test]
+    fn underline_kinds_from_sgr() {
+        let cases: [(&[u8], UnderlineKind); 5] = [
+            (b"\x1b[4mU", UnderlineKind::Single),
+            // Double underline is SGR 4:2 in this vte version (0.15.0);
+            // SGR 21 maps to Attr::CancelBold here, not DoubleUnderline.
+            (b"\x1b[4:2mU", UnderlineKind::Double),
+            (b"\x1b[4:3mU", UnderlineKind::Curly),
+            (b"\x1b[4:4mU", UnderlineKind::Dotted),
+            (b"\x1b[4:5mU", UnderlineKind::Dashed),
+        ];
+        for (seq, kind) in cases {
+            let mut t = term();
+            t.advance(seq);
+            let f = t.frame();
+            let c = f.cells.iter().find(|c| c.c == 'U').unwrap();
+            assert_eq!(c.underline, kind, "seq {:?}", std::str::from_utf8(seq));
+        }
+    }
+
+    #[test]
+    fn underline_color_sgr58() {
+        let mut t = term();
+        t.advance(b"\x1b[4m\x1b[58;2;10;20;30mU");
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == 'U').unwrap();
+        assert_eq!(c.underline_color, [10, 20, 30]);
+    }
+
+    #[test]
+    fn underline_color_defaults_to_fg() {
+        let mut t = term();
+        t.advance(b"\x1b[38;2;1;2;3m\x1b[4mU");
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == 'U').unwrap();
+        assert_eq!(c.underline_color, [1, 2, 3]);
+    }
+
+    #[test]
+    fn strikeout_flag() {
+        let mut t = term();
+        t.advance(b"\x1b[9mS");
+        let f = t.frame();
+        assert!(f.cells.iter().find(|c| c.c == 'S').unwrap().strike);
+    }
+
+    #[test]
+    fn dim_darkens_fg() {
+        let mut t = term();
+        t.advance(b"\x1b[2m\x1b[38;2;90;90;90mD");
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == 'D').unwrap();
+        assert_eq!(c.fg, [60, 60, 60]); // 2/3 of 90
+    }
+
+    #[test]
+    fn styled_space_still_emits_decoration_cell() {
+        // A space with underline/strike draws something: must not be culled.
+        let mut t = term();
+        t.advance(b"\x1b[4m \x1b[0m");
+        let f = t.frame();
+        assert!(f.cells.iter().any(|c| c.col == 0 && c.underline == UnderlineKind::Single));
     }
 
     #[test]
