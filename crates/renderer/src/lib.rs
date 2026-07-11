@@ -65,22 +65,27 @@ struct Glyph {
 /// Glyph cache key: char + bold + italic + sub-pixel x bin.
 type GlyphKey = (char, bool, bool, u8);
 
-/// Smooth-scroll easing state: a pixel displacement applied to the whole grid
-/// in the vertex shader, decaying exponentially to 0. Content that jumped N
-/// rows starts drawn N*cell_h px from its final position and glides in.
+/// Smooth-scroll easing: a pixel displacement applied to the whole grid in the
+/// vertex shader, eased to 0 with a fixed-duration cubic-out. Fixed duration
+/// (not decay) so every wheel notch settles at the same perceived speed;
+/// each bump restarts the clock from the new displacement.
 #[derive(Default)]
 pub struct ScrollAnim {
     /// Current visual y displacement in px (positive = grid drawn lower).
     pub px: f32,
+    /// Displacement when the current ease started.
+    start_px: f32,
+    /// Elapsed ms since the current ease started.
+    t_ms: f32,
 }
 
 /// Extra slot rows kept above AND below the viewport. On a scroll bump the
 /// departing edge rows shift into overscan and stay visible during the glide,
-/// so no blank gap opens at the top/bottom. Also the displacement cap: a
-/// glide never shows content the overscan doesn't hold.
-pub const OVERSCAN_ROWS: u16 = 8;
-/// Exponential decay time constant (ms); ~4*tau ≈ 260ms to visually settle.
-const SCROLL_TAU_MS: f32 = 65.0;
+/// so no blank gap opens at the top/bottom. Displacement cap: bumps beyond this
+/// snap via scroll_bump, now rare.
+pub const OVERSCAN_ROWS: u16 = 24;
+/// Glide duration per bump (ms).
+const SCROLL_DUR_MS: f32 = 140.0;
 
 /// Shift slot rows vertically by `rows_up` (positive = content moved up),
 /// patching each instance's y so it keeps its on-screen position; vacated
@@ -115,17 +120,19 @@ fn shift_slot_rows(slots: &mut [Instance], row_slots: usize, rows_up: i32, cell_
 }
 
 impl ScrollAnim {
-    /// Content moved `rows_up` rows up (negative = down) on a grid with
-    /// `cell_h`-px rows: displace so it starts where it was and eases home.
-    /// `max_px` bounds the displacement (viewport-aware, caller-supplied).
     pub fn bump(&mut self, rows_up: i32, cell_h: f32, max_px: f32) {
         self.px = (self.px + rows_up as f32 * cell_h).clamp(-max_px, max_px);
+        self.start_px = self.px;
+        self.t_ms = 0.0;
     }
 
     /// Advance by `dt_ms`. Returns true while still moving.
     pub fn tick(&mut self, dt_ms: f32) -> bool {
-        self.px *= (-dt_ms.max(0.0) / SCROLL_TAU_MS).exp();
-        if self.px.abs() < 0.5 {
+        self.t_ms += dt_ms.max(0.0);
+        let t = (self.t_ms / SCROLL_DUR_MS).min(1.0);
+        let ease = 1.0 - (1.0 - t).powi(3); // cubic-out
+        self.px = self.start_px * (1.0 - ease);
+        if t >= 1.0 || self.px.abs() < 0.5 {
             self.px = 0.0;
         }
         self.px != 0.0
@@ -1106,5 +1113,48 @@ mod scroll_anim_tests {
             assert!(a.px < prev && a.px >= 0.0);
             prev = a.px;
         }
+    }
+
+    #[test]
+    fn glide_settles_in_fixed_duration() {
+        let mut a = ScrollAnim::default();
+        a.bump(4, 20.0, 480.0); // 80 px displacement
+        let mut t = 0.0;
+        while a.tick(16.0) {
+            t += 16.0;
+            assert!(t < 200.0, "glide must settle within ~140ms, still moving at {t}ms");
+        }
+        assert_eq!(a.px, 0.0);
+    }
+
+    #[test]
+    fn glide_speed_decreases_monotonically() {
+        // cubic-out: displacement magnitude strictly decreases each tick
+        let mut a = ScrollAnim::default();
+        a.bump(4, 20.0, 480.0);
+        let mut prev = a.px.abs();
+        while a.tick(16.0) {
+            assert!(a.px.abs() < prev, "|px| must shrink every tick");
+            prev = a.px.abs();
+        }
+    }
+
+    #[test]
+    fn rebump_restarts_clock() {
+        let mut a = ScrollAnim::default();
+        a.bump(4, 20.0, 480.0);
+        for _ in 0..6 { a.tick(16.0); } // ~96ms in
+        a.bump(4, 20.0, 480.0); // new notch mid-glide
+        // Must take close to a full duration again, not settle in the remaining ~44ms
+        let mut t = 0.0;
+        while a.tick(16.0) { t += 16.0; }
+        assert!(t > 100.0, "re-bump must restart the ease, settled after only {t}ms");
+    }
+
+    #[test]
+    fn bump_clamps_to_max() {
+        let mut a = ScrollAnim::default();
+        a.bump(100, 20.0, 480.0);
+        assert_eq!(a.px, 480.0);
     }
 }
