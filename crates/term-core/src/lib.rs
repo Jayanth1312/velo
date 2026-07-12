@@ -15,7 +15,10 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape as AnsiCursorShape, Processor};
 
 pub mod keys;
+mod links;
 pub mod palette;
+
+pub use links::{Link, link_in_row};
 
 /// Grid dimensions passed to alacritty's `Term`. `TermSize` lives in a test-only
 /// submodule upstream, so we supply our own `Dimensions` impl. Scrollback
@@ -480,14 +483,30 @@ impl Terminal {
             let flags = cell.flags;
 
             // Skip the trailing spacer of a wide glyph; the wide cell overflows
-            // into it visually.
+            // into it visually. NB: the "gap after a pasted emoji" and the
+            // 3-backspace erase dance in PowerShell are PSReadLine/ConPTY redraw
+            // behavior over this 2-column layout (Windows Terminal shows the
+            // same); the grid here just reflects what ConPTY sends.
             if flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
 
             let bold = flags.intersects(Flags::BOLD | Flags::BOLD_ITALIC);
             let italic = flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC);
-            let underline = flags.intersects(Flags::UNDERLINE | Flags::DOUBLE_UNDERLINE);
+            let underline = if flags.contains(Flags::UNDERCURL) {
+                UnderlineKind::Curly
+            } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                UnderlineKind::Dotted
+            } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                UnderlineKind::Dashed
+            } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                UnderlineKind::Double
+            } else if flags.contains(Flags::UNDERLINE) {
+                UnderlineKind::Single
+            } else {
+                UnderlineKind::None
+            };
+            let strike = flags.contains(Flags::STRIKEOUT);
 
             // Bold brightens named foreground colors.
             let mut fg_color = cell.fg;
@@ -501,25 +520,46 @@ impl Terminal {
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+                fg = fg.map(|c| (c as u16 * 2 / 3) as u8);
+            }
+            let underline_color = cell.underline_color().map(palette::resolve).unwrap_or(fg);
 
             let selected = selection.is_some_and(|r| r.contains(indexed.point));
             let hidden = flags.contains(Flags::HIDDEN);
             let glyph = if cell.c == ' ' || hidden { '\0' } else { cell.c };
+            // Zero-width attachments (combining marks, VS15/16); two slots
+            // cover the realistic cases without heap-allocating per cell.
+            let mut zw = ['\0'; 2];
+            if let Some(z) = cell.zerowidth() {
+                for (i, ch) in z.iter().take(2).enumerate() {
+                    zw[i] = *ch;
+                }
+            }
 
             // Keep a cell only if it draws something: a glyph, a non-default
-            // background, or a selection highlight.
-            if glyph == '\0' && bg == palette::DEFAULT_BG && !selected {
+            // background, a selection highlight, or a decoration (underline
+            // or strikeout) on an otherwise-blank cell.
+            if glyph == '\0'
+                && bg == palette::DEFAULT_BG
+                && !selected
+                && underline == UnderlineKind::None
+                && !strike
+            {
                 continue;
             }
             cells.push(RenderCell {
                 col,
                 row,
                 c: glyph,
+                zw,
                 fg,
                 bg,
                 bold,
                 italic,
                 underline,
+                underline_color,
+                strike,
                 selected,
             });
         }
@@ -558,6 +598,64 @@ impl Terminal {
             scrolled_up,
         }
     }
+
+    /// Link under (col, row) in the visible viewport: an OSC 8 hyperlink on the
+    /// cell if the app set one, else a heuristic scan of the row's text.
+    pub fn link_at(&self, col: u16, row: u16) -> Option<Link> {
+        let cols = self.term.columns() as u16;
+        let rows = self.term.screen_lines() as u16;
+        if col >= cols || row >= rows {
+            return None;
+        }
+
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+
+        // Rebuild the row's text (char-per-column, same iteration as `frame()`)
+        // alongside each column's hyperlink, so a click can resolve either an
+        // OSC 8 link or fall back to a heuristic scan of the plain text.
+        let mut text = String::with_capacity(cols as usize);
+        let mut hyperlinks: Vec<Option<alacritty_terminal::term::cell::Hyperlink>> =
+            Vec::with_capacity(cols as usize);
+        // `display_iter` is line-ordered, so skip rows before the target and
+        // stop as soon as we pass it instead of scanning the whole viewport.
+        for indexed in content.display_iter {
+            let line = indexed.point.line.0 + display_offset as i32;
+            if line < row as i32 {
+                continue;
+            }
+            if line > row as i32 {
+                break;
+            }
+            let cell = indexed.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                text.push(' ');
+                hyperlinks.push(None);
+                continue;
+            }
+            text.push(cell.c);
+            hyperlinks.push(cell.hyperlink());
+        }
+
+        if let Some(hl) = hyperlinks.get(col as usize).and_then(|h| h.clone()) {
+            let idx = col as usize;
+            let mut start = idx;
+            while start > 0 && hyperlinks[start - 1].as_ref() == Some(&hl) {
+                start -= 1;
+            }
+            let mut end = idx;
+            while end + 1 < hyperlinks.len() && hyperlinks[end + 1].as_ref() == Some(&hl) {
+                end += 1;
+            }
+            return Some(Link {
+                col_start: start as u16,
+                col_end: end as u16,
+                target: hl.uri().to_string(),
+            });
+        }
+
+        link_in_row(&text, col)
+    }
 }
 
 /// What changed since the previous [`Frame`], for incremental GPU upload.
@@ -585,17 +683,37 @@ pub struct Frame {
     pub scrolled_up: i32,
 }
 
+/// Underline style, as distinguished by SGR 4 (with the `:n` subparameter)
+/// and SGR 21.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UnderlineKind {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 #[derive(Clone, Copy)]
 pub struct RenderCell {
     pub col: u16,
     pub row: u16,
     /// `'\0'` means a background-only cell (no glyph).
     pub c: char,
+    /// Zero-width chars attached to this cell (combining marks, VS15/16
+    /// variation selectors); `'\0'` = unused slot. Shaped together with `c`
+    /// as one grapheme cluster.
+    pub zw: [char; 2],
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: UnderlineKind,
+    /// SGR 58 underline color; defaults to `fg` when unset.
+    pub underline_color: [u8; 3],
+    pub strike: bool,
     pub selected: bool,
 }
 
@@ -630,6 +748,42 @@ mod tests {
         assert_eq!(emoji[0].col, 0);
         // The spacer cell (col 1) must not emit a glyph.
         assert!(!f.cells.iter().any(|c| c.col == 1 && c.c != '\0'));
+    }
+
+    #[test]
+    fn emoji_backspace_erase_sequence_clears_cleanly() {
+        // What a shell sends to erase a 2-col emoji: BS BS, two spaces, BS BS.
+        let mut t = term();
+        t.advance("😀".as_bytes());
+        t.advance(b"\x08\x08  \x08\x08");
+        let f = t.frame();
+        assert!(
+            !f.cells.iter().any(|c| c.c != '\0'),
+            "grid must be empty after erase, found {:?}",
+            f.cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replacement_char_renders_as_itself() {
+        // ConPTY hands us U+FFFD mid-edit on a half-erased surrogate pair.
+        // We render the grid faithfully (hiding data would be worse); this
+        // test pins that the char passes through rather than crashing/blanking.
+        let mut t = term();
+        t.advance("\u{FFFD}".to_string().as_bytes());
+        let f = t.frame();
+        assert!(f.cells.iter().any(|c| c.c == '\u{FFFD}'));
+    }
+
+    #[test]
+    fn variation_selector_attaches_to_cell() {
+        // ▶ + VS16 must reach the renderer as one cluster so it can pick the
+        // emoji presentation.
+        let mut t = term();
+        t.advance("▶\u{FE0F}".as_bytes());
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == '▶').expect("base char present");
+        assert_eq!(c.zw[0], '\u{FE0F}', "VS16 must ride the cell as zerowidth");
     }
 
     #[test]
@@ -720,7 +874,71 @@ mod tests {
         t.advance(b"\x1b[1;3;4mZ");
         let f = t.frame();
         let cell = f.cells.iter().find(|c| c.c == 'Z').expect("Z present");
-        assert!(cell.bold && cell.italic && cell.underline);
+        assert!(cell.bold && cell.italic && cell.underline == UnderlineKind::Single);
+    }
+
+    #[test]
+    fn underline_kinds_from_sgr() {
+        let cases: [(&[u8], UnderlineKind); 5] = [
+            (b"\x1b[4mU", UnderlineKind::Single),
+            // Double underline is SGR 4:2 in this vte version (0.15.0);
+            // SGR 21 maps to Attr::CancelBold here, not DoubleUnderline.
+            (b"\x1b[4:2mU", UnderlineKind::Double),
+            (b"\x1b[4:3mU", UnderlineKind::Curly),
+            (b"\x1b[4:4mU", UnderlineKind::Dotted),
+            (b"\x1b[4:5mU", UnderlineKind::Dashed),
+        ];
+        for (seq, kind) in cases {
+            let mut t = term();
+            t.advance(seq);
+            let f = t.frame();
+            let c = f.cells.iter().find(|c| c.c == 'U').unwrap();
+            assert_eq!(c.underline, kind, "seq {:?}", std::str::from_utf8(seq));
+        }
+    }
+
+    #[test]
+    fn underline_color_sgr58() {
+        let mut t = term();
+        t.advance(b"\x1b[4m\x1b[58;2;10;20;30mU");
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == 'U').unwrap();
+        assert_eq!(c.underline_color, [10, 20, 30]);
+    }
+
+    #[test]
+    fn underline_color_defaults_to_fg() {
+        let mut t = term();
+        t.advance(b"\x1b[38;2;1;2;3m\x1b[4mU");
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == 'U').unwrap();
+        assert_eq!(c.underline_color, [1, 2, 3]);
+    }
+
+    #[test]
+    fn strikeout_flag() {
+        let mut t = term();
+        t.advance(b"\x1b[9mS");
+        let f = t.frame();
+        assert!(f.cells.iter().find(|c| c.c == 'S').unwrap().strike);
+    }
+
+    #[test]
+    fn dim_darkens_fg() {
+        let mut t = term();
+        t.advance(b"\x1b[2m\x1b[38;2;90;90;90mD");
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == 'D').unwrap();
+        assert_eq!(c.fg, [60, 60, 60]); // 2/3 of 90
+    }
+
+    #[test]
+    fn styled_space_still_emits_decoration_cell() {
+        // A space with underline/strike draws something: must not be culled.
+        let mut t = term();
+        t.advance(b"\x1b[4m \x1b[0m");
+        let f = t.frame();
+        assert!(f.cells.iter().any(|c| c.col == 0 && c.underline == UnderlineKind::Single));
     }
 
     #[test]
@@ -874,5 +1092,22 @@ mod tests {
 
         t.advance(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l");
         assert_eq!(t.mouse_mode(), MouseMode::default(), "all DECSET bits reset");
+    }
+
+    #[test]
+    fn osc8_hyperlink_wins() {
+        // default term() is 4x2 — too narrow; use a wider one
+        let mut t = Terminal::new(40, 4, Arc::new(|_: &[u8]| {}));
+        t.advance(b"\x1b]8;;https://osc8.example\x1b\\click\x1b]8;;\x1b\\");
+        let l = t.link_at(2, 0).expect("osc8 link");
+        assert_eq!(l.target, "https://osc8.example");
+    }
+
+    #[test]
+    fn link_at_scans_row_text() {
+        let mut t = Terminal::new(40, 4, Arc::new(|_: &[u8]| {}));
+        t.advance(b"see https://example.com");
+        assert_eq!(t.link_at(8, 0).unwrap().target, "https://example.com");
+        assert!(t.link_at(1, 0).is_none());
     }
 }

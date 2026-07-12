@@ -8,6 +8,10 @@ namespace Velo.App;
 public sealed class Settings
 {
     public double FontSize { get; set; } = 13.0;
+    /// Terminal font family; "" = bundled Cascadia Code NF default.
+    public string FontFamily { get; set; } = "";
+    /// Also use FontFamily for the app chrome (tabs, dialogs), not just the grid.
+    public bool ApplyFontToApp { get; set; } = false;
     public string Shell { get; set; } = "powershell.exe";
     /// "#RRGGBB" terminal background (surface clear color / tint).
     public string BackgroundHex { get; set; } = "#1E1E1E";
@@ -16,6 +20,12 @@ public sealed class Settings
     public double BackgroundOpacity { get; set; } = 1.0;
     /// One of: Mica, MicaAlt, Acrylic, None.
     public string Backdrop { get; set; } = "Mica";
+    /// Programming ligatures (=> != ->) in the terminal grid.
+    public bool Ligatures { get; set; } = true;
+    /// Cursor shape: Default (shell-controlled via DECSCUSR), Block, Bar, Underline.
+    public string CursorStyle { get; set; } = "Default";
+    /// Blink the terminal cursor.
+    public bool CursorBlink { get; set; } = false;
     /// Active color theme name (see Themes.All). Drives the ANSI palette + the
     /// terminal/chrome background.
     public string ThemeName { get; set; } = "Velo Dark";

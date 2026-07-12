@@ -65,8 +65,8 @@ mod imp {
         DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassW, HMENU,
-        HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, KillTimer, PostMessageW, RegisterClassW,
+        SetTimer, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_TIMER, WNDCLASSW,
     };
 
     use super::{FONT_SIZE_PT, PAD_LOGICAL_PX};
@@ -77,6 +77,10 @@ mod imp {
     const WM_APP: u32 = 0x8000;
     const MSG_PTY_DATA: u32 = WM_APP + 1;
     const MSG_PTY_EOF: u32 = WM_APP + 2;
+    /// Win32 timer id on the wakeup window driving cursor blink.
+    const BLINK_TIMER_ID: usize = 0xB111;
+    /// Blink half-period (ms); matches the Windows default caret rate.
+    const BLINK_MS: u32 = 530;
 
     /// Subclass id for the wakeup-window hook (any stable per-proc constant).
     const SUBCLASS_ID: usize = 1;
@@ -126,6 +130,10 @@ mod imp {
         pub on_anim: Option<extern "C" fn(*mut c_void)>,
         /// (ctx, file_id, dirty) — an editor buffer's dirty state flipped.
         pub on_editor_dirty: Option<extern "C" fn(*mut c_void, u32, u8)>,
+        /// (ctx, over) — pointer is hovering a link (1) or left it (0); host sets the cursor.
+        pub on_link_hover: Option<extern "C" fn(*mut c_void, u8)>,
+        /// (ctx, utf16_ptr, utf16_len) — open a link target. URLs -> browser, paths -> reveal.
+        pub on_open_link: Option<extern "C" fn(*mut c_void, *const u16, usize)>,
     }
 
     impl Default for VeloCallbacks {
@@ -142,6 +150,8 @@ mod imp {
                 on_command: None,
                 on_anim: None,
                 on_editor_dirty: None,
+                on_link_hover: None,
+                on_open_link: None,
             }
         }
     }
@@ -341,6 +351,14 @@ mod imp {
         bg: [u8; 3],
         /// Terminal background alpha (0 = transparent → blur-through, 1 = opaque).
         bg_a: f32,
+        /// Ligature run shaping (applies to every pane; new panes inherit it).
+        ligatures: bool,
+        /// Cursor shape override (`None` = follow the shell / DECSCUSR).
+        cursor_style: Option<term_core::CursorShape>,
+        /// Blink the cursor (Win32 timer on the wakeup window).
+        cursor_blink: bool,
+        /// Current blink phase (true = cursor visible).
+        blink_on: bool,
 
         // Panes keyed by stable id (index); `None` = freed slot so ids stay stable.
         // Pane 0 is the primary surface created at `velo_attach`.
@@ -372,6 +390,11 @@ mod imp {
         swallow_next_char: bool,
         /// Buffered lone high surrogate awaiting its low surrogate.
         pending_high: Option<u16>,
+
+        /// Pointer-press origin (physical px) for click-vs-drag discrimination.
+        press_pos: Option<(f32, f32)>,
+        /// Whether the pointer is currently over a link (dedupes hover callbacks).
+        link_hover: bool,
 
         cb: VeloCallbacks,
     }
@@ -575,6 +598,18 @@ mod imp {
                     }
                 }
             };
+            // User cursor override + blink phase (terminal panes only; the
+            // editor draws its own caret).
+            if matches!(kind, PaneKind::Terminal)
+                && frame.cursor_shape != term_core::CursorShape::Hidden
+            {
+                if let Some(s) = self.cursor_style {
+                    frame.cursor_shape = s;
+                }
+                if self.cursor_blink && !self.blink_on {
+                    frame.cursor_shape = term_core::CursorShape::Hidden;
+                }
+            }
             // Disjoint field borrows: `self.panes` (mut) vs `self.device`,
             // `self.queue`, `self.font` (the renderer draw args).
             let Some(Some(pane)) = self.panes.get_mut(idx) else {
@@ -723,6 +758,19 @@ mod imp {
         /// `font_pt` * `dpi_scale`, then recompute grids and reflow + repaint.
         fn rebuild_font(&mut self) {
             self.font.set_size(self.font_pt * self.dpi_scale);
+            self.apply_font();
+        }
+
+        /// Swap the primary font family (`None` = bundled default), then
+        /// rebuild renderers exactly like a size change does.
+        fn set_font_family(&mut self, family: Option<&str>) {
+            self.font = text::Font::with_family(self.font_pt * self.dpi_scale, family);
+            self.apply_font();
+        }
+
+        /// Push the current `self.font` metrics into every pane (clears glyph
+        /// atlases), recompute grids, reflow bound sessions, repaint.
+        fn apply_font(&mut self) {
             let dpi = self.dpi_scale;
             let (cell_w, cell_h, ascent) = (self.font.cell_w, self.font.cell_h, self.font.ascent);
             for i in 0..self.panes.len() {
@@ -758,6 +806,46 @@ mod imp {
                 self.font_pt = pt;
                 self.rebuild_font();
             }
+        }
+
+        /// Cursor style override (0 = follow the shell / DECSCUSR, 1 = block,
+        /// 2 = bar, 3 = underline) + blink. Blink runs a Win32 timer on the
+        /// wakeup window; each tick flips the phase and repaints.
+        fn set_cursor(&mut self, style: u8, blink: bool) {
+            self.cursor_style = match style {
+                1 => Some(term_core::CursorShape::Block),
+                2 => Some(term_core::CursorShape::Bar),
+                3 => Some(term_core::CursorShape::Underline),
+                _ => None,
+            };
+            if blink != self.cursor_blink {
+                self.cursor_blink = blink;
+                self.blink_on = true;
+                unsafe {
+                    if blink {
+                        SetTimer(Some(self.wakeup_hwnd), BLINK_TIMER_ID, BLINK_MS, None);
+                    } else {
+                        let _ = KillTimer(Some(self.wakeup_hwnd), BLINK_TIMER_ID);
+                    }
+                }
+            }
+            for p in self.panes.iter_mut().flatten() {
+                p.force_full = true;
+            }
+            self.render_all();
+        }
+
+        /// Toggle ligature run shaping on every pane (new panes inherit it).
+        fn set_ligatures(&mut self, on: bool) {
+            if self.ligatures == on {
+                return;
+            }
+            self.ligatures = on;
+            for p in self.panes.iter_mut().flatten() {
+                p.renderer.set_ligatures(on);
+                p.force_full = true;
+            }
+            self.render_all();
         }
 
         /// Set the terminal background (surface clear) color on every pane.
@@ -805,7 +893,8 @@ mod imp {
         fn add_pane(&mut self, kind: PaneKind) -> Result<(usize, *mut c_void)> {
             let swapchain = unsafe { create_comp_swapchain(&self.queue)? };
             let raw = swapchain.as_raw();
-            let renderer = build_renderer(&self.device, &self.queue, &self.font, self.bg, self.bg_a);
+            let mut renderer = build_renderer(&self.device, &self.queue, &self.font, self.bg, self.bg_a);
+            renderer.set_ligatures(self.ligatures);
             let pane = Pane {
                 kind,
                 swapchain,
@@ -1326,6 +1415,19 @@ mod imp {
                 }
                 return;
             }
+            if cu == 0x7f {
+                // Ctrl+Backspace arrives as the DEL char; send ^W so the shell
+                // kills the previous word (PSReadLine, bash, zsh all bind it).
+                if let Some(s) = self.active_session() {
+                    s.terminal.scroll_to_bottom();
+                    let w = s.pty.writer();
+                    if alt {
+                        let _ = w.write_all(b"\x1b");
+                    }
+                    let _ = w.write_all(b"\x17");
+                }
+                return;
+            }
             let units: Vec<u16> = match self.pending_high.take() {
                 Some(hi) => vec![hi, cu],
                 None => {
@@ -1434,6 +1536,11 @@ mod imp {
 
             match kind {
                 0 => {
+                    // Only track left-button presses for click-to-open-link;
+                    // right/middle release must not open a link.
+                    if button == 0 {
+                        self.press_pos = Some((x, y));
+                    }
                     let (c, r, l) = self.pixel_to_cell(x, y, cols, rows);
                     if let Some(s) = self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
                         s.terminal.start_selection(c, r, l);
@@ -1448,9 +1555,52 @@ mod imp {
                             s.terminal.update_selection(c, r, l);
                         }
                         self.render_pane(idx);
+                    } else {
+                        let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                        let over = self
+                            .sessions
+                            .get(sid)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|s| s.terminal.link_at(c, r))
+                            .is_some();
+                        if over != self.link_hover {
+                            self.link_hover = over;
+                            if let Some(f) = self.cb.on_link_hover {
+                                f(self.cb.ctx, over as u8);
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    // Pointer left the pane: drop any pending click and stop
+                    // reporting a hover, but leave selection state untouched.
+                    self.press_pos = None;
+                    if self.link_hover {
+                        self.link_hover = false;
+                        if let Some(f) = self.cb.on_link_hover {
+                            f(self.cb.ctx, 0);
+                        }
                     }
                 }
                 _ => {
+                    let clicked = self.press_pos.take().is_some_and(|(px, py)| {
+                        (px - x).abs() < 4.0 && (py - y).abs() < 4.0
+                    });
+                    if clicked {
+                        let (c, r, _) = self.pixel_to_cell(x, y, cols, rows);
+                        if let Some(link) = self
+                            .sessions
+                            .get(sid)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|s| s.terminal.link_at(c, r))
+                        {
+                            if let Some(f) = self.cb.on_open_link {
+                                let w: Vec<u16> = link.target.encode_utf16().collect();
+                                f(self.cb.ctx, w.as_ptr(), w.len());
+                            }
+                        }
+                    }
+                    self.press_pos = None;
                     self.mouse_down = false;
                 }
             }
@@ -1596,6 +1746,16 @@ mod imp {
         match msg {
             MSG_PTY_DATA => {
                 eng.on_pty_data(wparam.0);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
+                // ponytail: full repaint per blink tick; damage just the cursor
+                // row if this ever shows up in profiles.
+                eng.blink_on = !eng.blink_on;
+                for p in eng.panes.iter_mut().flatten() {
+                    p.force_full = true;
+                }
+                eng.render_all();
                 LRESULT(0)
             }
             MSG_PTY_EOF => {
@@ -1755,6 +1915,10 @@ mod imp {
             shell: "powershell.exe".to_string(),
             bg,
             bg_a,
+            ligatures: true,
+            cursor_style: None,
+            cursor_blink: false,
+            blink_on: true,
             panes: vec![Some(pane0)],
             focused_pane: 0,
             sessions: Vec::new(),
@@ -1767,6 +1931,8 @@ mod imp {
             sgr_gesture: false,
             swallow_next_char: false,
             pending_high: None,
+            press_pos: None,
+            link_hover: false,
             cb: VeloCallbacks::default(),
         });
 
@@ -1844,10 +2010,12 @@ mod imp {
     }
 
     /// Forward a pointer event to the focused pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside the panel. `button` is 0 left,
-    /// 1 middle, 2 right. `mods` is the same live bitset as `velo_key`
-    /// (bit1 = Shift; shift overrides app mouse reporting to force local
-    /// text selection).
+    /// 2 = up, 3 = leave (pointer left the pane; clears any pending click and
+    /// stale link hover, but does not touch selection state). `(x, y)` are
+    /// physical px inside the panel (ignored for `kind == 3`; pass 0, 0).
+    /// `button` is 0 left, 1 middle, 2 right. `mods` is the same live bitset
+    /// as `velo_key` (bit1 = Shift; shift overrides app mouse reporting to
+    /// force local text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
@@ -1958,10 +2126,12 @@ mod imp {
     }
 
     /// Forward a pointer event to a specific pane. `kind`: 0 = down, 1 = move,
-    /// 2 = up. `(x, y)` are physical px inside that pane. `button` is 0 left,
-    /// 1 middle, 2 right. `mods` is the same live bitset as `velo_key`
-    /// (bit1 = Shift; shift overrides app mouse reporting to force local
-    /// text selection).
+    /// 2 = up, 3 = leave (pointer left the pane; clears any pending click and
+    /// stale link hover, but does not touch selection state). `(x, y)` are
+    /// physical px inside that pane (ignored for `kind == 3`; pass 0, 0).
+    /// `button` is 0 left, 1 middle, 2 right. `mods` is the same live bitset
+    /// as `velo_key` (bit1 = Shift; shift overrides app mouse reporting to
+    /// force local text selection).
     ///
     /// # Safety
     /// `eng` must be a live handle from `velo_attach`.
@@ -2211,6 +2381,78 @@ mod imp {
     pub unsafe extern "C" fn velo_set_font_size(eng: *mut Engine, pt: f32) {
         if let Some(e) = eng.as_mut() {
             e.set_font_size(pt);
+        }
+    }
+
+    /// Cursor style override (0 = shell default, 1 = block, 2 = bar,
+    /// 3 = underline) + blink (nonzero = on). Forces a redraw.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_cursor(eng: *mut Engine, style: u8, blink: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.set_cursor(style, blink != 0);
+        }
+    }
+
+    /// Toggle ligature run shaping (0 = off, nonzero = on). Forces a redraw.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_ligatures(eng: *mut Engine, on: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.set_ligatures(on != 0);
+        }
+    }
+
+    /// Set the terminal font family (rebuilds font + renderers, reflows).
+    /// `len == 0` (or null `ptr`) restores the bundled default font.
+    ///
+    /// # Safety
+    /// `eng` must be live; `ptr` must point to `len` valid UTF-16 code units
+    /// (or be null when `len` is 0).
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_font_family(eng: *mut Engine, ptr: *const u16, len: usize) {
+        let Some(e) = eng.as_mut() else { return };
+        if ptr.is_null() || len == 0 {
+            e.set_font_family(None);
+            return;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let name = String::from_utf16_lossy(slice);
+        e.set_font_family(Some(&name));
+    }
+
+    /// List every installed font family as one UTF-16 buffer, families joined
+    /// by '\n'. Writes the code-unit count to `out_len` and returns the buffer;
+    /// caller frees it with [`velo_free_utf16`]. Returns null on empty.
+    ///
+    /// # Safety
+    /// `out_len` must be a valid pointer.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_list_fonts(out_len: *mut usize) -> *mut u16 {
+        let joined = text::list_families().join("\n");
+        let utf16: Vec<u16> = joined.encode_utf16().collect();
+        if out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        *out_len = utf16.len();
+        if utf16.is_empty() {
+            return std::ptr::null_mut();
+        }
+        Box::into_raw(utf16.into_boxed_slice()) as *mut u16
+    }
+
+    /// Free a buffer returned by [`velo_list_fonts`].
+    ///
+    /// # Safety
+    /// `ptr`/`len` must be exactly what `velo_list_fonts` returned, freed once.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_free_utf16(ptr: *mut u16, len: usize) {
+        if !ptr.is_null() && len > 0 {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
         }
     }
 

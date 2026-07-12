@@ -1,8 +1,8 @@
 //! renderer: wgpu glyph atlas + instanced-quad pipeline.
 //!
 //! The whole visible grid is drawn in a single draw call: every cell owns a
-//! fixed run of [`SLOTS_PER_CELL`] instances (fill, glyph, decoration) in a
-//! persistent instance buffer. Each frame only the *damaged rows* are rebuilt
+//! fixed run of [`SLOTS_PER_CELL`] instances (fill, glyph, underline,
+//! strikeout) in a persistent instance buffer. Each frame only the *damaged rows* are rebuilt
 //! and re-uploaded (`queue.write_buffer` on contiguous sub-ranges); unchanged
 //! rows keep their GPU bytes. Glyphs are rasterized on demand into an RGBA atlas
 //! (mask glyphs stored as white + coverage-in-alpha, color/emoji as straight
@@ -12,12 +12,13 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell};
+use term_core::{palette, CursorShape, Frame, FrameDamage, RenderCell, UnderlineKind};
 
 const ATLAS_SIZE: u32 = 2048;
 /// Instances per cell: 0 = background/selection/cursor-block fill, 1 = glyph,
-/// 2 = decoration (text underline, or bar/underline cursor).
-const SLOTS_PER_CELL: usize = 3;
+/// 2 = underline, 3 = strikeout (also where the bar/underline cursor overlay
+/// is drawn, so it doesn't collide with the text underline).
+const SLOTS_PER_CELL: usize = 4;
 /// Number of sub-pixel x bins (matches cosmic-text's `SubpixelBin`).
 const SUBPX_BINS: u32 = 4;
 /// UV of the reserved opaque white texel at atlas (0,0); used for solid quads.
@@ -29,6 +30,10 @@ const WHITE_UV: [f32; 4] = {
 /// Instance kinds (the `kind` vertex attribute).
 const KIND_SOLID: u32 = 0; // solid/mask: tint by `color`, coverage from atlas alpha
 const KIND_COLOR: u32 = 1; // color glyph: use atlas rgba directly
+const KIND_DOUBLE: u32 = 2; // double underline: two lines split by a gap
+const KIND_CURLY: u32 = 3; // curly underline: sine-ish wave
+const KIND_DOTTED: u32 = 4; // dotted underline: on/off dots along x
+const KIND_DASHED: u32 = 5; // dashed underline: dashes along x
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,7 +44,8 @@ struct Instance {
     uv: [f32; 4],
     /// rgba, 0..1.
     color: [f32; 4],
-    /// `KIND_SOLID` or `KIND_COLOR`.
+    /// `KIND_SOLID`, `KIND_COLOR`, or a `KIND_DOUBLE`/`KIND_CURLY`/
+    /// `KIND_DOTTED`/`KIND_DASHED` procedural decoration pattern.
     kind: u32,
     _pad: [u32; 3],
 }
@@ -62,25 +68,57 @@ struct Glyph {
     color: bool,
 }
 
-/// Glyph cache key: char + bold + italic + sub-pixel x bin.
-type GlyphKey = (char, bool, bool, u8);
+/// Glyph cache key: base char + zero-width attachments + bold + italic +
+/// sub-pixel x bin.
+type GlyphKey = (char, [char; 2], bool, bool, u8);
 
-/// Smooth-scroll easing state: a pixel displacement applied to the whole grid
-/// in the vertex shader, decaying exponentially to 0. Content that jumped N
-/// rows starts drawn N*cell_h px from its final position and glides in.
+/// Symbol chars eligible for ligature run shaping. Letters/digits stay
+/// per-cell (Otty-style: ligatures fire only on symbol runs).
+fn is_lig_char(c: char) -> bool {
+    matches!(
+        c,
+        '=' | '<'
+            | '>'
+            | '!'
+            | '&'
+            | '|'
+            | '+'
+            | '-'
+            | '~'
+            | '^'
+            | '?'
+            | ':'
+            | '/'
+            | '\\'
+            | '*'
+            | '%'
+            | '#'
+            | '.'
+            | '_'
+    )
+}
+
+/// Smooth-scroll easing: a pixel displacement applied to the whole grid in the
+/// vertex shader, eased to 0 with a fixed-duration cubic-out. Fixed duration
+/// (not decay) so every wheel notch settles at the same perceived speed;
+/// each bump restarts the clock from the new displacement.
 #[derive(Default)]
 pub struct ScrollAnim {
     /// Current visual y displacement in px (positive = grid drawn lower).
     pub px: f32,
+    /// Displacement when the current ease started.
+    start_px: f32,
+    /// Elapsed ms since the current ease started.
+    t_ms: f32,
 }
 
 /// Extra slot rows kept above AND below the viewport. On a scroll bump the
 /// departing edge rows shift into overscan and stay visible during the glide,
-/// so no blank gap opens at the top/bottom. Also the displacement cap: a
-/// glide never shows content the overscan doesn't hold.
-pub const OVERSCAN_ROWS: u16 = 8;
-/// Exponential decay time constant (ms); ~4*tau ≈ 260ms to visually settle.
-const SCROLL_TAU_MS: f32 = 65.0;
+/// so no blank gap opens at the top/bottom. Displacement cap: bumps beyond this
+/// snap via scroll_bump, now rare.
+pub const OVERSCAN_ROWS: u16 = 24;
+/// Glide duration per bump (ms).
+const SCROLL_DUR_MS: f32 = 140.0;
 
 /// Shift slot rows vertically by `rows_up` (positive = content moved up),
 /// patching each instance's y so it keeps its on-screen position; vacated
@@ -115,17 +153,19 @@ fn shift_slot_rows(slots: &mut [Instance], row_slots: usize, rows_up: i32, cell_
 }
 
 impl ScrollAnim {
-    /// Content moved `rows_up` rows up (negative = down) on a grid with
-    /// `cell_h`-px rows: displace so it starts where it was and eases home.
-    /// `max_px` bounds the displacement (viewport-aware, caller-supplied).
     pub fn bump(&mut self, rows_up: i32, cell_h: f32, max_px: f32) {
         self.px = (self.px + rows_up as f32 * cell_h).clamp(-max_px, max_px);
+        self.start_px = self.px;
+        self.t_ms = 0.0;
     }
 
     /// Advance by `dt_ms`. Returns true while still moving.
     pub fn tick(&mut self, dt_ms: f32) -> bool {
-        self.px *= (-dt_ms.max(0.0) / SCROLL_TAU_MS).exp();
-        if self.px.abs() < 0.5 {
+        self.t_ms += dt_ms.max(0.0);
+        let t = (self.t_ms / SCROLL_DUR_MS).min(1.0);
+        let ease = 1.0 - (1.0 - t).powi(3); // cubic-out
+        self.px = self.start_px * (1.0 - ease);
+        if t >= 1.0 || self.px.abs() < 0.5 {
             self.px = 0.0;
         }
         self.px != 0.0
@@ -145,6 +185,11 @@ pub struct Renderer {
     grid_cols: u16,
     grid_rows: u16,
     glyphs: HashMap<GlyphKey, Option<Glyph>>,
+    /// Shaped symbol runs (programming ligatures): run text + style ->
+    /// positioned glyphs (x offset from run origin, atlas glyph).
+    runs: HashMap<(String, bool, bool), Vec<(f32, Option<Glyph>)>>,
+    /// Shape consecutive symbol cells as one run so font ligatures apply.
+    ligatures: bool,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
@@ -392,6 +437,8 @@ impl Renderer {
             grid_cols: 0,
             grid_rows: 0,
             glyphs: HashMap::new(),
+            runs: HashMap::new(),
+            ligatures: true,
             shelf_x: 1, // texel 0 is reserved white
             shelf_y: 0,
             shelf_h: 1,
@@ -475,6 +522,7 @@ impl Renderer {
         // Old displacement/overscan is in old-cell units; zoom mid-glide snaps.
         self.scroll_reset();
         self.glyphs.clear();
+        self.runs.clear();
         self.shelf_x = 1; // texel 0 is reserved white
         self.shelf_y = 0;
         self.shelf_h = 1;
@@ -490,13 +538,53 @@ impl Renderer {
         if let Some(g) = self.glyphs.get(&key) {
             return *g;
         }
-        let (c, bold, italic, xbin) = key;
+        let (c, zw, bold, italic, xbin) = key;
         let offset = xbin as f32 / SUBPX_BINS as f32;
-        let g = font
-            .rasterize(c, bold, italic, offset)
-            .and_then(|r| self.alloc(queue, &r));
+        let raster = if zw[0] == '\0' {
+            font.rasterize(c, bold, italic, offset)
+        } else {
+            // Cluster: base + zero-width attachments (combining marks, VS16)
+            // shaped as one unit.
+            let mut s = String::with_capacity(12);
+            s.push(c);
+            for z in zw {
+                if z != '\0' {
+                    s.push(z);
+                }
+            }
+            font.rasterize_str(&s, bold, italic, offset)
+        };
+        let g = raster.and_then(|r| self.alloc(queue, &r));
         self.glyphs.insert(key, g);
         g
+    }
+
+    /// Enable/disable ligature run shaping. Caller forces a full redraw.
+    pub fn set_ligatures(&mut self, on: bool) {
+        self.ligatures = on;
+    }
+
+    /// Shape a symbol run (so ligatures like `=>` collapse) and cache the
+    /// positioned atlas glyphs under the run text + style.
+    fn run(
+        &mut self,
+        queue: &wgpu::Queue,
+        font: &mut text::Font,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Vec<(f32, Option<Glyph>)> {
+        let key = (text.to_string(), bold, italic);
+        if let Some(v) = self.runs.get(&key) {
+            return v.clone();
+        }
+        let v: Vec<(f32, Option<Glyph>)> = font
+            .shape_run(text, bold, italic)
+            .into_iter()
+            .map(|(gx, r)| (gx, self.alloc(queue, &r)))
+            .collect();
+        self.runs.insert(key, v.clone());
+        v
     }
 
     /// Place a rasterized glyph into the RGBA atlas via the shelf allocator.
@@ -604,6 +692,21 @@ impl Renderer {
         }
     }
 
+    /// Quad whose pattern is drawn procedurally in the fragment shader
+    /// (`KIND_DOUBLE`/`KIND_CURLY`/`KIND_DOTTED`/`KIND_DASHED`). `uv` is
+    /// repurposed to carry the quad's pixel size — pattern kinds never sample
+    /// the atlas.
+    fn pattern(&self, x: f32, y: f32, w: f32, h: f32, color: [u8; 3], kind: u32) -> Instance {
+        let c = srgb(color);
+        Instance {
+            rect: [x, y, w, h],
+            uv: [w, h, 0.0, 0.0],
+            color: [c[0], c[1], c[2], 1.0],
+            kind,
+            _pad: [0; 3],
+        }
+    }
+
     /// Rebuild every slot of `row` from `cells` (just this row's slice, per
     /// `row_ranges`) and the cursor, if it sits on this row.
     fn rebuild_row(
@@ -623,7 +726,40 @@ impl Renderer {
 
         let cursor_here = frame.cursor_shape != CursorShape::Hidden && frame.cursor_row == row;
 
-        for cell in cells {
+        // Ligature pass: mark maximal runs of adjacent same-style symbol cells;
+        // their glyph slots are filled from one shaped run below instead of
+        // per-cell rasters.
+        let mut in_run = vec![false; cells.len()];
+        let mut lig_runs: Vec<(usize, usize)> = Vec::new(); // [i, j) index ranges
+        if self.ligatures {
+            let mut i = 0;
+            while i < cells.len() {
+                if !is_lig_char(cells[i].c) || cells[i].zw[0] != '\0' {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < cells.len()
+                    && cells[j].col == cells[j - 1].col + 1
+                    && is_lig_char(cells[j].c)
+                    && cells[j].zw[0] == '\0'
+                    && cells[j].bold == cells[i].bold
+                    && cells[j].italic == cells[i].italic
+                    && cells[j].fg == cells[i].fg
+                {
+                    j += 1;
+                }
+                if j - i >= 2 {
+                    for k in i..j {
+                        in_run[k] = true;
+                    }
+                    lig_runs.push((i, j));
+                }
+                i = j;
+            }
+        }
+
+        for (idx, cell) in cells.iter().enumerate() {
             if cell.col >= self.grid_cols {
                 continue;
             }
@@ -643,24 +779,73 @@ impl Renderer {
                 self.slots[base] = self.solid(x, y, self.cell_w, self.cell_h, bg);
             }
 
-            // Slot 1: glyph.
-            if cell.c != '\0' {
+            // Slot 1: glyph (ligature-run members are drawn after this loop).
+            if cell.c != '\0' && !in_run[idx] {
                 let pen_x = x;
                 let xi = pen_x.floor();
                 let frac = pen_x - xi;
                 let xbin = ((frac * SUBPX_BINS as f32).round() as u32 % SUBPX_BINS) as u8;
-                if let Some(g) = self.glyph(queue, font, (cell.c, cell.bold, cell.italic, xbin)) {
+                if let Some(g) = self.glyph(queue, font, (cell.c, cell.zw, cell.bold, cell.italic, xbin)) {
                     let gx = xi + g.left;
                     let gy = y + self.ascent - g.top;
                     self.slots[base + 1] = self.glyph_instance(&g, gx, gy, cell.fg);
                 }
             }
 
-            // Slot 2: text underline.
-            if cell.underline {
+            // Slot 2: underline (kind decides rect vs procedural pattern).
+            if cell.underline != UnderlineKind::None {
                 let thick = (self.cell_h * 0.07).max(1.0);
                 let uy = y + self.ascent + (self.cell_h - self.ascent) * 0.4;
-                self.slots[base + 2] = self.solid(x, uy, self.cell_w, thick, cell.fg);
+                let uc = cell.underline_color;
+                self.slots[base + 2] = match cell.underline {
+                    UnderlineKind::Single => self.solid(x, uy, self.cell_w, thick, uc),
+                    UnderlineKind::Double => {
+                        // One quad tall enough for both lines; shader draws the split.
+                        self.pattern(x, uy - thick, self.cell_w, thick * 3.0, uc, KIND_DOUBLE)
+                    }
+                    UnderlineKind::Curly => {
+                        self.pattern(x, uy - thick, self.cell_w, thick * 3.0, uc, KIND_CURLY)
+                    }
+                    UnderlineKind::Dotted => {
+                        self.pattern(x, uy, self.cell_w, thick, uc, KIND_DOTTED)
+                    }
+                    UnderlineKind::Dashed => {
+                        self.pattern(x, uy, self.cell_w, thick, uc, KIND_DASHED)
+                    }
+                    UnderlineKind::None => unreachable!(),
+                };
+            }
+
+            // Slot 3: strikeout.
+            if cell.strike {
+                let thick = (self.cell_h * 0.07).max(1.0);
+                let sy = y + self.ascent * 0.65;
+                self.slots[base + 3] = self.solid(x, sy, self.cell_w, thick, cell.fg);
+            }
+        }
+
+        // Draw each ligature run: shaped glyphs land in the run's cells' glyph
+        // slots in visual order (a collapsed `=>` produces one glyph in the
+        // first cell; the second cell's slot stays empty).
+        for &(i, j) in &lig_runs {
+            let text: String = cells[i..j].iter().map(|c| c.c).collect();
+            let run_x = self.pad_x + cells[i].col as f32 * self.cell_w;
+            let y = self.pad_y + row as f32 * self.cell_h;
+            let shaped = self.run(queue, font, &text, cells[i].bold, cells[i].italic);
+            for (n, (gx_off, g)) in shaped.into_iter().enumerate() {
+                // More glyphs than cells can't happen for a mono font; guard anyway.
+                let Some(cell) = cells.get(i + n).filter(|_| i + n < j) else {
+                    break;
+                };
+                if cell.col >= self.grid_cols {
+                    continue;
+                }
+                if let Some(g) = g {
+                    let base = self.slot_base(row, cell.col);
+                    let gx = (run_x + gx_off).floor() + g.left;
+                    let gy = y + self.ascent - g.top;
+                    self.slots[base + 1] = self.glyph_instance(&g, gx, gy, cells[i].fg);
+                }
             }
         }
 
@@ -700,7 +885,7 @@ impl Renderer {
                         let xi = x.floor();
                         let frac = x - xi;
                         let xbin = ((frac * SUBPX_BINS as f32).round() as u32 % SUBPX_BINS) as u8;
-                        if let Some(g) = self.glyph(queue, font, (c.c, c.bold, c.italic, xbin)) {
+                        if let Some(g) = self.glyph(queue, font, (c.c, c.zw, c.bold, c.italic, xbin)) {
                             let gx = xi + g.left;
                             let gy = y + self.ascent - g.top;
                             // Color glyphs keep their own color; mask glyphs use bg.
@@ -711,11 +896,11 @@ impl Renderer {
             }
             CursorShape::Bar => {
                 let w = (self.cell_w * 0.12).max(1.0);
-                self.slots[base + 2] = self.solid(x, y, w, self.cell_h, cursor_color);
+                self.slots[base + 3] = self.solid(x, y, w, self.cell_h, cursor_color);
             }
             CursorShape::Underline => {
                 let h = (self.cell_h * 0.12).max(2.0);
-                self.slots[base + 2] =
+                self.slots[base + 3] =
                     self.solid(x, y + self.cell_h - h, self.cell_w, h, cursor_color);
             }
             CursorShape::Hidden => {}
@@ -899,6 +1084,11 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) kind: u32,
+    // Position within the quad in px (0..size), and the quad's px size.
+    // Only meaningful for kind >= 2 (procedural decoration patterns), which
+    // never sample the atlas.
+    @location(3) local: vec2<f32>,
+    @location(4) @interpolate(flat) size: vec2<f32>,
 };
 
 @vertex
@@ -926,6 +1116,8 @@ fn vs_main(
     out.uv = mix(uvr.xy, uvr.zw, corner);
     out.color = color;
     out.kind = kind;
+    out.local = corner * rect.zw;
+    out.size = rect.zw;
     return out;
 }
 
@@ -940,6 +1132,39 @@ fn s2l(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.kind >= 2u) {
+        // Procedural decoration patterns: no atlas sample, `in.local` is the
+        // px position within the quad and `in.size` its px extent.
+        if (in.kind == 2u) {
+            // Double underline: two lines (top third / bottom third), gap
+            // in the middle third.
+            let fy = in.local.y / in.size.y;
+            if (fy > 0.33 && fy < 0.67) {
+                discard;
+            }
+        } else if (in.kind == 3u) {
+            // Curly underline: distance to a sine wave, one period per ~4x
+            // the quad height, amplitude filling the quad.
+            let period = in.size.y * 4.0;
+            let mid = in.size.y * 0.5 * (1.0 + sin(in.local.x * 6.2832 / period));
+            if (abs(in.local.y - mid) > in.size.y * 0.25) {
+                discard;
+            }
+        } else if (in.kind == 4u) {
+            // Dotted underline: 50% duty, pitch ~2x the quad height.
+            let pitch = in.size.y * 2.0;
+            if (fract(in.local.x / pitch) > 0.5) {
+                discard;
+            }
+        } else if (in.kind == 5u) {
+            // Dashed underline: 2/3 duty, ~9px period.
+            if (fract(in.local.x / 9.0) > 0.667) {
+                discard;
+            }
+        }
+        let a = in.color.a;
+        return vec4<f32>(s2l(in.color.rgb) * a, a);
+    }
     let texel = textureSample(atlas, samp, in.uv);
     if (in.kind == 1u) {
         // Color glyph: straight RGBA from the atlas, decoded to linear.
@@ -953,6 +1178,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 #[cfg(test)]
+mod shader_tests {
+    use super::SHADER;
+
+    /// Parse + validate the inline WGSL with `naga` (wgpu's own frontend, via
+    /// its `pub use naga` re-export) so a syntax/type error is caught here
+    /// instead of only at pipeline-creation time on a machine with a GPU.
+    #[test]
+    fn shader_wgsl_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("WGSL parse");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        validator.validate(&module).expect("WGSL validate");
+    }
+}
+
+#[cfg(test)]
 mod row_ranges_tests {
     use super::*;
 
@@ -961,11 +1204,14 @@ mod row_ranges_tests {
             col,
             row,
             c: 'x',
+            zw: ['\0'; 2],
             fg: [0, 0, 0],
             bg: [0, 0, 0],
             bold: false,
             italic: false,
-            underline: false,
+            underline: UnderlineKind::None,
+            underline_color: [0, 0, 0],
+            strike: false,
             selected: false,
         }
     }
@@ -1106,5 +1352,48 @@ mod scroll_anim_tests {
             assert!(a.px < prev && a.px >= 0.0);
             prev = a.px;
         }
+    }
+
+    #[test]
+    fn glide_settles_in_fixed_duration() {
+        let mut a = ScrollAnim::default();
+        a.bump(4, 20.0, 480.0); // 80 px displacement
+        let mut t = 0.0;
+        while a.tick(16.0) {
+            t += 16.0;
+            assert!(t < 200.0, "glide must settle within ~140ms, still moving at {t}ms");
+        }
+        assert_eq!(a.px, 0.0);
+    }
+
+    #[test]
+    fn glide_speed_decreases_monotonically() {
+        // cubic-out: displacement magnitude strictly decreases each tick
+        let mut a = ScrollAnim::default();
+        a.bump(4, 20.0, 480.0);
+        let mut prev = a.px.abs();
+        while a.tick(16.0) {
+            assert!(a.px.abs() < prev, "|px| must shrink every tick");
+            prev = a.px.abs();
+        }
+    }
+
+    #[test]
+    fn rebump_restarts_clock() {
+        let mut a = ScrollAnim::default();
+        a.bump(4, 20.0, 480.0);
+        for _ in 0..6 { a.tick(16.0); } // ~96ms in
+        a.bump(4, 20.0, 480.0); // new notch mid-glide
+        // Must take close to a full duration again, not settle in the remaining ~44ms
+        let mut t = 0.0;
+        while a.tick(16.0) { t += 16.0; }
+        assert!(t > 100.0, "re-bump must restart the ease, settled after only {t}ms");
+    }
+
+    #[test]
+    fn bump_clamps_to_max() {
+        let mut a = ScrollAnim::default();
+        a.bump(100, 20.0, 480.0);
+        assert_eq!(a.px, 480.0);
     }
 }

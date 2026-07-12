@@ -1527,7 +1527,18 @@ public sealed partial class MainWindow : Window
     }
 
     private void PaneHost_PointerExited(object sender, PointerRoutedEventArgs e)
-        => PaneCtl.Visibility = Visibility.Collapsed;
+    {
+        PaneCtl.Visibility = Visibility.Collapsed;
+        if (_engine == IntPtr.Zero)
+            return;
+        var pos = e.GetCurrentPoint(PaneHost).Position;
+        int i = _mousePane >= 0 ? _mousePane : PaneAt(pos);
+        if (i < 0)
+            return;
+        // Leave event: clears any pending click + stale link hover in the
+        // engine (see velo_pane_mouse kind == 3), coordinates are unused.
+        Native.velo_pane_mouse(_engine, PaneId(_panels[i]), 3, 0, 0, 0, 0);
+    }
 
     // ---- Per-pane split controls (swap position / make full screen) --------
 
@@ -3031,6 +3042,10 @@ public sealed partial class MainWindow : Window
 
     // ---- Settings ---------------------------------------------------------
 
+    /// Last font family pushed into the core ("" = bundled default, which the
+    /// engine starts with — so the startup ApplySettings skips the rebuild).
+    private string _appliedFontFamily = "";
+
     /// Push the current settings into the core + chrome. The titlebar background
     /// tracks the terminal background so they read as one blended surface.
     private void ApplySettings()
@@ -3038,6 +3053,27 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         Native.velo_set_font_size(_engine, (float)(_settings.FontSize * _zoom));
+        // Font family: pushing rebuilds the font + every atlas, so only on change.
+        if (_appliedFontFamily != _settings.FontFamily)
+        {
+            var fam = _settings.FontFamily ?? "";
+            unsafe
+            {
+                fixed (char* p = fam)
+                    Native.velo_set_font_family(_engine, (ushort*)p, (nuint)fam.Length);
+            }
+            _appliedFontFamily = _settings.FontFamily ?? "";
+        }
+        ApplyAppFont();
+        Native.velo_set_ligatures(_engine, _settings.Ligatures ? (byte)1 : (byte)0);
+        byte cursorStyle = _settings.CursorStyle switch
+        {
+            "Block" => 1,
+            "Bar" => 2,
+            "Underline" => 3,
+            _ => 0,
+        };
+        Native.velo_set_cursor(_engine, cursorStyle, _settings.CursorBlink ? (byte)1 : (byte)0);
         SetShell(_settings.Shell);
         PushPalette(Themes.ByName(_settings.ThemeName));
         var (r, g, b) = _settings.BackgroundRgb();
@@ -3138,8 +3174,66 @@ public sealed partial class MainWindow : Window
         PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
     }
 
-    private async void Settings_Click(object sender, RoutedEventArgs e)
+    /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
+    /// font inheritance, so: override the theme resource (future controls, e.g.
+    /// new tab headers from templates) and walk the live tree (existing ones).
+    private void ApplyAppFont()
     {
+        var fam = _settings.ApplyFontToApp && !string.IsNullOrWhiteSpace(_settings.FontFamily)
+            ? new FontFamily(_settings.FontFamily)
+            : FontFamily.XamlAutoFontFamily;
+        Application.Current.Resources["ContentControlThemeFontFamily"] = fam;
+        ApplyFontRecursive(RootGrid, fam);
+    }
+
+    private static void ApplyFontRecursive(DependencyObject node, FontFamily fam)
+    {
+        // Icon glyphs (FontIcon's inner TextBlock, caption/toolbar buttons whose
+        // Content is a Segoe MDL2/Fluent codepoint) must keep their symbol font
+        // or they render as tofu boxes.
+        if (node is FontIcon)
+            return;
+        if (node is Control c && !KeepsOwnFont(c.FontFamily))
+            c.FontFamily = fam;
+        else if (node is TextBlock tb && !KeepsOwnFont(tb.FontFamily))
+            tb.FontFamily = fam;
+        int n = VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < n; i++)
+            ApplyFontRecursive(VisualTreeHelper.GetChild(node, i), fam);
+    }
+
+    /// Fonts an element sets deliberately (icon faces, monospace previews) —
+    /// the app-wide chrome font must not override them.
+    private static bool KeepsOwnFont(FontFamily? f)
+    {
+        string s = f?.Source ?? "";
+        return s.Contains("Segoe MDL2") || s.Contains("Segoe Fluent") || s.Contains("Consolas");
+    }
+
+    /// Installed font families from the core's font db (sorted, deduped).
+    private static unsafe string[] ListInstalledFonts()
+    {
+        nuint len = 0;
+        ushort* p = Native.velo_list_fonts(&len);
+        if (p == null || len == 0)
+            return Array.Empty<string>();
+        var joined = new string((char*)p, 0, (int)len);
+        Native.velo_free_utf16(p, len);
+        return joined.Split('\n');
+    }
+
+    private const string DefaultFontLabel = "Default (Cascadia Code NF, bundled)";
+
+    /// Live settings overlay while open (null = closed). An overlay, not a
+    /// ContentDialog: needs an X button, Esc/Enter dismissal, and
+    /// click-outside-to-close, none of which ContentDialog gives us.
+    private Grid? _settingsOverlay;
+
+    private void Settings_Click(object sender, RoutedEventArgs e)
+    {
+        if (_settingsOverlay != null)
+            return;
+        // ---- Appearance page -------------------------------------------
         var fontBox = new NumberBox
         {
             Header = "Font size (pt)",
@@ -3148,15 +3242,54 @@ public sealed partial class MainWindow : Window
             Maximum = 72,
             SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
         };
-        var shellBox = new ComboBox
+
+        // Terminal font: search box + list of installed families, each row
+        // previewed in its own face (Windows-settings style).
+        string selectedFont = _settings.FontFamily ?? "";
+        var allFonts = ListInstalledFonts();
+        var fontSearch = new TextBox { PlaceholderText = "Search fonts" };
+        var fontList = new ListView
         {
-            Header = "Shell",
-            IsEditable = true,
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            Text = _settings.Shell,
+            Height = 200,
+            SelectionMode = ListViewSelectionMode.Single,
         };
-        foreach (var s in new[] { "powershell.exe", "pwsh.exe", "cmd.exe", "wsl.exe" })
-            shellBox.Items.Add(s);
+        void FillFonts()
+        {
+            var filter = fontSearch.Text?.Trim() ?? "";
+            var items = new List<TextBlock>();
+            if (filter.Length == 0
+                || DefaultFontLabel.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                items.Add(new TextBlock { Text = DefaultFontLabel, Tag = "" });
+            foreach (var f in allFonts)
+                if (filter.Length == 0 || f.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                    items.Add(new TextBlock { Text = f, Tag = f, FontFamily = new FontFamily(f) });
+            fontList.ItemsSource = items;
+            fontList.SelectedItem = items.FirstOrDefault(t => (string)t.Tag == selectedFont);
+        }
+        fontSearch.TextChanged += (_, _) => FillFonts();
+        fontList.SelectionChanged += (_, _) =>
+        {
+            if (fontList.SelectedItem is TextBlock tb)
+                selectedFont = (string)tb.Tag;
+        };
+        FillFonts();
+
+        var applyAppBox = new CheckBox
+        {
+            Content = "Apply this font to the entire app",
+            IsChecked = _settings.ApplyFontToApp,
+        };
+
+        var ligBox = new ToggleSwitch
+        {
+            Header = "Ligatures (=> != -> collapse into one glyph)",
+            IsOn = _settings.Ligatures,
+        };
+
+        var backdropBox = new ComboBox { Header = "Backdrop", HorizontalAlignment = HorizontalAlignment.Stretch };
+        foreach (var s in new[] { "Mica", "MicaAlt", "Acrylic", "None" })
+            backdropBox.Items.Add(s);
+        backdropBox.SelectedItem = _settings.Backdrop;
 
         var bgBox = new TextBox { Header = "Terminal background / tint (#RRGGBB)", Text = _settings.BackgroundHex };
 
@@ -3169,52 +3302,297 @@ public sealed partial class MainWindow : Window
             StepFrequency = 5,
         };
 
-        var backdropBox = new ComboBox { Header = "Backdrop", HorizontalAlignment = HorizontalAlignment.Stretch };
-        foreach (var s in new[] { "Mica", "MicaAlt", "Acrylic", "None" })
-            backdropBox.Items.Add(s);
-        backdropBox.SelectedItem = _settings.Backdrop;
-
-        var panel = new StackPanel { Spacing = 12, MinWidth = 320 };
-        panel.Children.Add(fontBox);
-        panel.Children.Add(shellBox);
-        panel.Children.Add(bgBox);
-        panel.Children.Add(opacityBox);
-        panel.Children.Add(backdropBox);
-        panel.Children.Add(new TextBlock
+        var cursorBox = new ComboBox
         {
-            Text = "Lower the terminal opacity to let the backdrop blur show "
-                 + "through the terminal (0 = full blur, 100 = solid).",
+            Header = "Cursor style",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        foreach (var s in new[] { "Default (shell-controlled)", "Block", "Bar", "Underline" })
+            cursorBox.Items.Add(s);
+        cursorBox.SelectedIndex = _settings.CursorStyle switch
+        {
+            "Block" => 1,
+            "Bar" => 2,
+            "Underline" => 3,
+            _ => 0,
+        };
+
+        var blinkBox = new ToggleSwitch
+        {
+            Header = "Cursor blink",
+            IsOn = _settings.CursorBlink,
+        };
+
+        // Small-caps section headers + dim hint text (Otty-style pages).
+        static TextBlock Section(string s) => new()
+        {
+            Text = s.ToUpperInvariant(),
+            FontSize = 12,
+            Opacity = 0.55,
+            CharacterSpacing = 150,
+            Margin = new Thickness(0, 10, 0, -4),
+        };
+        static TextBlock Hint(string s) => new()
+        {
+            Text = s,
             TextWrapping = TextWrapping.Wrap,
             Opacity = 0.6,
             FontSize = 12,
-        });
-
-        var dialog = new ContentDialog
-        {
-            Title = "Settings",
-            Content = panel,
-            PrimaryButtonText = "Save",
-            CloseButtonText = "Cancel",
-            DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = Content.XamlRoot,
         };
 
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        var appearance = new StackPanel { Spacing = 12 };
+        appearance.Children.Add(Section("Text"));
+        appearance.Children.Add(fontBox);
+        appearance.Children.Add(new TextBlock { Text = "Terminal font" });
+        appearance.Children.Add(fontSearch);
+        appearance.Children.Add(fontList);
+        appearance.Children.Add(applyAppBox);
+        appearance.Children.Add(ligBox);
+        appearance.Children.Add(Section("Cursor"));
+        appearance.Children.Add(cursorBox);
+        appearance.Children.Add(blinkBox);
+        appearance.Children.Add(Section("Window"));
+        appearance.Children.Add(backdropBox);
+        appearance.Children.Add(bgBox);
+        appearance.Children.Add(opacityBox);
+        appearance.Children.Add(Hint(
+            "Lower the terminal opacity to let the backdrop blur show "
+            + "through the terminal (0 = full blur, 100 = solid)."));
+
+        // ---- Terminal page ----------------------------------------------
+        var shellBox = new ComboBox
         {
+            Header = "Shell",
+            IsEditable = true,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Text = _settings.Shell,
+        };
+        foreach (var s in new[] { "powershell.exe", "pwsh.exe", "cmd.exe", "wsl.exe" })
+            shellBox.Items.Add(s);
+
+        var shellIntBox = new ToggleSwitch
+        {
+            Header = "Shell integration (cwd + per-command tracking)",
+            IsOn = _settings.ShellIntegration,
+        };
+
+        var terminal = new StackPanel { Spacing = 12 };
+        terminal.Children.Add(Section("Shell"));
+        terminal.Children.Add(shellBox);
+        terminal.Children.Add(shellIntBox);
+        terminal.Children.Add(Hint(
+            "Shell integration injects OSC 7/133 markers into the shell "
+            + "profile on startup. Changes apply to new tabs."));
+
+        // ---- Sidebar (searchable) + content ------------------------------
+        var content = new ScrollViewer
+        {
+            Content = appearance,
+            Height = 480,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Padding = new Thickness(0, 0, 16, 0),
+        };
+        var pages = new (string Name, UIElement Page)[]
+        {
+            ("Appearance", appearance),
+            ("Terminal", terminal),
+        };
+        // Individual options for search: typing lists matching options; picking
+        // one opens its page, scrolls it into view, and focuses it.
+        var options = new (string Label, int Page, FrameworkElement El)[]
+        {
+            ("Font size", 0, fontBox),
+            ("Terminal font", 0, fontSearch),
+            ("Apply font to entire app", 0, applyAppBox),
+            ("Ligatures", 0, ligBox),
+            ("Cursor style", 0, cursorBox),
+            ("Cursor blink", 0, blinkBox),
+            ("Backdrop", 0, backdropBox),
+            ("Background color", 0, bgBox),
+            ("Background opacity", 0, opacityBox),
+            ("Shell", 1, shellBox),
+            ("Shell integration", 1, shellIntBox),
+        };
+        var navSearch = new TextBox
+        {
+            PlaceholderText = "Search settings",
+            Margin = new Thickness(0, 0, 0, 8),
+        };
+        var nav = new ListView { SelectionMode = ListViewSelectionMode.Single };
+        void FillNav()
+        {
+            var q = navSearch.Text?.Trim() ?? "";
+            nav.Items.Clear();
+            if (q.Length == 0)
+            {
+                foreach (var (name, _) in pages)
+                    nav.Items.Add(name);
+                nav.SelectedIndex = 0;
+                return;
+            }
+            foreach (var (label, _, _) in options)
+                if (label.Contains(q, StringComparison.OrdinalIgnoreCase))
+                    nav.Items.Add(label);
+            // No auto-select while searching: selection would move focus away
+            // from the search box mid-typing.
+        }
+        nav.SelectionChanged += (_, _) =>
+        {
+            if (nav.SelectedItem is not string sel)
+                return;
+            var pi = Array.FindIndex(pages, p => p.Name == sel);
+            if (pi >= 0)
+            {
+                content.Content = pages[pi].Page;
+                return;
+            }
+            var oi = Array.FindIndex(options, o => o.Label == sel);
+            if (oi >= 0)
+            {
+                content.Content = pages[options[oi].Page].Page;
+                var el = options[oi].El;
+                el.StartBringIntoView();
+                (el as Control)?.Focus(FocusState.Programmatic);
+            }
+        };
+        navSearch.TextChanged += (_, _) => FillNav();
+        FillNav();
+
+        var sidebar = new StackPanel { Width = 190 };
+        sidebar.Children.Add(navSearch);
+        sidebar.Children.Add(nav);
+
+        var body = new Grid { ColumnSpacing = 20 };
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        Grid.SetColumn(sidebar, 0);
+        body.Children.Add(sidebar);
+        Grid.SetColumn(content, 1);
+        body.Children.Add(content);
+
+        // ---- Card + dim overlay ------------------------------------------
+        var closeBtn = new Button
+        {
+            Content = "",
+            FontFamily = new FontFamily("Segoe MDL2 Assets"),
+            FontSize = 12,
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(8),
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        ToolTipService.SetToolTip(closeBtn, "Close (Esc)");
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(new TextBlock
+        {
+            Text = "Settings",
+            FontSize = 20,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        });
+        Grid.SetColumn(closeBtn, 1);
+        header.Children.Add(closeBtn);
+
+        var cardInner = new StackPanel { Spacing = 16 };
+        cardInner.Children.Add(header);
+        cardInner.Children.Add(body);
+
+        // Card bg: theme background lifted a touch so it separates from the
+        // terminal behind the dim scrim.
+        var (br, bgr, bbl) = _settings.BackgroundRgb();
+        static byte Lift(byte v) => (byte)Math.Min(255, v + 14);
+        var card = new Border
+        {
+            Child = cardInner,
+            Background = new SolidColorBrush(
+                Microsoft.UI.ColorHelper.FromArgb(255, Lift(br), Lift(bgr), Lift(bbl))),
+            BorderBrush = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 70, 70, 70)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(12),
+            Padding = new Thickness(24),
+            MinWidth = 780,
+            MaxWidth = 920,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var overlay = new Grid
+        {
+            Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(0x80, 0, 0, 0)),
+        };
+        overlay.Children.Add(card);
+        Grid.SetRowSpan(overlay, Math.Max(1, RootGrid.RowDefinitions.Count));
+        Grid.SetColumnSpan(overlay, Math.Max(1, RootGrid.ColumnDefinitions.Count));
+        Canvas.SetZIndex(overlay, 1000);
+
+        // ---- Live apply + dismissal --------------------------------------
+        // No Save/Cancel: every change lands in _settings, applies on the spot,
+        // and persists (so a crash/kill can't lose an applied change).
+        void Apply()
+        {
+            _settings.FontSize = double.IsNaN(fontBox.Value) ? _settings.FontSize : fontBox.Value;
+            _settings.FontFamily = selectedFont;
+            _settings.ApplyFontToApp = applyAppBox.IsChecked == true;
+            _settings.Ligatures = ligBox.IsOn;
+            _settings.CursorStyle = cursorBox.SelectedIndex switch
+            {
+                1 => "Block",
+                2 => "Bar",
+                3 => "Underline",
+                _ => "Default",
+            };
+            _settings.CursorBlink = blinkBox.IsOn;
+            _settings.Shell = string.IsNullOrWhiteSpace(shellBox.Text) ? _settings.Shell : shellBox.Text;
+            _settings.ShellIntegration = shellIntBox.IsOn;
+            _settings.BackgroundHex = bgBox.Text;
+            _settings.BackgroundOpacity = opacityBox.Value / 100.0;
+            _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;
+            ApplyBackdrop();
+            ApplySettings();
+            _settings.Save();
+        }
+        void Close()
+        {
+            Apply();
+            RootGrid.Children.Remove(overlay);
+            _settingsOverlay = null;
             FocusTerminal();
-            return;
+        }
+        fontBox.ValueChanged += (_, _) => Apply();
+        fontList.SelectionChanged += (_, _) => Apply();
+        applyAppBox.Checked += (_, _) => Apply();
+        applyAppBox.Unchecked += (_, _) => Apply();
+        ligBox.Toggled += (_, _) => Apply();
+        cursorBox.SelectionChanged += (_, _) => Apply();
+        blinkBox.Toggled += (_, _) => Apply();
+        backdropBox.SelectionChanged += (_, _) => Apply();
+        opacityBox.ValueChanged += (_, _) => Apply();
+        bgBox.LostFocus += (_, _) => Apply();
+        shellBox.LostFocus += (_, _) => Apply();
+        shellIntBox.Toggled += (_, _) => Apply();
+
+        closeBtn.Click += (_, _) => Close();
+        // Click on the dim scrim (not the card) closes.
+        overlay.Tapped += (_, args) =>
+        {
+            if (args.OriginalSource == overlay)
+                Close();
+        };
+        // Esc/Enter close from anywhere inside the card.
+        foreach (var k in new[] { Windows.System.VirtualKey.Escape, Windows.System.VirtualKey.Enter })
+        {
+            var acc = new Microsoft.UI.Xaml.Input.KeyboardAccelerator { Key = k };
+            acc.Invoked += (_, args) =>
+            {
+                args.Handled = true;
+                Close();
+            };
+            card.KeyboardAccelerators.Add(acc);
         }
 
-        _settings.FontSize = double.IsNaN(fontBox.Value) ? _settings.FontSize : fontBox.Value;
-        _settings.Shell = string.IsNullOrWhiteSpace(shellBox.Text) ? _settings.Shell : shellBox.Text;
-        _settings.BackgroundHex = bgBox.Text;
-        _settings.BackgroundOpacity = opacityBox.Value / 100.0;
-        _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;
-        _settings.Save();
-
-        ApplyBackdrop();
-        ApplySettings();
-        FocusTerminal();
+        _settingsOverlay = overlay;
+        RootGrid.Children.Add(overlay);
+        navSearch.Focus(FocusState.Programmatic);
     }
 
     // ---- Rust -> C# callbacks --------------------------------------------
@@ -3236,6 +3614,8 @@ public sealed partial class MainWindow : Window
         OnCommand = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, int, ulong, ushort*, nuint, void>)&OnCommand,
         OnAnim = (IntPtr)(delegate* unmanaged<IntPtr, void>)&OnAnim,
         OnEditorDirty = (IntPtr)(delegate* unmanaged<IntPtr, uint, byte, void>)&OnEditorDirty,
+        OnLinkHover = (IntPtr)(delegate* unmanaged<IntPtr, byte, void>)&OnLinkHover,
+        OnOpenLink = (IntPtr)(delegate* unmanaged<IntPtr, ushort*, nuint, void>)&OnOpenLink,
     };
 
     private static MainWindow? FromCtx(IntPtr ctx)
@@ -3254,6 +3634,76 @@ public sealed partial class MainWindow : Window
         // Fired on the UI thread (subclass proc) whenever a render leaves a
         // scroll glide in flight; StartAnimPump is idempotent.
         FromCtx(ctx)?.StartAnimPump();
+    }
+
+    [UnmanagedCallersOnly]
+    private static void OnLinkHover(IntPtr ctx, byte over)
+    {
+        var w = FromCtx(ctx);
+        w?.DispatcherQueue.TryEnqueue(() => w.SetPaneCursor(over != 0));
+    }
+
+    [UnmanagedCallersOnly]
+    private static unsafe void OnOpenLink(IntPtr ctx, ushort* text, nuint len)
+    {
+        string target = new string((char*)text, 0, (int)len);
+        var w = FromCtx(ctx);
+        w?.DispatcherQueue.TryEnqueue(() => w.OpenLink(target));
+    }
+
+    /// Reflection workaround: `UIElement.ProtectedCursor` is `protected`, so an
+    /// arbitrary element outside a UIElement subclass can't set it directly —
+    /// there is no public WinUI 3 API for per-element pointer cursors.
+    private static readonly System.Reflection.PropertyInfo? s_protectedCursorProp =
+        typeof(UIElement).GetProperty("ProtectedCursor", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+    /// Set the hand/I-beam cursor over the pane area (PaneHost is the actual
+    /// pointer hit-test target; the SwapChainPanels themselves are not
+    /// hit-test-visible, see PaneHost_PointerMoved).
+    private void SetPaneCursor(bool hand)
+    {
+        try
+        {
+            var cursor = InputSystemCursor.Create(hand ? InputSystemCursorShape.Hand : InputSystemCursorShape.IBeam);
+            s_protectedCursorProp?.SetValue(PaneHost, cursor);
+        }
+        catch (Exception ex) { Log.Write($"SetPaneCursor failed: {ex.Message}"); }
+    }
+
+    /// Open a link target reported by the core. http/https URLs go to the
+    /// default browser; everything else (bare paths, and `file://` URIs with
+    /// their scheme stripped) is a path — never handed to ShellExecute
+    /// directly, since a malicious `file://…/evil.exe` OSC 8 hyperlink must
+    /// not be able to execute on click. Paths are converted from a possible
+    /// WSL form and revealed in Explorer (reusing InfoReveal_Click's
+    /// ToWindowsPath helper).
+    private void OpenLink(string target)
+    {
+        try
+        {
+            if (target.StartsWith("http://", StringComparison.Ordinal)
+                || target.StartsWith("https://", StringComparison.Ordinal))
+            {
+                Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                return;
+            }
+            if (target.StartsWith("file://", StringComparison.Ordinal))
+            {
+                // Uri.LocalPath percent-decodes and handles UNC (file://host/share/x)
+                // as well as local (file:///mnt/d/x) forms.
+                if (!Uri.TryCreate(target, UriKind.Absolute, out var uri))
+                    return;
+                target = uri.LocalPath;
+            }
+            var win = ToWindowsPath(target);
+            if (win is null)
+                return;
+            if (Directory.Exists(win))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{win}\"") { UseShellExecute = true });
+            else if (File.Exists(win))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{win}\"") { UseShellExecute = true });
+        }
+        catch (Exception ex) { Log.Write($"open link failed: {ex.Message}"); }
     }
 
     private bool _animPumping;

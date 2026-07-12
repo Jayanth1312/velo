@@ -29,6 +29,8 @@ internal static unsafe partial class Native
         public IntPtr OnCommand;          // (ctx, id, phase, exit, dur_ms, utf16*, len)
         public IntPtr OnAnim;             // (ctx) — start driving velo_tick
         public IntPtr OnEditorDirty;      // (ctx, file_id, dirty)
+        public IntPtr OnLinkHover;        // (ctx, over) — 1 = hovering a link, 0 = left it
+        public IntPtr OnOpenLink;         // (ctx, utf16*, len) — open a link target
     }
 
     /// Init GPU + composition swapchain + the core's internal wakeup window.
@@ -96,8 +98,9 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_pane_resize(IntPtr eng, uint pane, uint w, uint h);
 
-    /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up.
-    /// button: 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
+    /// Forward a pointer event to a specific pane. kind 0=down,1=move,2=up,
+    /// 3=leave (pointer left the pane; x,y unused, pass 0,0). button:
+    /// 0=left, 1=middle, 2=right. mods is the velo_key bitset (bit1 =
     /// Shift; shift forces local selection even when the app has enabled
     /// mouse reporting).
     [LibraryImport(Core)]
@@ -127,6 +130,26 @@ internal static unsafe partial class Native
 
     [LibraryImport(Core)]
     internal static partial void velo_set_shell(IntPtr eng, ushort* ptr, nuint len);
+
+    /// Terminal font family; len == 0 restores the bundled default.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_font_family(IntPtr eng, ushort* ptr, nuint len);
+
+    /// Ligature run shaping; 0 = off, nonzero = on.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_ligatures(IntPtr eng, byte on);
+
+    /// Cursor: style 0 = shell default, 1 = block, 2 = bar, 3 = underline;
+    /// blink nonzero = on.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_cursor(IntPtr eng, byte style, byte blink);
+
+    /// Installed font families, '\n'-joined UTF-16; free with velo_free_utf16.
+    [LibraryImport(Core)]
+    internal static partial ushort* velo_list_fonts(nuint* outLen);
+
+    [LibraryImport(Core)]
+    internal static partial void velo_free_utf16(ushort* ptr, nuint len);
 
     [LibraryImport(Core)]
     internal static partial void velo_set_bg(IntPtr eng, byte r, byte g, byte b);
