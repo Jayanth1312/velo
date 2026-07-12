@@ -528,6 +528,14 @@ impl Terminal {
             let selected = selection.is_some_and(|r| r.contains(indexed.point));
             let hidden = flags.contains(Flags::HIDDEN);
             let glyph = if cell.c == ' ' || hidden { '\0' } else { cell.c };
+            // Zero-width attachments (combining marks, VS15/16); two slots
+            // cover the realistic cases without heap-allocating per cell.
+            let mut zw = ['\0'; 2];
+            if let Some(z) = cell.zerowidth() {
+                for (i, ch) in z.iter().take(2).enumerate() {
+                    zw[i] = *ch;
+                }
+            }
 
             // Keep a cell only if it draws something: a glyph, a non-default
             // background, a selection highlight, or a decoration (underline
@@ -544,6 +552,7 @@ impl Terminal {
                 col,
                 row,
                 c: glyph,
+                zw,
                 fg,
                 bg,
                 bold,
@@ -693,6 +702,10 @@ pub struct RenderCell {
     pub row: u16,
     /// `'\0'` means a background-only cell (no glyph).
     pub c: char,
+    /// Zero-width chars attached to this cell (combining marks, VS15/16
+    /// variation selectors); `'\0'` = unused slot. Shaped together with `c`
+    /// as one grapheme cluster.
+    pub zw: [char; 2],
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub bold: bool,
@@ -760,6 +773,17 @@ mod tests {
         t.advance("\u{FFFD}".to_string().as_bytes());
         let f = t.frame();
         assert!(f.cells.iter().any(|c| c.c == '\u{FFFD}'));
+    }
+
+    #[test]
+    fn variation_selector_attaches_to_cell() {
+        // ▶ + VS16 must reach the renderer as one cluster so it can pick the
+        // emoji presentation.
+        let mut t = term();
+        t.advance("▶\u{FE0F}".as_bytes());
+        let f = t.frame();
+        let c = f.cells.iter().find(|c| c.c == '▶').expect("base char present");
+        assert_eq!(c.zw[0], '\u{FE0F}', "VS16 must ride the cell as zerowidth");
     }
 
     #[test]

@@ -20,6 +20,12 @@ public sealed class Settings
     public double BackgroundOpacity { get; set; } = 1.0;
     /// One of: Mica, MicaAlt, Acrylic, None.
     public string Backdrop { get; set; } = "Mica";
+    /// Programming ligatures (=> != ->) in the terminal grid.
+    public bool Ligatures { get; set; } = true;
+    /// Cursor shape: Default (shell-controlled via DECSCUSR), Block, Bar, Underline.
+    public string CursorStyle { get; set; } = "Default";
+    /// Blink the terminal cursor.
+    public bool CursorBlink { get; set; } = false;
     /// Active color theme name (see Themes.All). Drives the ANSI palette + the
     /// terminal/chrome background.
     public string ThemeName { get; set; } = "Velo Dark";

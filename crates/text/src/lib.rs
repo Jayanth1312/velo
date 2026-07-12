@@ -235,38 +235,182 @@ impl Font {
     /// key for crisper positioning. Returns `None` for blank/empty glyphs.
     pub fn rasterize(&mut self, c: char, bold: bool, italic: bool, subpx_x: f32) -> Option<Raster> {
         let mut s = [0u8; 4];
-        let text = c.encode_utf8(&mut s);
+        self.rasterize_str(c.encode_utf8(&mut s), bold, italic, subpx_x)
+    }
+
+    /// Shape a whole run of text as one unit so font ligatures (`=>`, `!=`,
+    /// `->`) apply, and rasterize each resulting glyph. Returns
+    /// `(x offset from the run origin in px, raster)` per glyph, in visual
+    /// order. Callers place each raster at `run_origin_x + offset + left`.
+    pub fn shape_run(&mut self, text: &str, bold: bool, italic: bool) -> Vec<(f32, Raster)> {
         let attrs = mono_attrs(&self.family, bold, italic);
         self.buffer
             .set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
         self.buffer.shape_until_scroll(&mut self.font_system, false);
 
-        let run = self.buffer.layout_runs().next()?;
-        let glyph = run.glyphs.first()?;
-        let physical = glyph.physical((subpx_x, 0.0), 1.0);
-        let img = self
-            .swash
-            .get_image(&mut self.font_system, physical.cache_key)
-            .as_ref()?;
+        let physicals: Vec<_> = match self.buffer.layout_runs().next() {
+            Some(run) => run
+                .glyphs
+                .iter()
+                .map(|g| (g.x, g.physical((0.0, 0.0), 1.0)))
+                .collect(),
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (gx, p) in physicals {
+            let Some(img) = self
+                .swash
+                .get_image(&mut self.font_system, p.cache_key)
+                .as_ref()
+            else {
+                continue;
+            };
+            if img.placement.width == 0 || img.placement.height == 0 {
+                continue;
+            }
+            let color = match img.content {
+                SwashContent::Mask => false,
+                SwashContent::Color => true,
+                SwashContent::SubpixelMask => continue,
+            };
+            out.push((
+                gx,
+                Raster {
+                    width: img.placement.width,
+                    height: img.placement.height,
+                    left: img.placement.left,
+                    top: img.placement.top,
+                    coverage: img.data.clone(),
+                    color,
+                },
+            ));
+        }
+        out
+    }
 
-        if img.placement.width == 0 || img.placement.height == 0 {
+    /// Rasterize a full grapheme cluster (base char plus zero-width attachments:
+    /// combining marks, VS15/16 variation selectors). Shaping the cluster as one
+    /// unit lets VS16 pick the emoji presentation and positions marks over their
+    /// base; when shaping yields several glyphs (base + mark) they are composited
+    /// into a single bitmap anchored at the union of their bounds.
+    pub fn rasterize_str(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        subpx_x: f32,
+    ) -> Option<Raster> {
+        let attrs = mono_attrs(&self.family, bold, italic);
+        self.buffer
+            .set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+
+        // Physical positions first (immutable borrow of the buffer), images
+        // after (mutable borrow of swash + font_system).
+        let physicals: Vec<_> = self
+            .buffer
+            .layout_runs()
+            .next()?
+            .glyphs
+            .iter()
+            .map(|g| g.physical((subpx_x, 0.0), 1.0))
+            .collect();
+
+        struct Part {
+            left: i32,
+            /// Top edge, up from the baseline.
+            top: i32,
+            w: i32,
+            h: i32,
+            color: bool,
+            data: Vec<u8>,
+        }
+        let mut parts: Vec<Part> = Vec::new();
+        for p in physicals {
+            let Some(img) = self
+                .swash
+                .get_image(&mut self.font_system, p.cache_key)
+                .as_ref()
+            else {
+                continue;
+            };
+            if img.placement.width == 0 || img.placement.height == 0 {
+                continue;
+            }
+            let color = match img.content {
+                SwashContent::Mask => false,
+                SwashContent::Color => true,
+                // Subpixel masks are unused here; treat as blank.
+                SwashContent::SubpixelMask => continue,
+            };
+            parts.push(Part {
+                left: p.x + img.placement.left,
+                top: img.placement.top - p.y,
+                w: img.placement.width as i32,
+                h: img.placement.height as i32,
+                color,
+                data: img.data.clone(),
+            });
+        }
+
+        if parts.len() == 1 {
+            let p = parts.pop().unwrap();
+            return Some(Raster {
+                width: p.w as u32,
+                height: p.h as u32,
+                left: p.left,
+                top: p.top,
+                coverage: p.data,
+                color: p.color,
+            });
+        }
+        if parts.is_empty() {
             return None;
         }
 
-        let color = match img.content {
-            SwashContent::Mask => false,
-            SwashContent::Color => true,
-            // Subpixel masks are unused here; treat as blank.
-            SwashContent::SubpixelMask => return None,
-        };
-
+        // Composite base + marks into one bitmap over the union of bounds.
+        let left = parts.iter().map(|p| p.left).min().unwrap();
+        let top = parts.iter().map(|p| p.top).max().unwrap();
+        let right = parts.iter().map(|p| p.left + p.w).max().unwrap();
+        let bottom = parts.iter().map(|p| p.top - p.h).min().unwrap();
+        let (w, h) = ((right - left) as usize, (top - bottom) as usize);
+        let any_color = parts.iter().any(|p| p.color);
+        let bpp = if any_color { 4 } else { 1 };
+        // ponytail: max-blend per channel — cluster parts barely overlap, and it
+        // avoids straight-alpha "over" math; switch to proper over if halos show.
+        let mut out = vec![0u8; w * h * bpp];
+        for p in &parts {
+            for row in 0..p.h as usize {
+                for colx in 0..p.w as usize {
+                    let dx = (p.left - left) as usize + colx;
+                    let dy = (top - p.top) as usize + row;
+                    let di = (dy * w + dx) * bpp;
+                    if any_color {
+                        if p.color {
+                            let si = (row * p.w as usize + colx) * 4;
+                            for k in 0..4 {
+                                out[di + k] = out[di + k].max(p.data[si + k]);
+                            }
+                        } else {
+                            // Mask part in a color raster: white at coverage alpha.
+                            let a = p.data[row * p.w as usize + colx];
+                            for k in 0..4 {
+                                out[di + k] = out[di + k].max(a);
+                            }
+                        }
+                    } else {
+                        out[di] = out[di].max(p.data[row * p.w as usize + colx]);
+                    }
+                }
+            }
+        }
         Some(Raster {
-            width: img.placement.width,
-            height: img.placement.height,
-            left: img.placement.left,
-            top: img.placement.top,
-            coverage: img.data.clone(),
-            color,
+            width: w as u32,
+            height: h as u32,
+            left,
+            top,
+            coverage: out,
+            color: any_color,
         })
     }
 }
@@ -314,6 +458,22 @@ mod tests {
             let r = font.rasterize(c, false, false, 0.0);
             assert!(r.is_some(), "{c:?} should rasterize (fallback coverage)");
         }
+    }
+
+    #[test]
+    fn cluster_composites_combining_mark() {
+        let mut font = Font::new(16.0);
+        // Skip when the host has no usable face at all.
+        let Some(base) = font.rasterize('e', false, false, 0.0) else {
+            return;
+        };
+        let r = font
+            .rasterize_str("e\u{0301}", false, false, 0.0)
+            .expect("cluster rasterizes");
+        assert!(
+            r.height >= base.height,
+            "combining acute should extend the bitmap upward"
+        );
     }
 
     #[test]

@@ -135,6 +135,15 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_set_font_family(IntPtr eng, ushort* ptr, nuint len);
 
+    /// Ligature run shaping; 0 = off, nonzero = on.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_ligatures(IntPtr eng, byte on);
+
+    /// Cursor: style 0 = shell default, 1 = block, 2 = bar, 3 = underline;
+    /// blink nonzero = on.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_cursor(IntPtr eng, byte style, byte blink);
+
     /// Installed font families, '\n'-joined UTF-16; free with velo_free_utf16.
     [LibraryImport(Core)]
     internal static partial ushort* velo_list_fonts(nuint* outLen);

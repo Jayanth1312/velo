@@ -68,8 +68,35 @@ struct Glyph {
     color: bool,
 }
 
-/// Glyph cache key: char + bold + italic + sub-pixel x bin.
-type GlyphKey = (char, bool, bool, u8);
+/// Glyph cache key: base char + zero-width attachments + bold + italic +
+/// sub-pixel x bin.
+type GlyphKey = (char, [char; 2], bool, bool, u8);
+
+/// Symbol chars eligible for ligature run shaping. Letters/digits stay
+/// per-cell (Otty-style: ligatures fire only on symbol runs).
+fn is_lig_char(c: char) -> bool {
+    matches!(
+        c,
+        '=' | '<'
+            | '>'
+            | '!'
+            | '&'
+            | '|'
+            | '+'
+            | '-'
+            | '~'
+            | '^'
+            | '?'
+            | ':'
+            | '/'
+            | '\\'
+            | '*'
+            | '%'
+            | '#'
+            | '.'
+            | '_'
+    )
+}
 
 /// Smooth-scroll easing: a pixel displacement applied to the whole grid in the
 /// vertex shader, eased to 0 with a fixed-duration cubic-out. Fixed duration
@@ -158,6 +185,11 @@ pub struct Renderer {
     grid_cols: u16,
     grid_rows: u16,
     glyphs: HashMap<GlyphKey, Option<Glyph>>,
+    /// Shaped symbol runs (programming ligatures): run text + style ->
+    /// positioned glyphs (x offset from run origin, atlas glyph).
+    runs: HashMap<(String, bool, bool), Vec<(f32, Option<Glyph>)>>,
+    /// Shape consecutive symbol cells as one run so font ligatures apply.
+    ligatures: bool,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
@@ -405,6 +437,8 @@ impl Renderer {
             grid_cols: 0,
             grid_rows: 0,
             glyphs: HashMap::new(),
+            runs: HashMap::new(),
+            ligatures: true,
             shelf_x: 1, // texel 0 is reserved white
             shelf_y: 0,
             shelf_h: 1,
@@ -488,6 +522,7 @@ impl Renderer {
         // Old displacement/overscan is in old-cell units; zoom mid-glide snaps.
         self.scroll_reset();
         self.glyphs.clear();
+        self.runs.clear();
         self.shelf_x = 1; // texel 0 is reserved white
         self.shelf_y = 0;
         self.shelf_h = 1;
@@ -503,13 +538,53 @@ impl Renderer {
         if let Some(g) = self.glyphs.get(&key) {
             return *g;
         }
-        let (c, bold, italic, xbin) = key;
+        let (c, zw, bold, italic, xbin) = key;
         let offset = xbin as f32 / SUBPX_BINS as f32;
-        let g = font
-            .rasterize(c, bold, italic, offset)
-            .and_then(|r| self.alloc(queue, &r));
+        let raster = if zw[0] == '\0' {
+            font.rasterize(c, bold, italic, offset)
+        } else {
+            // Cluster: base + zero-width attachments (combining marks, VS16)
+            // shaped as one unit.
+            let mut s = String::with_capacity(12);
+            s.push(c);
+            for z in zw {
+                if z != '\0' {
+                    s.push(z);
+                }
+            }
+            font.rasterize_str(&s, bold, italic, offset)
+        };
+        let g = raster.and_then(|r| self.alloc(queue, &r));
         self.glyphs.insert(key, g);
         g
+    }
+
+    /// Enable/disable ligature run shaping. Caller forces a full redraw.
+    pub fn set_ligatures(&mut self, on: bool) {
+        self.ligatures = on;
+    }
+
+    /// Shape a symbol run (so ligatures like `=>` collapse) and cache the
+    /// positioned atlas glyphs under the run text + style.
+    fn run(
+        &mut self,
+        queue: &wgpu::Queue,
+        font: &mut text::Font,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Vec<(f32, Option<Glyph>)> {
+        let key = (text.to_string(), bold, italic);
+        if let Some(v) = self.runs.get(&key) {
+            return v.clone();
+        }
+        let v: Vec<(f32, Option<Glyph>)> = font
+            .shape_run(text, bold, italic)
+            .into_iter()
+            .map(|(gx, r)| (gx, self.alloc(queue, &r)))
+            .collect();
+        self.runs.insert(key, v.clone());
+        v
     }
 
     /// Place a rasterized glyph into the RGBA atlas via the shelf allocator.
@@ -651,7 +726,40 @@ impl Renderer {
 
         let cursor_here = frame.cursor_shape != CursorShape::Hidden && frame.cursor_row == row;
 
-        for cell in cells {
+        // Ligature pass: mark maximal runs of adjacent same-style symbol cells;
+        // their glyph slots are filled from one shaped run below instead of
+        // per-cell rasters.
+        let mut in_run = vec![false; cells.len()];
+        let mut lig_runs: Vec<(usize, usize)> = Vec::new(); // [i, j) index ranges
+        if self.ligatures {
+            let mut i = 0;
+            while i < cells.len() {
+                if !is_lig_char(cells[i].c) || cells[i].zw[0] != '\0' {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < cells.len()
+                    && cells[j].col == cells[j - 1].col + 1
+                    && is_lig_char(cells[j].c)
+                    && cells[j].zw[0] == '\0'
+                    && cells[j].bold == cells[i].bold
+                    && cells[j].italic == cells[i].italic
+                    && cells[j].fg == cells[i].fg
+                {
+                    j += 1;
+                }
+                if j - i >= 2 {
+                    for k in i..j {
+                        in_run[k] = true;
+                    }
+                    lig_runs.push((i, j));
+                }
+                i = j;
+            }
+        }
+
+        for (idx, cell) in cells.iter().enumerate() {
             if cell.col >= self.grid_cols {
                 continue;
             }
@@ -671,13 +779,13 @@ impl Renderer {
                 self.slots[base] = self.solid(x, y, self.cell_w, self.cell_h, bg);
             }
 
-            // Slot 1: glyph.
-            if cell.c != '\0' {
+            // Slot 1: glyph (ligature-run members are drawn after this loop).
+            if cell.c != '\0' && !in_run[idx] {
                 let pen_x = x;
                 let xi = pen_x.floor();
                 let frac = pen_x - xi;
                 let xbin = ((frac * SUBPX_BINS as f32).round() as u32 % SUBPX_BINS) as u8;
-                if let Some(g) = self.glyph(queue, font, (cell.c, cell.bold, cell.italic, xbin)) {
+                if let Some(g) = self.glyph(queue, font, (cell.c, cell.zw, cell.bold, cell.italic, xbin)) {
                     let gx = xi + g.left;
                     let gy = y + self.ascent - g.top;
                     self.slots[base + 1] = self.glyph_instance(&g, gx, gy, cell.fg);
@@ -713,6 +821,31 @@ impl Renderer {
                 let thick = (self.cell_h * 0.07).max(1.0);
                 let sy = y + self.ascent * 0.65;
                 self.slots[base + 3] = self.solid(x, sy, self.cell_w, thick, cell.fg);
+            }
+        }
+
+        // Draw each ligature run: shaped glyphs land in the run's cells' glyph
+        // slots in visual order (a collapsed `=>` produces one glyph in the
+        // first cell; the second cell's slot stays empty).
+        for &(i, j) in &lig_runs {
+            let text: String = cells[i..j].iter().map(|c| c.c).collect();
+            let run_x = self.pad_x + cells[i].col as f32 * self.cell_w;
+            let y = self.pad_y + row as f32 * self.cell_h;
+            let shaped = self.run(queue, font, &text, cells[i].bold, cells[i].italic);
+            for (n, (gx_off, g)) in shaped.into_iter().enumerate() {
+                // More glyphs than cells can't happen for a mono font; guard anyway.
+                let Some(cell) = cells.get(i + n).filter(|_| i + n < j) else {
+                    break;
+                };
+                if cell.col >= self.grid_cols {
+                    continue;
+                }
+                if let Some(g) = g {
+                    let base = self.slot_base(row, cell.col);
+                    let gx = (run_x + gx_off).floor() + g.left;
+                    let gy = y + self.ascent - g.top;
+                    self.slots[base + 1] = self.glyph_instance(&g, gx, gy, cells[i].fg);
+                }
             }
         }
 
@@ -752,7 +885,7 @@ impl Renderer {
                         let xi = x.floor();
                         let frac = x - xi;
                         let xbin = ((frac * SUBPX_BINS as f32).round() as u32 % SUBPX_BINS) as u8;
-                        if let Some(g) = self.glyph(queue, font, (c.c, c.bold, c.italic, xbin)) {
+                        if let Some(g) = self.glyph(queue, font, (c.c, c.zw, c.bold, c.italic, xbin)) {
                             let gx = xi + g.left;
                             let gy = y + self.ascent - g.top;
                             // Color glyphs keep their own color; mask glyphs use bg.
@@ -1071,6 +1204,7 @@ mod row_ranges_tests {
             col,
             row,
             c: 'x',
+            zw: ['\0'; 2],
             fg: [0, 0, 0],
             bg: [0, 0, 0],
             bold: false,

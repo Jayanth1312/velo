@@ -65,8 +65,8 @@ mod imp {
         DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassW, HMENU,
-        HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, KillTimer, PostMessageW, RegisterClassW,
+        SetTimer, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_TIMER, WNDCLASSW,
     };
 
     use super::{FONT_SIZE_PT, PAD_LOGICAL_PX};
@@ -77,6 +77,10 @@ mod imp {
     const WM_APP: u32 = 0x8000;
     const MSG_PTY_DATA: u32 = WM_APP + 1;
     const MSG_PTY_EOF: u32 = WM_APP + 2;
+    /// Win32 timer id on the wakeup window driving cursor blink.
+    const BLINK_TIMER_ID: usize = 0xB111;
+    /// Blink half-period (ms); matches the Windows default caret rate.
+    const BLINK_MS: u32 = 530;
 
     /// Subclass id for the wakeup-window hook (any stable per-proc constant).
     const SUBCLASS_ID: usize = 1;
@@ -347,6 +351,14 @@ mod imp {
         bg: [u8; 3],
         /// Terminal background alpha (0 = transparent → blur-through, 1 = opaque).
         bg_a: f32,
+        /// Ligature run shaping (applies to every pane; new panes inherit it).
+        ligatures: bool,
+        /// Cursor shape override (`None` = follow the shell / DECSCUSR).
+        cursor_style: Option<term_core::CursorShape>,
+        /// Blink the cursor (Win32 timer on the wakeup window).
+        cursor_blink: bool,
+        /// Current blink phase (true = cursor visible).
+        blink_on: bool,
 
         // Panes keyed by stable id (index); `None` = freed slot so ids stay stable.
         // Pane 0 is the primary surface created at `velo_attach`.
@@ -586,6 +598,18 @@ mod imp {
                     }
                 }
             };
+            // User cursor override + blink phase (terminal panes only; the
+            // editor draws its own caret).
+            if matches!(kind, PaneKind::Terminal)
+                && frame.cursor_shape != term_core::CursorShape::Hidden
+            {
+                if let Some(s) = self.cursor_style {
+                    frame.cursor_shape = s;
+                }
+                if self.cursor_blink && !self.blink_on {
+                    frame.cursor_shape = term_core::CursorShape::Hidden;
+                }
+            }
             // Disjoint field borrows: `self.panes` (mut) vs `self.device`,
             // `self.queue`, `self.font` (the renderer draw args).
             let Some(Some(pane)) = self.panes.get_mut(idx) else {
@@ -784,6 +808,46 @@ mod imp {
             }
         }
 
+        /// Cursor style override (0 = follow the shell / DECSCUSR, 1 = block,
+        /// 2 = bar, 3 = underline) + blink. Blink runs a Win32 timer on the
+        /// wakeup window; each tick flips the phase and repaints.
+        fn set_cursor(&mut self, style: u8, blink: bool) {
+            self.cursor_style = match style {
+                1 => Some(term_core::CursorShape::Block),
+                2 => Some(term_core::CursorShape::Bar),
+                3 => Some(term_core::CursorShape::Underline),
+                _ => None,
+            };
+            if blink != self.cursor_blink {
+                self.cursor_blink = blink;
+                self.blink_on = true;
+                unsafe {
+                    if blink {
+                        SetTimer(Some(self.wakeup_hwnd), BLINK_TIMER_ID, BLINK_MS, None);
+                    } else {
+                        let _ = KillTimer(Some(self.wakeup_hwnd), BLINK_TIMER_ID);
+                    }
+                }
+            }
+            for p in self.panes.iter_mut().flatten() {
+                p.force_full = true;
+            }
+            self.render_all();
+        }
+
+        /// Toggle ligature run shaping on every pane (new panes inherit it).
+        fn set_ligatures(&mut self, on: bool) {
+            if self.ligatures == on {
+                return;
+            }
+            self.ligatures = on;
+            for p in self.panes.iter_mut().flatten() {
+                p.renderer.set_ligatures(on);
+                p.force_full = true;
+            }
+            self.render_all();
+        }
+
         /// Set the terminal background (surface clear) color on every pane.
         fn set_bg(&mut self, bg: [u8; 3]) {
             self.bg = bg;
@@ -829,7 +893,8 @@ mod imp {
         fn add_pane(&mut self, kind: PaneKind) -> Result<(usize, *mut c_void)> {
             let swapchain = unsafe { create_comp_swapchain(&self.queue)? };
             let raw = swapchain.as_raw();
-            let renderer = build_renderer(&self.device, &self.queue, &self.font, self.bg, self.bg_a);
+            let mut renderer = build_renderer(&self.device, &self.queue, &self.font, self.bg, self.bg_a);
+            renderer.set_ligatures(self.ligatures);
             let pane = Pane {
                 kind,
                 swapchain,
@@ -1683,6 +1748,16 @@ mod imp {
                 eng.on_pty_data(wparam.0);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
+                // ponytail: full repaint per blink tick; damage just the cursor
+                // row if this ever shows up in profiles.
+                eng.blink_on = !eng.blink_on;
+                for p in eng.panes.iter_mut().flatten() {
+                    p.force_full = true;
+                }
+                eng.render_all();
+                LRESULT(0)
+            }
             MSG_PTY_EOF => {
                 let id = wparam.0 as u32;
                 dbglog(&format!("MSG_PTY_EOF: session {id} ended (shell exited)"));
@@ -1840,6 +1915,10 @@ mod imp {
             shell: "powershell.exe".to_string(),
             bg,
             bg_a,
+            ligatures: true,
+            cursor_style: None,
+            cursor_blink: false,
+            blink_on: true,
             panes: vec![Some(pane0)],
             focused_pane: 0,
             sessions: Vec::new(),
@@ -2302,6 +2381,29 @@ mod imp {
     pub unsafe extern "C" fn velo_set_font_size(eng: *mut Engine, pt: f32) {
         if let Some(e) = eng.as_mut() {
             e.set_font_size(pt);
+        }
+    }
+
+    /// Cursor style override (0 = shell default, 1 = block, 2 = bar,
+    /// 3 = underline) + blink (nonzero = on). Forces a redraw.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_cursor(eng: *mut Engine, style: u8, blink: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.set_cursor(style, blink != 0);
+        }
+    }
+
+    /// Toggle ligature run shaping (0 = off, nonzero = on). Forces a redraw.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_ligatures(eng: *mut Engine, on: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.set_ligatures(on != 0);
         }
     }
 
