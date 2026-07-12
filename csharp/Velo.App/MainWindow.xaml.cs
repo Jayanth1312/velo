@@ -3062,12 +3062,9 @@ public sealed partial class MainWindow : Window
                 fixed (char* p = fam)
                     Native.velo_set_font_family(_engine, (ushort*)p, (nuint)fam.Length);
             }
-            _appliedFontFamily = _settings.FontFamily;
+            _appliedFontFamily = _settings.FontFamily ?? "";
         }
-        // Chrome font: inherited by everything under RootGrid.
-        RootGrid.FontFamily = _settings.ApplyFontToApp && !string.IsNullOrWhiteSpace(_settings.FontFamily)
-            ? new FontFamily(_settings.FontFamily)
-            : FontFamily.XamlAutoFontFamily;
+        ApplyAppFont();
         SetShell(_settings.Shell);
         PushPalette(Themes.ByName(_settings.ThemeName));
         var (r, g, b) = _settings.BackgroundRgb();
@@ -3166,6 +3163,29 @@ public sealed partial class MainWindow : Window
         // readable over the dim overlay at very low opacity settings.
         byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
         PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
+    }
+
+    /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
+    /// font inheritance, so: override the theme resource (future controls, e.g.
+    /// new tab headers from templates) and walk the live tree (existing ones).
+    private void ApplyAppFont()
+    {
+        var fam = _settings.ApplyFontToApp && !string.IsNullOrWhiteSpace(_settings.FontFamily)
+            ? new FontFamily(_settings.FontFamily)
+            : FontFamily.XamlAutoFontFamily;
+        Application.Current.Resources["ContentControlThemeFontFamily"] = fam;
+        ApplyFontRecursive(RootGrid, fam);
+    }
+
+    private static void ApplyFontRecursive(DependencyObject node, FontFamily fam)
+    {
+        if (node is Control c)
+            c.FontFamily = fam;
+        else if (node is TextBlock tb)
+            tb.FontFamily = fam;
+        int n = VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < n; i++)
+            ApplyFontRecursive(VisualTreeHelper.GetChild(node, i), fam);
     }
 
     /// Installed font families from the core's font db (sorted, deduped).
