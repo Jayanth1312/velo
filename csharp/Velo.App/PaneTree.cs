@@ -17,7 +17,7 @@ sealed class Leaf : PaneNode
 sealed class Branch : PaneNode
 {
     public bool Vertical;       // true = stacked rows, false = side-by-side columns
-    public double Ratio = 0.5;  // first child's share (fixed 0.5 this phase)
+    public double? Ratio;       // first child's share; null = auto (leaf-count weight)
     public PaneNode A = null!, B = null!;
 }
 
