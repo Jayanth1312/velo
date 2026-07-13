@@ -281,6 +281,15 @@
                                 KeyDown="Panel_KeyDown"
                                 CharacterReceived="Panel_CharacterReceived" />
 
+                <!-- Accent outline around the focused split pane. -->
+                <Border x:Name="PaneFocusRing"
+                        Visibility="Collapsed"
+                        IsHitTestVisible="False"
+                        BorderBrush="{ThemeResource AccentFillColorDefaultBrush}"
+                        BorderThickness="1"
+                        HorizontalAlignment="Left" VerticalAlignment="Top"
+                        Canvas.ZIndex="5" />
+
                 <!-- Drop-zone overlay (a single highlight repositioned per edge). -->
                 <Grid x:Name="SplitOverlay"
                       Grid.RowSpan="4" Grid.ColumnSpan="4"
@@ -475,6 +484,21 @@
                 PointerReleased="TitleBarHover_PointerReleased"
                 DoubleTapped="TitleBarHover_DoubleTapped" />
 
+        <!-- Sidebar drag-resize grips: thin invisible strips on the terminal
+             column's edges, over the seams to the left/right panels. -->
+        <Rectangle x:Name="DetailsGrip" Grid.Column="1" Width="6"
+                   HorizontalAlignment="Left" VerticalAlignment="Stretch"
+                   Margin="0,34,0,0" Fill="Transparent" Canvas.ZIndex="20"
+                   PointerEntered="Grip_PointerEntered" PointerExited="Grip_PointerExited"
+                   PointerPressed="Grip_PointerPressed" PointerMoved="Grip_PointerMoved"
+                   PointerReleased="Grip_PointerReleased" />
+        <Rectangle x:Name="SidebarGrip" Grid.Column="1" Width="6"
+                   HorizontalAlignment="Right" VerticalAlignment="Stretch"
+                   Margin="0,34,0,0" Fill="Transparent" Canvas.ZIndex="20"
+                   PointerEntered="Grip_PointerEntered" PointerExited="Grip_PointerExited"
+                   PointerPressed="Grip_PointerPressed" PointerMoved="Grip_PointerMoved"
+                   PointerReleased="Grip_PointerReleased" />
+
         <!-- Details panel: LEFT column. Holds Info/Outline/Git/Files, switched by
              the icon row. Closed = column width 0; opening animates Width to 280,
              genuinely pushing the terminal. Clipped so content never spills past its
@@ -487,8 +511,9 @@
                 BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}"
                 Background="Transparent">
             <!-- Fixed-width content (stable, no reflow); the Border owns the column
-                 width (set instantly on toggle) and clips the content to it. -->
-            <Grid Width="280" HorizontalAlignment="Left">
+                 width (set instantly on toggle) and clips the content to it.
+                 Width follows the active tab: the Agent panel needs TUI room. -->
+            <Grid x:Name="DetailsContent" Width="280" HorizontalAlignment="Left">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="34" />
                     <RowDefinition Height="*" />
@@ -573,6 +598,34 @@
                                 </Canvas>
                             </Viewbox>
                             <TextBlock x:Name="FilesLabel" Text="Files" Visibility="Collapsed" />
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="AgentTabButton" Style="{StaticResource SectionButtonStyle}"
+                            Tag="Agent" Click="DetailsTab_Click" ToolTipService.ToolTip="Agent">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <!-- Lucide bot (stroke). -->
+                            <Viewbox Width="15" Height="15">
+                                <Canvas Width="24" Height="24">
+                                    <Canvas.Resources>
+                                        <Style TargetType="Path">
+                                            <Setter Property="Stroke" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            <Setter Property="StrokeThickness" Value="2" />
+                                            <Setter Property="StrokeLineJoin" Value="Round" />
+                                            <Setter Property="StrokeStartLineCap" Value="Round" />
+                                            <Setter Property="StrokeEndLineCap" Value="Round" />
+                                        </Style>
+                                    </Canvas.Resources>
+                                    <Path Data="M12 8V4H8" />
+                                    <Rectangle Canvas.Left="4" Canvas.Top="8" Width="16" Height="12"
+                                               RadiusX="2" RadiusY="2"
+                                               Stroke="{ThemeResource TextFillColorSecondaryBrush}" StrokeThickness="2" />
+                                    <Path Data="M2 14h2" />
+                                    <Path Data="M20 14h2" />
+                                    <Path Data="M15 13v2" />
+                                    <Path Data="M9 13v2" />
+                                </Canvas>
+                            </Viewbox>
+                            <TextBlock x:Name="AgentLabel" Text="Agent" Visibility="Collapsed" />
                         </StackPanel>
                     </Button>
                 </StackPanel>
@@ -779,6 +832,70 @@
                                 </DataTemplate>
                             </muxc:TreeView.ItemTemplate>
                         </muxc:TreeView>
+                    </Grid>
+
+                    <!-- AGENT: native chat UI over headless agent CLIs. Each send
+                         runs the picked agent non-interactively in the focused
+                         tab's cwd, so the panel always follows the terminal. -->
+                    <Grid x:Name="AgentPanel" Visibility="Collapsed" RowSpacing="4"
+                          Padding="12,4,12,12">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid Grid.Row="0" ColumnSpacing="4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <!-- DropDownButton + MenuFlyout, not ComboBox: the ComboBox
+                                 popup mispositions when the window is maximized. -->
+                            <DropDownButton x:Name="AgentPick" Grid.Column="0"
+                                            HorizontalAlignment="Left"
+                                            Background="Transparent" BorderThickness="0"
+                                            Content="Scanning for agents…" />
+                            <Button Grid.Column="1" Style="{StaticResource IconButtonStyle}"
+                                    Content="&#xE710;" Click="AgentNew_Click"
+                                    ToolTipService.ToolTip="New chat" />
+                        </Grid>
+                        <TextBlock x:Name="AgentCwd" Grid.Row="1" FontSize="11" Opacity="0.6"
+                                   FontFamily="Consolas, monospace"
+                                   TextTrimming="CharacterEllipsis" />
+                        <Grid Grid.Row="2">
+                            <ScrollViewer x:Name="AgentScroll"
+                                          VerticalScrollBarVisibility="Auto"
+                                          ViewChanged="AgentScroll_ViewChanged">
+                                <StackPanel x:Name="AgentChat" Spacing="16"
+                                            Padding="2,10,8,10" />
+                            </ScrollViewer>
+                            <!-- Empty-chat greeting (sparkle + time-of-day + user). -->
+                            <StackPanel x:Name="AgentGreeting" Spacing="12"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center"
+                                        IsHitTestVisible="False">
+                                <TextBlock Text="&#x2726;" FontSize="34"
+                                           HorizontalAlignment="Center"
+                                           Foreground="{ThemeResource AccentFillColorDefaultBrush}" />
+                                <TextBlock x:Name="AgentGreetText" FontSize="16"
+                                           Opacity="0.85" HorizontalAlignment="Center" />
+                            </StackPanel>
+                            <!-- Jump-to-bottom, shown only when scrolled up. -->
+                            <Button x:Name="AgentScrollDown" Visibility="Collapsed"
+                                    Style="{StaticResource IconButtonStyle}"
+                                    Content="&#xE74B;" Click="AgentScrollDown_Click"
+                                    HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                    Margin="0,0,0,8"
+                                    Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                    CornerRadius="14" />
+                        </Grid>
+                        <!-- Enter sends, Shift+Enter inserts a newline. -->
+                        <TextBox x:Name="AgentInput" Grid.Row="3"
+                                 PlaceholderText="Ask the agent…"
+                                 AcceptsReturn="True" TextWrapping="Wrap"
+                                 MinHeight="64" MaxHeight="160"
+                                 PreviewKeyDown="AgentInput_KeyDown" />
                     </Grid>
                 </Grid>
             </Grid>

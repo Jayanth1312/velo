@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
@@ -132,6 +133,9 @@ public sealed partial class MainWindow : Window
         Log.Write("ctor: ShellIntegration dispatched");
         SelectDetailsTab(InfoTabButton);   // default section, shown when panel opens
         Log.Write("ctor: SelectDetailsTab done");
+        // Warm the agent scan (PATH + WSL probes take seconds) so the Agent
+        // panel's dropdown is populated by the time it first opens.
+        _ = AgentProfiles.AllAsync();
 
         // Frameless: drop the system title bar (keep the resize border), then
         // extend our content into the whole window.
@@ -278,7 +282,7 @@ public sealed partial class MainWindow : Window
             TerminalPanel.CompositionScaleChanged += OnCompositionScaleChanged;
 
             UpdateMaxGlyph();
-            AddTab();
+            RestoreSession();
             FocusTerminal();
             Log.Write("Loaded: complete");
         }
@@ -289,9 +293,54 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// Reopen last session's tabs, each shell starting in its saved cwd (fresh
+    /// processes — see SessionState). Falls back to one default tab.
+    private void RestoreSession()
+    {
+        var s = SessionState.Load();
+        foreach (var t in s.Tabs)
+        {
+            if (string.IsNullOrWhiteSpace(t.Cmd))
+                continue;
+            var vm = SpawnTab(new ShellProfile("Shell", CmdWithCwd(t.Cmd, t.Cwd), "powershell.svg"));
+            if (vm is null)
+                continue;
+            vm.LaunchCmd = t.Cmd;   // unwrapped: re-saving must not nest the cd
+            _layout.Add(vm);
+        }
+        RefreshTabList();
+        if (Tabs.Count == 0)
+        {
+            AddTab();
+            return;
+        }
+        TabList.SelectedItem = Tabs[0];
+    }
+
+    /// Wrap a shell launch command so it starts in `cwd`.
+    private static string CmdWithCwd(string cmd, string cwd)
+    {
+        if (string.IsNullOrWhiteSpace(cwd))
+            return cmd;
+        var c = cmd.ToLowerInvariant();
+        if (c.Contains("wsl"))
+            return $"{cmd} --cd \"{cwd}\"";
+        if (c.Contains("cmd"))
+            return $"{cmd} /K \"cd /d {cwd}\"";
+        if (c.Contains("powershell") || c.Contains("pwsh"))
+            return $"{cmd} -NoExit -Command \"Set-Location -LiteralPath '{cwd}'\"";
+        return cmd;
+    }
+
     private void OnClosed(object sender, WindowEventArgs e)
     {
         Log.Write($"OnClosed: window closing. Tabs={Tabs.Count}\n{Environment.StackTrace}");
+        // Snapshot tabs (command + cwd) for next launch's RestoreSession.
+        var session = new SessionState();
+        foreach (var t in Tabs)
+            if (t.LaunchCmd.Length > 0)
+                session.Tabs.Add(new SessionState.TabInfo { Cmd = t.LaunchCmd, Cwd = t.Cwd });
+        session.Save();
         if (_engine != IntPtr.Zero)
         {
             // velo_shutdown drops every PTY Session, which calls ClosePseudoConsole
@@ -507,8 +556,9 @@ public sealed partial class MainWindow : Window
         _suppressPaneResize = true;
         // Closing → the terminal column GROWS: pre-size the panes to their final
         // width so the reveal shows rendered terminal, not a background strip.
-        PreGrowPaneSizes(SidebarSurface.ActualWidth - (open ? SidebarWidth : 0));
-        AnimateWidth(SidebarSurface, open ? SidebarWidth : 0, () =>
+        Sidebar.Width = TabsWidth;
+        PreGrowPaneSizes(SidebarSurface.ActualWidth - (open ? TabsWidth : 0));
+        AnimateWidth(SidebarSurface, open ? TabsWidth : 0, () =>
         {
             _suppressPaneResize = false;
             FlushPendingResizes();
@@ -559,8 +609,9 @@ public sealed partial class MainWindow : Window
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
         _suppressPaneResize = true;                              // see SetSidebar
-        PreGrowPaneSizes(DetailsSurface.ActualWidth - (open ? SidebarWidth : 0));
-        AnimateWidth(DetailsSurface, open ? SidebarWidth : 0, () =>
+        DetailsContent.Width = DetailsWidth;
+        PreGrowPaneSizes(DetailsSurface.ActualWidth - (open ? DetailsWidth : 0));
+        AnimateWidth(DetailsSurface, open ? DetailsWidth : 0, () =>
         {
             _suppressPaneResize = false;
             FlushPendingResizes();
@@ -583,6 +634,12 @@ public sealed partial class MainWindow : Window
             SetEditorMode(!_editorMode);
             return; // SetEditorMode owns focus either way
         }
+        // The agent panel is a chat: keyboard goes to its input box.
+        if (ReferenceEquals(sender, AgentTabButton) && _detailsRealized)
+        {
+            AgentInput.Focus(FocusState.Programmatic);
+            return;
+        }
         FocusTerminal();
     }
 
@@ -598,6 +655,7 @@ public sealed partial class MainWindow : Window
             (OutlineTabButton, OutlineLabel),
             (GitTabButton, GitLabel),
             (FilesTabButton, FilesLabel),
+            (AgentTabButton, AgentLabel),
         };
         foreach (var (btn, label) in labels)
         {
@@ -606,6 +664,7 @@ public sealed partial class MainWindow : Window
         }
         if (selected.Tag is string tag)
             _activeDetailsTab = tag;
+        SyncDetailsWidth();
         // Panels live under x:Load="False" — only touch them once realized
         // (i.e. after the panel has been opened at least once).
         if (_detailsRealized)
@@ -613,6 +672,98 @@ public sealed partial class MainWindow : Window
             ApplyDetailsTab();
             RefreshDetails();
         }
+    }
+
+    /// Details column target width: user drag wins, else the Agent panel gets
+    /// more room than the lists.
+    private const double AgentSidebarWidth = 420;
+    private double DetailsWidth => _detailsUserWidth ?? (_activeDetailsTab == "Agent" ? AgentSidebarWidth : SidebarWidth);
+    /// Tabs (right) column target width: user drag wins, else the default.
+    private double TabsWidth => _tabsUserWidth ?? SidebarWidth;
+
+    // ---- Sidebar drag-resize grips ----------------------------------------
+
+    private const double PanelMinWidth = 200, PanelMaxWidth = 600;
+    private double? _detailsUserWidth, _tabsUserWidth;
+    private bool _gripDragL, _gripDragR;
+    private double _gripStartX, _gripStartW;
+
+    private void Grip_PointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        bool open = ReferenceEquals(sender, DetailsGrip) ? _detailsOpen : _sidebarOpen;
+        if (open)
+            SetElementCursor((UIElement)sender, InputSystemCursorShape.SizeWestEast);
+    }
+
+    private void Grip_PointerExited(object sender, PointerRoutedEventArgs e)
+        => SetElementCursor((UIElement)sender, InputSystemCursorShape.Arrow);
+
+    private void Grip_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        bool left = ReferenceEquals(sender, DetailsGrip);
+        if (left ? !_detailsOpen : !_sidebarOpen)
+            return;
+        _gripDragL = left;
+        _gripDragR = !left;
+        _gripStartX = e.GetCurrentPoint(RootGrid).Position.X;
+        _gripStartW = left ? DetailsSurface.ActualWidth : SidebarSurface.ActualWidth;
+        _suppressPaneResize = true;    // one swapchain resize on release, not per frame
+        ((UIElement)sender).CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void Grip_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_gripDragL && !_gripDragR)
+            return;
+        double dx = e.GetCurrentPoint(RootGrid).Position.X - _gripStartX;
+        if (_gripDragL)
+        {
+            double w = Math.Clamp(_gripStartW + dx, PanelMinWidth, PanelMaxWidth);
+            _detailsUserWidth = w;
+            DetailsSurface.Width = w;
+            DetailsContent.Width = w;
+        }
+        else
+        {
+            double w = Math.Clamp(_gripStartW - dx, PanelMinWidth, PanelMaxWidth);
+            _tabsUserWidth = w;
+            SidebarSurface.Width = w;
+            Sidebar.Width = w;
+        }
+        e.Handled = true;
+    }
+
+    private void Grip_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_gripDragL && !_gripDragR)
+            return;
+        _gripDragL = _gripDragR = false;
+        ((UIElement)sender).ReleasePointerCaptures();
+        _suppressPaneResize = false;
+        FlushPendingResizes();
+    }
+
+    private static void SetElementCursor(UIElement el, InputSystemCursorShape shape)
+    {
+        try { s_protectedCursorProp?.SetValue(el, InputSystemCursor.Create(shape)); }
+        catch { /* reflection blocked: cursor stays default */ }
+    }
+
+    /// Re-animate the open details column when a tab switch changes its target
+    /// width (280 lists ↔ 420 agent). Closed panel: SetDetails applies it on open.
+    private void SyncDetailsWidth()
+    {
+        DetailsContent.Width = DetailsWidth;
+        if (!_detailsOpen || Math.Abs(DetailsSurface.ActualWidth - DetailsWidth) < 0.5)
+            return;
+        _suppressPaneResize = true;                              // see SetSidebar
+        PreGrowPaneSizes(DetailsSurface.ActualWidth - DetailsWidth);
+        AnimateWidth(DetailsSurface, DetailsWidth, () =>
+        {
+            _suppressPaneResize = false;
+            FlushPendingResizes();
+        });
     }
 
     // ---- Detail panels (Info / Outline / Git / Files) --------------------
@@ -646,6 +797,7 @@ public sealed partial class MainWindow : Window
         OutlineList.Visibility = _activeDetailsTab == "Outline" ? Visibility.Visible : Visibility.Collapsed;
         GitPanel.Visibility    = _activeDetailsTab == "Git"     ? Visibility.Visible : Visibility.Collapsed;
         FilesPanel.Visibility  = _activeDetailsTab == "Files"   ? Visibility.Visible : Visibility.Collapsed;
+        AgentPanel.Visibility  = _activeDetailsTab == "Agent"   ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void RefreshDetails()
@@ -658,6 +810,7 @@ public sealed partial class MainWindow : Window
             case "Outline": OutlineList.ItemsSource = CurrentTab()?.CommandHistory; break;
             case "Git":     _ = RefreshGitAsync(); break;
             case "Files":   RefreshFiles(); break;
+            case "Agent":   _ = RefreshAgentPanelAsync(); break;
         }
     }
 
@@ -1219,6 +1372,7 @@ public sealed partial class MainWindow : Window
             "Outline" => OutlineTabButton,
             "Git" => GitTabButton,
             "Files" => FilesTabButton,
+            "Agent" => AgentTabButton,
             _ => InfoTabButton,
         };
         SelectDetailsTab(b);
@@ -1496,10 +1650,20 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
-        int i = PaneAt(e.GetCurrentPoint(PaneHost).Position);
+        var pressPos = e.GetCurrentPoint(PaneHost).Position;
+        if (SeamAt(pressPos) is Branch seam)
+        {
+            _seamDrag = seam;
+            _suppressPaneResize = true;   // one swapchain resize on release
+            PaneHost.CapturePointer(e.Pointer);
+            e.Handled = true;
+            return;
+        }
+        int i = PaneAt(pressPos);
         if (i < 0)
             return;
         _focusedPane = i;
+        UpdatePaneFocusRing();
         PaneHost.Focus(FocusState.Pointer);   // SwapChainPanel can't take focus
         Native.velo_pane_focus(_engine, PaneId(_panels[i]));
         // Clicking a split pane makes its tab the active one in the list
@@ -1519,6 +1683,26 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         var pos = e.GetCurrentPoint(PaneHost).Position;
+        if (_seamDrag is Branch drag)
+        {
+            double t = _seamVert ? (pos.Y - _seamOrigin) / _seamExtent
+                                 : (pos.X - _seamOrigin) / _seamExtent;
+            drag.Ratio = Math.Clamp(t, 0.15, 0.85);
+            BuildLayout();
+            e.Handled = true;
+            return;
+        }
+        // Resize cursor over a seam; back to I-beam when leaving it.
+        bool nearSeam = SeamAt(pos) is not null;
+        if (nearSeam != _seamHover)
+        {
+            _seamHover = nearSeam;
+            if (nearSeam)
+                SetElementCursor(PaneHost, _seamVert ? InputSystemCursorShape.SizeNorthSouth
+                                                     : InputSystemCursorShape.SizeWestEast);
+            else
+                SetPaneCursor(false);
+        }
         UpdatePaneCtl(pos);
         int i = _mousePane >= 0 ? _mousePane : PaneAt(pos);
         if (i < 0)
@@ -1619,6 +1803,15 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
+        if (_seamDrag is not null)
+        {
+            _seamDrag = null;
+            PaneHost.ReleasePointerCapture(e.Pointer);
+            _suppressPaneResize = false;
+            FlushPendingResizes();
+            e.Handled = true;
+            return;
+        }
         int i = _mousePane >= 0 ? _mousePane : PaneAt(e.GetCurrentPoint(PaneHost).Position);
         _mousePane = -1;
         PaneHost.ReleasePointerCapture(e.Pointer);
@@ -1745,6 +1938,7 @@ public sealed partial class MainWindow : Window
             return null;
         }
         var vm = new TabVM(id, profile?.Name ?? "PowerShell");
+        vm.LaunchCmd = profile?.Command ?? _settings.Shell;
         ApplyShellKind(vm, profile?.Command ?? _settings.Shell);
         return vm;
     }
@@ -2379,6 +2573,7 @@ public sealed partial class MainWindow : Window
             _slotX[0] = 0; _slotY[0] = 0; _slotW[0] = W; _slotH[0] = H;
             PaneHost.UpdateLayout();
             PushPaneSize(p);
+            UpdatePaneFocusRing();
             return;
         }
 
@@ -2390,6 +2585,65 @@ public sealed partial class MainWindow : Window
         PaneHost.UpdateLayout();
         for (int i = 0; i < _paneCount; i++)
             PushPaneSize(_panels[i]);
+        UpdatePaneFocusRing();
+    }
+
+    /// Accent outline over the focused pane's rect; hidden outside split mode.
+    private void UpdatePaneFocusRing()
+    {
+        if (_paneCount <= 1 || _focusedPane < 0 || _focusedPane >= _paneCount)
+        {
+            PaneFocusRing.Visibility = Visibility.Collapsed;
+            return;
+        }
+        Grid.SetRow(PaneFocusRing, 0);
+        Grid.SetColumn(PaneFocusRing, 0);
+        PaneFocusRing.Width = Math.Max(1, _slotW[_focusedPane]);
+        PaneFocusRing.Height = Math.Max(1, _slotH[_focusedPane]);
+        PaneFocusRing.Margin = new Thickness(_slotX[_focusedPane], _slotY[_focusedPane], 0, 0);
+        PaneFocusRing.Visibility = Visibility.Visible;
+    }
+
+    // ---- Split seam drag-resize --------------------------------------------
+
+    private Branch? _seamDrag;
+    private bool _seamVert;
+    private double _seamOrigin, _seamExtent; // branch rect start/size on the drag axis
+    private bool _seamHover;
+
+    /// Branch whose split seam lies within a few px of `pt` (PaneHost coords),
+    /// walking the tree with PlaceNode's geometry. Sets the _seam* fields.
+    private Branch? SeamAt(Point pt)
+        => _viewRoot is null || _paneCount <= 1
+            ? null
+            : SeamIn(_viewRoot, 0, 0, PaneHost.ActualWidth, PaneHost.ActualHeight, pt);
+
+    private Branch? SeamIn(PaneNode node, double x, double y, double w, double h, Point pt)
+    {
+        if (node is not Branch b)
+            return null;
+        const double grab = 4;
+        double fa = b.Ratio ?? (double)PaneTree.Count(b.A) / PaneTree.Count(node);
+        if (b.Vertical)
+        {
+            double ha = h * fa;
+            if (pt.X >= x && pt.X <= x + w && Math.Abs(pt.Y - (y + ha)) <= grab)
+            {
+                _seamVert = true; _seamOrigin = y; _seamExtent = h;
+                return b;
+            }
+            return SeamIn(b.A, x, y, w, ha, pt) ?? SeamIn(b.B, x, y + ha, w, h - ha, pt);
+        }
+        else
+        {
+            double wa = w * fa;
+            if (pt.Y >= y && pt.Y <= y + h && Math.Abs(pt.X - (x + wa)) <= grab)
+            {
+                _seamVert = false; _seamOrigin = x; _seamExtent = w;
+                return b;
+            }
+            return SeamIn(b.A, x, y, wa, h, pt) ?? SeamIn(b.B, x + wa, y, w - wa, h, pt);
+        }
     }
 
     private const double SplitGap = 1;   // seam between panes
@@ -2417,7 +2671,7 @@ public sealed partial class MainWindow : Window
         // of same-orientation splits comes out with equal-sized panes instead of
         // halving each time (1/2, 1/4, 1/8…). ponytail: ignores b.Ratio — manual
         // drag-resize (Phase 3) will reintroduce it, blended with these weights.
-        double fa = (double)PaneTree.Count(b.A) / PaneTree.Count(node);
+        double fa = b.Ratio ?? (double)PaneTree.Count(b.A) / PaneTree.Count(node);
         if (b.Vertical)
         {
             double ha = h * fa;
@@ -3376,6 +3630,13 @@ public sealed partial class MainWindow : Window
             IsOn = _settings.ShellIntegration,
         };
 
+        var agentCmdBox = new TextBox
+        {
+            Header = "Custom agent command",
+            PlaceholderText = "headless command, prompt on stdin — e.g. claude -p",
+            Text = _settings.CustomAgentCommand,
+        };
+
         var terminal = new StackPanel { Spacing = 12 };
         terminal.Children.Add(Section("Shell"));
         terminal.Children.Add(shellBox);
@@ -3384,11 +3645,32 @@ public sealed partial class MainWindow : Window
             "Shell integration injects OSC 7/133 markers into the shell "
             + "profile on startup. Changes apply to new tabs."));
 
+        // ---- Agent page ---------------------------------------------------
+        var defAgentBox = new TextBox
+        {
+            Header = "Default agent",
+            PlaceholderText = "exact name, e.g. Claude Code (Ubuntu); empty = first found",
+            Text = _settings.DefaultAgent,
+        };
+        var agent = new StackPanel { Spacing = 12 };
+        agent.Children.Add(Section("Agent panel"));
+        agent.Children.Add(defAgentBox);
+        agent.Children.Add(agentCmdBox);
+        agent.Children.Add(Hint(
+            "The custom command is an extra non-interactive entry in the agent "
+            + "dropdown; it receives the prompt on stdin. Changes apply after restart."));
+
+        // ---- Keybindings page (placeholder) -------------------------------
+        var keys = new StackPanel { Spacing = 12 };
+        keys.Children.Add(Section("Keybindings"));
+        keys.Children.Add(Hint("Customizable keybindings are coming soon."));
+
         // ---- Sidebar (searchable) + content ------------------------------
         var content = new ScrollViewer
         {
             Content = appearance,
             Height = 480,
+            Width = 520,   // fixed: page switches must not resize the dialog
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             Padding = new Thickness(0, 0, 16, 0),
         };
@@ -3396,6 +3678,8 @@ public sealed partial class MainWindow : Window
         {
             ("Appearance", appearance),
             ("Terminal", terminal),
+            ("Agent", agent),
+            ("Keybindings", keys),
         };
         // Individual options for search: typing lists matching options; picking
         // one opens its page, scrolls it into view, and focuses it.
@@ -3412,6 +3696,8 @@ public sealed partial class MainWindow : Window
             ("Background opacity", 0, opacityBox),
             ("Shell", 1, shellBox),
             ("Shell integration", 1, shellIntBox),
+            ("Default agent", 2, defAgentBox),
+            ("Custom agent command", 2, agentCmdBox),
         };
         var navSearch = new TextBox
         {
@@ -3544,6 +3830,8 @@ public sealed partial class MainWindow : Window
             _settings.CursorBlink = blinkBox.IsOn;
             _settings.Shell = string.IsNullOrWhiteSpace(shellBox.Text) ? _settings.Shell : shellBox.Text;
             _settings.ShellIntegration = shellIntBox.IsOn;
+            _settings.CustomAgentCommand = agentCmdBox.Text.Trim();
+            _settings.DefaultAgent = defAgentBox.Text.Trim();
             _settings.BackgroundHex = bgBox.Text;
             _settings.BackgroundOpacity = opacityBox.Value / 100.0;
             _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;
@@ -3570,6 +3858,8 @@ public sealed partial class MainWindow : Window
         bgBox.LostFocus += (_, _) => Apply();
         shellBox.LostFocus += (_, _) => Apply();
         shellIntBox.Toggled += (_, _) => Apply();
+        agentCmdBox.LostFocus += (_, _) => Apply();
+        defAgentBox.LostFocus += (_, _) => Apply();
 
         closeBtn.Click += (_, _) => Close();
         // Click on the dim scrim (not the card) closes.
@@ -3988,6 +4278,312 @@ public sealed partial class MainWindow : Window
     private void EditorTerm_SizeChanged(object sender, SizeChangedEventArgs e)
     {
         if (_editorTermPane != InvalidId) PushPaneSize(EditorTermPanel);
+    }
+
+    // ---- Sidebar Agent panel ----------------------------------------------
+    // Native chat over headless agent CLIs: each send spawns the picked agent
+    // non-interactively in the focused tab's cwd (prompt on stdin), so the
+    // panel always follows the terminal's directory. Claude resumes its
+    // per-directory session via --continue; other agents are stateless.
+    // ponytail: whole-response append, no streaming; add stream-json when needed.
+
+    private Process? _agentProc;
+    private bool _agentContinue;
+    private string _agentCwd = "";
+
+    private AgentProfile? _agentSel;
+
+    /// Fill the picker flyout once and keep the cwd label current.
+    private async Task RefreshAgentPanelAsync()
+    {
+        AgentCwd.Text = CurrentCwd();
+        if (AgentPick.Flyout is not null)
+        {
+            _ = UpdateAgentGreetingAsync();   // time of day may have moved on
+            return;
+        }
+        var profiles = new List<AgentProfile>(await AgentProfiles.AllAsync());
+        if (!string.IsNullOrWhiteSpace(_settings.CustomAgentCommand))
+            profiles.Add(new AgentProfile("Custom", _settings.CustomAgentCommand, null, "", null));
+        if (profiles.Count == 0)
+        {
+            AgentPick.Content = "No agents found";
+            return;
+        }
+        var flyout = new MenuFlyout();
+        foreach (var prof in profiles)
+        {
+            var p = prof;
+            var item = new MenuFlyoutItem { Text = p.Name };
+            item.Click += (_, _) =>
+            {
+                _agentSel = p;
+                AgentPick.Content = p.Name;
+                _agentContinue = false; // a different agent knows nothing of the last session
+                _ = UpdateAgentGreetingAsync();
+            };
+            flyout.Items.Add(item);
+        }
+        var def = profiles.Find(p => p.Name == _settings.DefaultAgent) ?? profiles[0];
+        _agentSel = def;
+        AgentPick.Content = def.Name;
+        AgentPick.Flyout = flyout;
+        _ = UpdateAgentGreetingAsync();
+    }
+
+    /// Empty-chat hero: time-of-day greeting + the user the agent runs as
+    /// (Windows username, or the WSL distro's user for distro agents).
+    private async Task UpdateAgentGreetingAsync()
+    {
+        bool empty = AgentChat.Children.Count == 0;
+        AgentGreeting.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+        if (!empty)
+            return;
+        int h = DateTime.Now.Hour;
+        var greet = h < 5 ? "Good night" : h < 12 ? "Good morning"
+                  : h < 17 ? "Good afternoon" : h < 21 ? "Good evening" : "Good night";
+        var name = _agentSel?.Distro is string d ? await WslUserAsync(d) : Environment.UserName;
+        AgentGreetText.Text = $"{greet}, {name}";
+    }
+
+    private static readonly Dictionary<string, string> _wslUserCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private static async Task<string> WslUserAsync(string distro)
+    {
+        if (_wslUserCache.TryGetValue(distro, out var hit))
+            return hit;
+        var user = distro;
+        try
+        {
+            var psi = new ProcessStartInfo("wsl.exe")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+            };
+            psi.ArgumentList.Add("-d");
+            psi.ArgumentList.Add(distro);
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add("whoami");
+            using var p = Process.Start(psi);
+            if (p is not null)
+            {
+                var raw = (await p.StandardOutput.ReadToEndAsync()).Trim().Trim('\0');
+                await p.WaitForExitAsync();
+                if (raw.Length > 0)
+                    user = raw;
+            }
+        }
+        catch { /* distro unreachable: fall back to its name */ }
+        _wslUserCache[distro] = user;
+        return user;
+    }
+
+    /// + button: wipe the chat and start a fresh session.
+    private void AgentNew_Click(object sender, RoutedEventArgs e)
+    {
+        try { _agentProc?.Kill(entireProcessTree: true); }
+        catch { /* already exited */ }
+        HideAgentThinking();
+        AgentChat.Children.Clear();
+        _agentContinue = false;
+        AgentScrollDown.Visibility = Visibility.Collapsed;
+        _ = UpdateAgentGreetingAsync();
+        AgentInput.Focus(FocusState.Programmatic);
+    }
+
+    private void AgentScroll_ViewChanged(object? sender, ScrollViewerViewChangedEventArgs e)
+        => AgentScrollDown.Visibility =
+            AgentScroll.VerticalOffset < AgentScroll.ScrollableHeight - 40
+                ? Visibility.Visible : Visibility.Collapsed;
+
+    private void AgentScrollDown_Click(object sender, RoutedEventArgs e)
+        => AgentScroll.ChangeView(null, AgentScroll.ScrollableHeight, null);
+
+    private void AgentInput_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == VirtualKey.Enter && !IsDown(VirtualKey.Shift))
+        {
+            e.Handled = true;
+            _ = AgentSendAsync();
+        }
+    }
+
+    private async Task AgentSendAsync()
+    {
+        var prompt = AgentInput.Text.Trim();
+        if (prompt.Length == 0 || _agentProc is not null || _agentSel is not AgentProfile p)
+            return;
+        var cwd = CurrentCwd();
+        if (cwd != _agentCwd)
+        {
+            _agentCwd = cwd;
+            _agentContinue = false; // agent sessions are per-directory
+        }
+        AgentCwd.Text = cwd;
+        AgentInput.Text = "";
+        AgentGreeting.Visibility = Visibility.Collapsed;
+        AppendAgentMsg(prompt, user: true);
+        ShowAgentThinking();
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var psi = AgentPsi(p, _agentContinue, cwd);
+            using var proc = Process.Start(psi)!;
+            _agentProc = proc;
+            await proc.StandardInput.WriteAsync(prompt);
+            proc.StandardInput.Close();
+            var outT = proc.StandardOutput.ReadToEndAsync();
+            var errT = proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            var text = (await outT).Trim();
+            if (text.Length == 0)
+                text = (await errT).Trim();
+            if (p.Exe == "ollama")   // reasoning models print their chain inline
+                text = System.Text.RegularExpressions.Regex
+                    .Replace(text, @"(?is)^\s*thinking(\.{3}|…).*?done thinking\.?", "").Trim();
+            HideAgentThinking();
+            AppendAgentMsg(text.Length > 0 ? text : $"(no output, exit {proc.ExitCode})",
+                user: false, seconds: sw.Elapsed.TotalSeconds);
+            if (proc.ExitCode == 0 && p.ContinueArgs is not null)
+                _agentContinue = true;
+        }
+        catch (Exception ex)
+        {
+            AppendAgentMsg(ex.Message, user: false);
+        }
+        finally
+        {
+            _agentProc = null;
+            HideAgentThinking();
+        }
+    }
+
+    // Three staggered pulsing dots appended under the last user message.
+    private StackPanel? _agentThinking;
+
+    private void ShowAgentThinking()
+    {
+        var sp = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 5,
+            Margin = new Thickness(2, 2, 0, 0),
+        };
+        for (int i = 0; i < 3; i++)
+        {
+            var dot = new Microsoft.UI.Xaml.Shapes.Ellipse
+            {
+                Width = 6,
+                Height = 6,
+                Fill = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+                Opacity = 0.25,
+            };
+            var anim = new DoubleAnimation
+            {
+                From = 0.25,
+                To = 1,
+                Duration = new Duration(TimeSpan.FromMilliseconds(350)),
+                AutoReverse = true,
+                RepeatBehavior = RepeatBehavior.Forever,
+                BeginTime = TimeSpan.FromMilliseconds(i * 150),
+            };
+            Storyboard.SetTarget(anim, dot);
+            Storyboard.SetTargetProperty(anim, "Opacity");
+            var sb = new Storyboard();
+            sb.Children.Add(anim);
+            sp.Children.Add(dot);
+            sb.Begin();
+        }
+        _agentThinking = sp;
+        AgentChat.Children.Add(sp);
+        AgentScroll.UpdateLayout();
+        AgentScroll.ChangeView(null, AgentScroll.ScrollableHeight, null, true);
+    }
+
+    private void HideAgentThinking()
+    {
+        if (_agentThinking is null)
+            return;
+        AgentChat.Children.Remove(_agentThinking);
+        _agentThinking = null;
+    }
+
+    /// Headless invocation: WSL agents run via `wsl --cd` (accepts Windows
+    /// paths) + a login shell so ~/.local/bin installs resolve; Windows agents
+    /// via cmd /c (npm shims are .cmd files, not directly spawnable).
+    private static ProcessStartInfo AgentPsi(AgentProfile p, bool cont, string cwd)
+    {
+        var args = cont && p.ContinueArgs is not null ? p.ContinueArgs : p.Args;
+        var cmd = $"{p.Exe} {args}".Trim();
+        ProcessStartInfo psi;
+        if (p.Distro is string d)
+        {
+            psi = new ProcessStartInfo("wsl.exe");
+            psi.ArgumentList.Add("-d");
+            psi.ArgumentList.Add(d);
+            psi.ArgumentList.Add("--cd");
+            psi.ArgumentList.Add(cwd);
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add(p.Shell);
+            psi.ArgumentList.Add("-lic"); // match the probe: rc files set the PATH
+            psi.ArgumentList.Add(cmd);
+        }
+        else
+        {
+            psi = new ProcessStartInfo("cmd.exe") { WorkingDirectory = cwd };
+            psi.ArgumentList.Add("/c");
+            psi.ArgumentList.Add(cmd);
+        }
+        psi.RedirectStandardInput = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.StandardInputEncoding = Encoding.UTF8;
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
+        return psi;
+    }
+
+    /// User prompts get a subtle pill; agent replies are plain selectable text
+    /// with an elapsed-time caption underneath.
+    private void AppendAgentMsg(string text, bool user, double? seconds = null)
+    {
+        var tb = new TextBlock
+        {
+            Text = text,
+            FontSize = 13,
+            TextWrapping = TextWrapping.Wrap,
+            IsTextSelectionEnabled = true,
+        };
+        if (user)
+        {
+            AgentChat.Children.Add(new Border
+            {
+                Background = (Brush)Application.Current.Resources["SubtleFillColorSecondaryBrush"],
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12, 8, 12, 8),
+                Margin = new Thickness(0, 0, 12, 0),
+                Child = tb,
+            });
+        }
+        else
+        {
+            var reply = new StackPanel { Spacing = 6, Margin = new Thickness(2, 0, 0, 0) };
+            reply.Children.Add(tb);
+            if (seconds is double s)
+                reply.Children.Add(new TextBlock
+                {
+                    Text = s < 60 ? $"{s:0.0}s" : $"{(int)(s / 60)}m {s % 60:0}s",
+                    FontSize = 11,
+                    Opacity = 0.5,
+                });
+            AgentChat.Children.Add(reply);
+        }
+        AgentScroll.UpdateLayout();
+        AgentScroll.ChangeView(null, AgentScroll.ScrollableHeight, null, true);
     }
 
     private void EditorPanel_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
