@@ -17,6 +17,8 @@ public sealed class SessionState
         public string Cwd { get; set; } = "";
         /// velo-pty-host session id; uint.MaxValue = none (spawn fresh).
         public uint HostId { get; set; } = uint.MaxValue;
+        /// Command running at close (OSC 133), for opt-in re-run on restore.
+        public string Running { get; set; } = "";
     }
 
     public sealed class AgentMsg

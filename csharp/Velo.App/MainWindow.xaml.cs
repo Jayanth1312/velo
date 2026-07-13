@@ -319,7 +319,8 @@ public sealed partial class MainWindow : Window
             }
             if (vm is null)
             {
-                vm = SpawnTab(new ShellProfile("Shell", CmdWithCwd(t.Cmd, t.Cwd), "powershell.svg"));
+                var run = ShouldRerun(t.Running) ? t.Running : null;
+                vm = SpawnTab(new ShellProfile("Shell", CmdWithCwd(t.Cmd, t.Cwd, run), "powershell.svg"));
                 if (vm is null)
                     continue;
                 vm.LaunchCmd = t.Cmd;   // unwrapped: re-saving must not nest the cd
@@ -335,8 +336,24 @@ public sealed partial class MainWindow : Window
         TabList.SelectedItem = Tabs[0];
     }
 
-    /// Wrap a shell launch command so it starts in `cwd`.
-    private static string CmdWithCwd(string cmd, string cwd)
+    /// True when policy + whitelist allow re-launching `running` on restore.
+    private bool ShouldRerun(string running)
+    {
+        if (string.IsNullOrWhiteSpace(running) || _settings.RerunOnRestore == "Off")
+            return false;
+        if (_settings.RerunOnRestore == "All")
+            return true;
+        var first = running.TrimStart().Split(' ', '\t')[0];
+        foreach (var w in _settings.RerunWhitelist.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            if (first.Equals(w, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    /// Wrap a shell launch command so it starts in `cwd`, optionally re-running
+    /// `run` there (PowerShell/cmd only; WSL tabs keep processes alive via the
+    /// pty host instead).
+    private static string CmdWithCwd(string cmd, string cwd, string? run = null)
     {
         if (string.IsNullOrWhiteSpace(cwd))
             return cmd;
@@ -344,9 +361,13 @@ public sealed partial class MainWindow : Window
         if (c.Contains("wsl"))
             return $"{cmd} --cd \"{cwd}\"";
         if (c.Contains("cmd"))
-            return $"{cmd} /K \"cd /d {cwd}\"";
+            return run is null
+                ? $"{cmd} /K \"cd /d {cwd}\""
+                : $"{cmd} /K \"cd /d {cwd} && {run}\"";
         if (c.Contains("powershell") || c.Contains("pwsh"))
-            return $"{cmd} -NoExit -Command \"Set-Location -LiteralPath '{cwd}'\"";
+            return run is null
+                ? $"{cmd} -NoExit -Command \"Set-Location -LiteralPath '{cwd}'\""
+                : $"{cmd} -NoExit -Command \"Set-Location -LiteralPath '{cwd}'; {run.Replace("\"", "'")}\"";
         return cmd;
     }
 
@@ -362,11 +383,15 @@ public sealed partial class MainWindow : Window
                     Cmd = t.LaunchCmd,
                     Cwd = t.Cwd,
                     HostId = _engine != IntPtr.Zero ? Native.velo_tab_host_id(_engine, t.Id) : uint.MaxValue,
+                    Running = t.RunningCommand,
                 });
-        foreach (var m in _agentHistory)
-            session.AgentChat.Add(new SessionState.AgentMsg { Text = m.Text, User = m.User });
-        session.AgentName = _agentSel?.Name ?? "";
-        session.AgentContinue = _agentContinue;
+        if (_settings.RestoreAgentChat)
+        {
+            foreach (var m in _agentHistory)
+                session.AgentChat.Add(new SessionState.AgentMsg { Text = m.Text, User = m.User });
+            session.AgentName = _agentSel?.Name ?? "";
+            session.AgentContinue = _agentContinue;
+        }
         session.Save();
         if (_engine != IntPtr.Zero)
         {
@@ -3518,10 +3543,10 @@ public sealed partial class MainWindow : Window
         // ---- Appearance page -------------------------------------------
         var fontBox = new NumberBox
         {
-            Header = "Font size (pt)",
             Value = _settings.FontSize,
             Minimum = 6,
             Maximum = 72,
+            Width = 140,
             SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
         };
 
@@ -3558,37 +3583,29 @@ public sealed partial class MainWindow : Window
 
         var applyAppBox = new CheckBox
         {
-            Content = "Apply this font to the entire app",
+            MinWidth = 0,
             IsChecked = _settings.ApplyFontToApp,
         };
 
-        var ligBox = new ToggleSwitch
-        {
-            Header = "Ligatures (=> != -> collapse into one glyph)",
-            IsOn = _settings.Ligatures,
-        };
+        var ligBox = new ToggleSwitch { IsOn = _settings.Ligatures };
 
-        var backdropBox = new ComboBox { Header = "Backdrop", HorizontalAlignment = HorizontalAlignment.Stretch };
+        var backdropBox = new ComboBox { Width = 140 };
         foreach (var s in new[] { "Mica", "MicaAlt", "Acrylic", "None" })
             backdropBox.Items.Add(s);
         backdropBox.SelectedItem = _settings.Backdrop;
 
-        var bgBox = new TextBox { Header = "Terminal background / tint (#RRGGBB)", Text = _settings.BackgroundHex };
+        var bgBox = new TextBox { Width = 120, Text = _settings.BackgroundHex };
 
         var opacityBox = new Slider
         {
-            Header = "Terminal background opacity (blur)",
             Minimum = 0,
             Maximum = 100,
+            Width = 200,
             Value = _settings.BackgroundOpacity * 100,
             StepFrequency = 5,
         };
 
-        var cursorBox = new ComboBox
-        {
-            Header = "Cursor style",
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-        };
+        var cursorBox = new ComboBox { Width = 190 };
         foreach (var s in new[] { "Default (shell-controlled)", "Block", "Bar", "Underline" })
             cursorBox.Items.Add(s);
         cursorBox.SelectedIndex = _settings.CursorStyle switch
@@ -3599,11 +3616,7 @@ public sealed partial class MainWindow : Window
             _ => 0,
         };
 
-        var blinkBox = new ToggleSwitch
-        {
-            Header = "Cursor blink",
-            IsOn = _settings.CursorBlink,
-        };
+        var blinkBox = new ToggleSwitch { IsOn = _settings.CursorBlink };
 
         // Small-caps section headers + dim hint text (Otty-style pages).
         static TextBlock Section(string s) => new()
@@ -3622,84 +3635,148 @@ public sealed partial class MainWindow : Window
             FontSize = 12,
         };
 
-        var appearance = new StackPanel { Spacing = 12 };
+        // Card row: title + dim description on the left, the control on the
+        // right (settings-app style). RowWide stacks the control underneath
+        // for wide inputs (font list, sliders, long text boxes).
+        static StackPanel RowText(string title, string desc)
+        {
+            var text = new StackPanel { Spacing = 2 };
+            text.Children.Add(new TextBlock { Text = title, FontSize = 14 });
+            if (desc.Length > 0)
+                text.Children.Add(new TextBlock
+                {
+                    Text = desc,
+                    FontSize = 12,
+                    Opacity = 0.6,
+                    TextWrapping = TextWrapping.Wrap,
+                });
+            return text;
+        }
+        static Border Card(UIElement child) => new()
+        {
+            Background = (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(14, 12, 14, 12),
+            Child = child,
+        };
+        static Border Row(string title, string desc, FrameworkElement ctl)
+        {
+            var g = new Grid { ColumnSpacing = 12 };
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var text = RowText(title, desc);
+            Grid.SetColumn(text, 0);
+            Grid.SetColumn(ctl, 1);
+            ctl.VerticalAlignment = VerticalAlignment.Center;
+            if (ctl is ToggleSwitch t)
+            {
+                t.OnContent = null;
+                t.OffContent = null;
+                t.MinWidth = 0;
+                t.Margin = new Thickness(0, 0, -12, 0); // trim the label gutter
+            }
+            g.Children.Add(text);
+            g.Children.Add(ctl);
+            return Card(g);
+        }
+        static Border RowWide(string title, string desc, FrameworkElement ctl)
+        {
+            var sp = new StackPanel { Spacing = 10 };
+            sp.Children.Add(RowText(title, desc));
+            sp.Children.Add(ctl);
+            return Card(sp);
+        }
+
+        var fontPick = new StackPanel { Spacing = 8 };
+        fontPick.Children.Add(fontSearch);
+        fontPick.Children.Add(fontList);
+
+        var appearance = new StackPanel { Spacing = 8 };
         appearance.Children.Add(Section("Text"));
-        appearance.Children.Add(fontBox);
-        appearance.Children.Add(new TextBlock { Text = "Terminal font" });
-        appearance.Children.Add(fontSearch);
-        appearance.Children.Add(fontList);
-        appearance.Children.Add(applyAppBox);
-        appearance.Children.Add(ligBox);
+        appearance.Children.Add(Row("Font size", "Terminal text size in points", fontBox));
+        appearance.Children.Add(RowWide("Terminal font", "Each family previews in its own face", fontPick));
+        appearance.Children.Add(Row("Apply font to entire app", "Tabs, panels and dialogs use the terminal font too", applyAppBox));
+        appearance.Children.Add(Row("Ligatures", "=> != -> collapse into one glyph", ligBox));
         appearance.Children.Add(Section("Cursor"));
-        appearance.Children.Add(cursorBox);
-        appearance.Children.Add(blinkBox);
+        appearance.Children.Add(Row("Cursor style", "Default lets the shell control it (DECSCUSR)", cursorBox));
+        appearance.Children.Add(Row("Cursor blink", "", blinkBox));
         appearance.Children.Add(Section("Window"));
-        appearance.Children.Add(backdropBox);
-        appearance.Children.Add(bgBox);
-        appearance.Children.Add(opacityBox);
-        appearance.Children.Add(Hint(
-            "Lower the terminal opacity to let the backdrop blur show "
-            + "through the terminal (0 = full blur, 100 = solid)."));
+        appearance.Children.Add(Row("Backdrop", "Material behind the window (Mica, Acrylic)", backdropBox));
+        appearance.Children.Add(Row("Background tint", "Terminal background as #RRGGBB", bgBox));
+        appearance.Children.Add(Row("Background opacity", "0 lets the backdrop blur through, 100 is solid", opacityBox));
 
         // ---- Terminal page ----------------------------------------------
         var shellBox = new ComboBox
         {
-            Header = "Shell",
             IsEditable = true,
-            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Width = 200,
             Text = _settings.Shell,
         };
         foreach (var s in new[] { "powershell.exe", "pwsh.exe", "cmd.exe", "wsl.exe" })
             shellBox.Items.Add(s);
 
-        var shellIntBox = new ToggleSwitch
+        var shellIntBox = new ToggleSwitch { IsOn = _settings.ShellIntegration };
+        var recoveryBox = new ToggleSwitch { IsOn = _settings.SessionRecovery };
+        var agentChatBox = new ToggleSwitch { IsOn = _settings.RestoreAgentChat };
+
+        var rerunBox = new ComboBox { Width = 170 };
+        foreach (var s in new[] { "Off", "Whitelisted", "All" })
+            rerunBox.Items.Add(s);
+        rerunBox.SelectedItem = _settings.RerunOnRestore;
+        if (rerunBox.SelectedIndex < 0)
+            rerunBox.SelectedIndex = 1;
+
+        var whitelistBox = new TextBox
         {
-            Header = "Shell integration (cwd + per-command tracking)",
-            IsOn = _settings.ShellIntegration,
+            Text = _settings.RerunWhitelist,
+            PlaceholderText = "npm cargo node …",
         };
 
-        var agentCmdBox = new TextBox
-        {
-            Header = "Custom agent command",
-            PlaceholderText = "headless command, prompt on stdin — e.g. claude -p",
-            Text = _settings.CustomAgentCommand,
-        };
-
-        var recoveryBox = new ToggleSwitch
-        {
-            Header = "Session recovery (processes survive closing the app)",
-            IsOn = _settings.SessionRecovery,
-        };
-
-        var terminal = new StackPanel { Spacing = 12 };
+        var terminal = new StackPanel { Spacing = 8 };
         terminal.Children.Add(Section("Shell"));
-        terminal.Children.Add(shellBox);
-        terminal.Children.Add(shellIntBox);
-        terminal.Children.Add(recoveryBox);
-        terminal.Children.Add(Hint(
-            "Shell integration injects OSC 7/133 markers into the shell "
-            + "profile on startup. Changes apply to new tabs. Session recovery "
-            + "keeps tabs alive in a background host process across restarts."));
+        terminal.Children.Add(Row("Shell", "Command new tabs launch", shellBox));
+        terminal.Children.Add(Row("Shell integration",
+            "Injects OSC 7/133 markers into the shell profile for cwd and per-command tracking; applies to new tabs",
+            shellIntBox));
+        terminal.Children.Add(Section("Session restore"));
+        terminal.Children.Add(Row("Session recovery",
+            "Tabs live in a background host process and reattach — with their processes still running — after closing the app",
+            recoveryBox));
+        terminal.Children.Add(Row("Restore agent chat",
+            "Resume the sidebar agent conversation when the app reopens",
+            agentChatBox));
+        terminal.Children.Add(Row("Re-run processes on restore",
+            "When a tab's live session is gone, re-launch the command it was running",
+            rerunBox));
+        terminal.Children.Add(RowWide("Command whitelist",
+            "First words eligible for re-run, space separated",
+            whitelistBox));
 
         // ---- Agent page ---------------------------------------------------
         var defAgentBox = new TextBox
         {
-            Header = "Default agent",
-            PlaceholderText = "exact name, e.g. Claude Code (Ubuntu); empty = first found",
+            Width = 220,
+            PlaceholderText = "empty = first found",
             Text = _settings.DefaultAgent,
         };
-        var agent = new StackPanel { Spacing = 12 };
+        var agentCmdBox = new TextBox
+        {
+            PlaceholderText = "headless command, prompt on stdin — e.g. claude -p",
+            Text = _settings.CustomAgentCommand,
+        };
+        var agent = new StackPanel { Spacing = 8 };
         agent.Children.Add(Section("Agent panel"));
-        agent.Children.Add(defAgentBox);
-        agent.Children.Add(agentCmdBox);
-        agent.Children.Add(Hint(
-            "The custom command is an extra non-interactive entry in the agent "
-            + "dropdown; it receives the prompt on stdin. Changes apply after restart."));
+        agent.Children.Add(Row("Default agent",
+            "Exact dropdown name, e.g. Claude Code (Ubuntu)",
+            defAgentBox));
+        agent.Children.Add(RowWide("Custom agent command",
+            "Extra non-interactive entry in the agent dropdown; receives the prompt on stdin. Applies after restart",
+            agentCmdBox));
 
         // ---- Keybindings page (placeholder) -------------------------------
-        var keys = new StackPanel { Spacing = 12 };
+        var keys = new StackPanel { Spacing = 8 };
         keys.Children.Add(Section("Keybindings"));
-        keys.Children.Add(Hint("Customizable keybindings are coming soon."));
+        keys.Children.Add(Card(Hint("Customizable keybindings are coming soon.")));
 
         // ---- Sidebar (searchable) + content ------------------------------
         var content = new ScrollViewer
@@ -3733,6 +3810,9 @@ public sealed partial class MainWindow : Window
             ("Shell", 1, shellBox),
             ("Shell integration", 1, shellIntBox),
             ("Session recovery", 1, recoveryBox),
+            ("Restore agent chat", 1, agentChatBox),
+            ("Re-run processes on restore", 1, rerunBox),
+            ("Command whitelist", 1, whitelistBox),
             ("Default agent", 2, defAgentBox),
             ("Custom agent command", 2, agentCmdBox),
         };
@@ -3870,6 +3950,9 @@ public sealed partial class MainWindow : Window
             _settings.CustomAgentCommand = agentCmdBox.Text.Trim();
             _settings.DefaultAgent = defAgentBox.Text.Trim();
             _settings.SessionRecovery = recoveryBox.IsOn;
+            _settings.RestoreAgentChat = agentChatBox.IsOn;
+            _settings.RerunOnRestore = rerunBox.SelectedItem as string ?? _settings.RerunOnRestore;
+            _settings.RerunWhitelist = whitelistBox.Text.Trim();
             _settings.BackgroundHex = bgBox.Text;
             _settings.BackgroundOpacity = opacityBox.Value / 100.0;
             _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;
@@ -3899,6 +3982,9 @@ public sealed partial class MainWindow : Window
         agentCmdBox.LostFocus += (_, _) => Apply();
         defAgentBox.LostFocus += (_, _) => Apply();
         recoveryBox.Toggled += (_, _) => Apply();
+        agentChatBox.Toggled += (_, _) => Apply();
+        rerunBox.SelectionChanged += (_, _) => Apply();
+        whitelistBox.LostFocus += (_, _) => Apply();
 
         closeBtn.Click += (_, _) => Close();
         // Click on the dim scrim (not the card) closes.
@@ -4370,7 +4456,7 @@ public sealed partial class MainWindow : Window
         _agentSel = def;
         AgentPick.Content = def.Name;
         AgentPick.Flyout = flyout;
-        if (_restored.AgentChat.Count > 0)
+        if (_restored.AgentChat.Count > 0 && _settings.RestoreAgentChat)
         {
             foreach (var m in _restored.AgentChat)
                 AppendAgentMsg(m.Text, m.User);
