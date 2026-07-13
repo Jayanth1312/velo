@@ -293,19 +293,37 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// Reopen last session's tabs, each shell starting in its saved cwd (fresh
-    /// processes — see SessionState). Falls back to one default tab.
+    /// Reopen last session's tabs. Tabs that ran in velo-pty-host are ADOPTED —
+    /// the same process, still running, output replayed. Others (or gone host
+    /// sessions) respawn fresh in their saved cwd. Falls back to one default tab.
+    private SessionState _restored = new();
+
     private void RestoreSession()
     {
         var s = SessionState.Load();
+        _restored = s;   // agent chat replays when the panel first opens
         foreach (var t in s.Tabs)
         {
             if (string.IsNullOrWhiteSpace(t.Cmd))
                 continue;
-            var vm = SpawnTab(new ShellProfile("Shell", CmdWithCwd(t.Cmd, t.Cwd), "powershell.svg"));
+            TabVM? vm = null;
+            if (t.HostId != uint.MaxValue && _settings.SessionRecovery)
+            {
+                uint tid = Native.velo_tab_adopt(_engine, t.HostId);
+                Log.Write($"RestoreSession: adopt host={t.HostId} -> {tid}");
+                if (tid != uint.MaxValue)
+                {
+                    vm = new TabVM(tid, "Shell") { LaunchCmd = t.Cmd, Cwd = t.Cwd };
+                    ApplyShellKind(vm, t.Cmd);
+                }
+            }
             if (vm is null)
-                continue;
-            vm.LaunchCmd = t.Cmd;   // unwrapped: re-saving must not nest the cd
+            {
+                vm = SpawnTab(new ShellProfile("Shell", CmdWithCwd(t.Cmd, t.Cwd), "powershell.svg"));
+                if (vm is null)
+                    continue;
+                vm.LaunchCmd = t.Cmd;   // unwrapped: re-saving must not nest the cd
+            }
             _layout.Add(vm);
         }
         RefreshTabList();
@@ -335,11 +353,20 @@ public sealed partial class MainWindow : Window
     private void OnClosed(object sender, WindowEventArgs e)
     {
         Log.Write($"OnClosed: window closing. Tabs={Tabs.Count}\n{Environment.StackTrace}");
-        // Snapshot tabs (command + cwd) for next launch's RestoreSession.
+        // Snapshot tabs (command + cwd + host session) for RestoreSession.
         var session = new SessionState();
         foreach (var t in Tabs)
             if (t.LaunchCmd.Length > 0)
-                session.Tabs.Add(new SessionState.TabInfo { Cmd = t.LaunchCmd, Cwd = t.Cwd });
+                session.Tabs.Add(new SessionState.TabInfo
+                {
+                    Cmd = t.LaunchCmd,
+                    Cwd = t.Cwd,
+                    HostId = _engine != IntPtr.Zero ? Native.velo_tab_host_id(_engine, t.Id) : uint.MaxValue,
+                });
+        foreach (var m in _agentHistory)
+            session.AgentChat.Add(new SessionState.AgentMsg { Text = m.Text, User = m.User });
+        session.AgentName = _agentSel?.Name ?? "";
+        session.AgentContinue = _agentContinue;
         session.Save();
         if (_engine != IntPtr.Zero)
         {
@@ -3306,6 +3333,7 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
+        Native.velo_set_recovery(_engine, _settings.SessionRecovery ? (byte)1 : (byte)0);
         Native.velo_set_font_size(_engine, (float)(_settings.FontSize * _zoom));
         // Font family: pushing rebuilds the font + every atlas, so only on change.
         if (_appliedFontFamily != _settings.FontFamily)
@@ -3637,13 +3665,21 @@ public sealed partial class MainWindow : Window
             Text = _settings.CustomAgentCommand,
         };
 
+        var recoveryBox = new ToggleSwitch
+        {
+            Header = "Session recovery (processes survive closing the app)",
+            IsOn = _settings.SessionRecovery,
+        };
+
         var terminal = new StackPanel { Spacing = 12 };
         terminal.Children.Add(Section("Shell"));
         terminal.Children.Add(shellBox);
         terminal.Children.Add(shellIntBox);
+        terminal.Children.Add(recoveryBox);
         terminal.Children.Add(Hint(
             "Shell integration injects OSC 7/133 markers into the shell "
-            + "profile on startup. Changes apply to new tabs."));
+            + "profile on startup. Changes apply to new tabs. Session recovery "
+            + "keeps tabs alive in a background host process across restarts."));
 
         // ---- Agent page ---------------------------------------------------
         var defAgentBox = new TextBox
@@ -3696,6 +3732,7 @@ public sealed partial class MainWindow : Window
             ("Background opacity", 0, opacityBox),
             ("Shell", 1, shellBox),
             ("Shell integration", 1, shellIntBox),
+            ("Session recovery", 1, recoveryBox),
             ("Default agent", 2, defAgentBox),
             ("Custom agent command", 2, agentCmdBox),
         };
@@ -3832,6 +3869,7 @@ public sealed partial class MainWindow : Window
             _settings.ShellIntegration = shellIntBox.IsOn;
             _settings.CustomAgentCommand = agentCmdBox.Text.Trim();
             _settings.DefaultAgent = defAgentBox.Text.Trim();
+            _settings.SessionRecovery = recoveryBox.IsOn;
             _settings.BackgroundHex = bgBox.Text;
             _settings.BackgroundOpacity = opacityBox.Value / 100.0;
             _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;
@@ -3860,6 +3898,7 @@ public sealed partial class MainWindow : Window
         shellIntBox.Toggled += (_, _) => Apply();
         agentCmdBox.LostFocus += (_, _) => Apply();
         defAgentBox.LostFocus += (_, _) => Apply();
+        recoveryBox.Toggled += (_, _) => Apply();
 
         closeBtn.Click += (_, _) => Close();
         // Click on the dim scrim (not the card) closes.
@@ -4324,10 +4363,20 @@ public sealed partial class MainWindow : Window
             };
             flyout.Items.Add(item);
         }
-        var def = profiles.Find(p => p.Name == _settings.DefaultAgent) ?? profiles[0];
+        // Restored chat wins over the configured default (it continues a session).
+        var def = profiles.Find(p => p.Name == _restored.AgentName)
+               ?? profiles.Find(p => p.Name == _settings.DefaultAgent)
+               ?? profiles[0];
         _agentSel = def;
         AgentPick.Content = def.Name;
         AgentPick.Flyout = flyout;
+        if (_restored.AgentChat.Count > 0)
+        {
+            foreach (var m in _restored.AgentChat)
+                AppendAgentMsg(m.Text, m.User);
+            _agentContinue = _restored.AgentContinue && def.Name == _restored.AgentName;
+            _restored.AgentChat.Clear();
+        }
         _ = UpdateAgentGreetingAsync();
     }
 
@@ -4387,6 +4436,7 @@ public sealed partial class MainWindow : Window
         catch { /* already exited */ }
         HideAgentThinking();
         AgentChat.Children.Clear();
+        _agentHistory.Clear();
         _agentContinue = false;
         AgentScrollDown.Visibility = Visibility.Collapsed;
         _ = UpdateAgentGreetingAsync();
@@ -4547,10 +4597,14 @@ public sealed partial class MainWindow : Window
         return psi;
     }
 
+    /// Chat transcript mirror, persisted in session.json across app restarts.
+    private readonly List<(string Text, bool User)> _agentHistory = new();
+
     /// User prompts get a subtle pill; agent replies are plain selectable text
     /// with an elapsed-time caption underneath.
     private void AppendAgentMsg(string text, bool user, double? seconds = null)
     {
+        _agentHistory.Add((text, user));
         var tb = new TextBlock
         {
             Text = text,

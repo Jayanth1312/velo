@@ -15,9 +15,22 @@ public sealed class SessionState
     {
         public string Cmd { get; set; } = "";
         public string Cwd { get; set; } = "";
+        /// velo-pty-host session id; uint.MaxValue = none (spawn fresh).
+        public uint HostId { get; set; } = uint.MaxValue;
+    }
+
+    public sealed class AgentMsg
+    {
+        public string Text { get; set; } = "";
+        public bool User { get; set; }
     }
 
     public List<TabInfo> Tabs { get; set; } = new();
+
+    // Sidebar agent chat, restored with the tabs.
+    public List<AgentMsg> AgentChat { get; set; } = new();
+    public string AgentName { get; set; } = "";
+    public bool AgentContinue { get; set; }
 
     private static string Path => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

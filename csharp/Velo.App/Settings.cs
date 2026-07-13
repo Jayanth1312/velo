@@ -36,6 +36,8 @@ public sealed class Settings
     public string CustomAgentCommand { get; set; } = "";
     /// Agent preselected in the sidebar panel, by display name ("" = first found).
     public string DefaultAgent { get; set; } = "";
+    /// Run tabs in the detached PTY host so their processes survive app close.
+    public bool SessionRecovery { get; set; } = true;
 
     private static string Path =>
         System.IO.Path.Combine(
