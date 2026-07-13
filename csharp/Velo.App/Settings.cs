@@ -32,6 +32,10 @@ public sealed class Settings
     /// Inject OSC 7 / 133 shell-integration into the shell profile on startup
     /// (cwd + per-command tracking). False = never touch the profile.
     public bool ShellIntegration { get; set; } = true;
+    /// Extra launch command shown in the sidebar Agent panel ("" = none).
+    public string CustomAgentCommand { get; set; } = "";
+    /// Agent preselected in the sidebar panel, by display name ("" = first found).
+    public string DefaultAgent { get; set; } = "";
 
     private static string Path =>
         System.IO.Path.Combine(

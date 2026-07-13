@@ -63,6 +63,9 @@ public sealed class TabVM : INotifyPropertyChanged
         new Microsoft.UI.Xaml.Media.Imaging.SvgImageSource(
             new Uri($"ms-appx:///Assets/ShellIcons/{_iconFile}"));
 
+    /// <summary>Unwrapped launch command (shell exe + args), for session restore.</summary>
+    public string LaunchCmd { get; set; } = "";
+
     // Shell integration (OSC 7 / 133). Cwd updates on `cd`; CommandHistory
     // grows as commands run. The detail panels (later phases) bind to these.
     private string _cwd = "";

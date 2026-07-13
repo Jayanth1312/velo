@@ -98,7 +98,7 @@ public static class ShellProfiles
         return false;
     }
 
-    private static IEnumerable<string> WslDistros()
+    internal static IEnumerable<string> WslDistros()
     {
         string raw;
         try
