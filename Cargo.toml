@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/term-core",
   "crates/pty-win",
+  "crates/pty-host",
   "crates/renderer",
   "crates/text",
   "crates/app",
