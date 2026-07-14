@@ -52,8 +52,11 @@ public static class ShellProfiles
                 // "zsh"/"bash" into CJK garbage.
                 StandardOutputEncoding = Encoding.UTF8,
             };
-            psi.ArgumentList.Add("-d");
-            psi.ArgumentList.Add(distro);
+            if (distro.Length > 0)
+            {
+                psi.ArgumentList.Add("-d");
+                psi.ArgumentList.Add(distro);
+            }
             psi.ArgumentList.Add("-e");
             psi.ArgumentList.Add("sh");
             psi.ArgumentList.Add("-c");

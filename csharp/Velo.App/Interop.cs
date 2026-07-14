@@ -76,6 +76,18 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial uint velo_tab_new(IntPtr eng);
 
+    /// Session recovery: tabs spawn in the detached velo-pty-host process.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_recovery(IntPtr eng, byte on);
+
+    /// Reattach to a surviving host session; uint.MaxValue when it's gone.
+    [LibraryImport(Core)]
+    internal static partial uint velo_tab_adopt(IntPtr eng, uint hostId);
+
+    /// Host session id backing a tab (uint.MaxValue when local).
+    [LibraryImport(Core)]
+    internal static partial uint velo_tab_host_id(IntPtr eng, uint id);
+
     [LibraryImport(Core)]
     internal static partial uint velo_tab_close(IntPtr eng, uint id);
 

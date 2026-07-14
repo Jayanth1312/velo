@@ -36,6 +36,15 @@ public sealed class Settings
     public string CustomAgentCommand { get; set; } = "";
     /// Agent preselected in the sidebar panel, by display name ("" = first found).
     public string DefaultAgent { get; set; } = "";
+    /// Run tabs in the detached PTY host so their processes survive app close.
+    public bool SessionRecovery { get; set; } = true;
+    /// Resume the sidebar agent conversation on launch.
+    public bool RestoreAgentChat { get; set; } = true;
+    /// Re-launch the command a tab was running when its live session is gone:
+    /// "Off", "Whitelisted", or "All".
+    public string RerunOnRestore { get; set; } = "Whitelisted";
+    /// First-token prefixes eligible for re-run (space separated).
+    public string RerunWhitelist { get; set; } = "npm pnpm yarn cargo node python ping";
 
     private static string Path =>
         System.IO.Path.Combine(

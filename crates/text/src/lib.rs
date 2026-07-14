@@ -78,6 +78,12 @@ pub struct Font {
     /// Resolved family name when a specific font was loaded; `None` falls back
     /// to generic `Family::Monospace`.
     family: Option<String>,
+    /// Whether the primary family has a real bold / italic face. Requesting a
+    /// style the family lacks makes cosmic-text match a DIFFERENT family
+    /// (usually proportional) — words render with broken spacing ("Cl aude").
+    /// Better upright-but-monospace than slanted-and-proportional.
+    has_bold: bool,
+    has_italic: bool,
     /// Monospace advance width, px.
     pub cell_w: f32,
     /// Line height, px.
@@ -172,6 +178,19 @@ impl Font {
         if let Some(name) = &family {
             db.set_monospace_family(name.clone());
         }
+        let (has_bold, has_italic) = match &family {
+            Some(name) => {
+                let (mut b, mut i) = (false, false);
+                for f in db.faces() {
+                    if f.families.iter().any(|(n, _)| n == name) {
+                        b |= f.weight.0 >= 600;
+                        i |= f.style == fontdb::Style::Italic;
+                    }
+                }
+                (b, i)
+            }
+            None => (true, true),
+        };
 
         let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         let swash = SwashCache::new();
@@ -200,6 +219,8 @@ impl Font {
             swash,
             buffer,
             family,
+            has_bold,
+            has_italic,
             cell_w,
             cell_h,
             ascent,
@@ -243,7 +264,7 @@ impl Font {
     /// `(x offset from the run origin in px, raster)` per glyph, in visual
     /// order. Callers place each raster at `run_origin_x + offset + left`.
     pub fn shape_run(&mut self, text: &str, bold: bool, italic: bool) -> Vec<(f32, Raster)> {
-        let attrs = mono_attrs(&self.family, bold, italic);
+        let attrs = mono_attrs(&self.family, bold && self.has_bold, italic && self.has_italic);
         self.buffer
             .set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
         self.buffer.shape_until_scroll(&mut self.font_system, false);
@@ -300,7 +321,7 @@ impl Font {
         italic: bool,
         subpx_x: f32,
     ) -> Option<Raster> {
-        let attrs = mono_attrs(&self.family, bold, italic);
+        let attrs = mono_attrs(&self.family, bold && self.has_bold, italic && self.has_italic);
         self.buffer
             .set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
         self.buffer.shape_until_scroll(&mut self.font_system, false);

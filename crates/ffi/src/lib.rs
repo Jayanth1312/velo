@@ -33,6 +33,9 @@ const FONT_SIZE_PT: f32 = 13.0;
 const PAD_LOGICAL_PX: f32 = 10.0;
 
 #[cfg(windows)]
+mod host_client;
+
+#[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
     use std::sync::Arc;
@@ -156,11 +159,74 @@ mod imp {
         }
     }
 
+    /// A tab's PTY: in-process ConPTY, or a session owned by the detached
+    /// velo-pty-host process (survives the UI closing — session recovery).
+    enum PtyHandle {
+        Local(pty_win::Pty),
+        Remote(crate::host_client::RemotePty),
+    }
+
+    /// Clonable stdin writer over either backend (mirrors `pty_win::PtyWriter`).
+    #[derive(Clone)]
+    enum HandleWriter {
+        Local(pty_win::PtyWriter),
+        Remote(Arc<std::sync::Mutex<std::fs::File>>),
+    }
+
+    impl HandleWriter {
+        fn write_all(&self, b: &[u8]) -> std::io::Result<()> {
+            match self {
+                HandleWriter::Local(w) => w.write_all(b),
+                HandleWriter::Remote(f) => {
+                    use std::io::Write;
+                    let mut g = f.lock().expect("remote stdin mutex poisoned");
+                    let r = g.write_all(b).and_then(|_| g.flush());
+                    if let Err(e) = &r {
+                        dbglog(&format!("remote stdin write FAILED: {e}"));
+                    }
+                    r
+                }
+            }
+        }
+    }
+
+    impl PtyHandle {
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+            match self {
+                PtyHandle::Local(p) => p.resize(cols, rows),
+                PtyHandle::Remote(r) => r.resize(cols, rows),
+            }
+        }
+
+        fn writer(&self) -> HandleWriter {
+            match self {
+                PtyHandle::Local(p) => HandleWriter::Local(p.writer()),
+                PtyHandle::Remote(r) => HandleWriter::Remote(r.writer()),
+            }
+        }
+
+        /// Host session id when remote (persisted by C# for reattach).
+        fn host_id(&self) -> Option<u32> {
+            match self {
+                PtyHandle::Local(_) => None,
+                PtyHandle::Remote(r) => Some(r.id),
+            }
+        }
+
+        /// End the child. Local drops kill implicitly; remote must ask the
+        /// host (a plain drop DETACHES and leaves it running).
+        fn kill(&self) {
+            if let PtyHandle::Remote(r) = self {
+                r.kill();
+            }
+        }
+    }
+
     /// One terminal tab: an independent shell + parser, plus the inbox the reader
     /// thread fills and the message loop drains.
     struct Session {
         terminal: term_core::Terminal,
-        pty: pty_win::Pty,
+        pty: PtyHandle,
         /// Reader appends, the loop drains via `mem::take`.
         inbox: Arc<Mutex<Vec<u8>>>,
         /// Coalesces PTY-flood wakeups: the reader only posts `MSG_PTY_DATA` on a
@@ -347,6 +413,9 @@ mod imp {
         font_pt: f32,
         /// Shell command line new tabs spawn (default `powershell.exe`).
         shell: String,
+        /// Spawn sessions in the detached velo-pty-host so they survive app
+        /// close (falls back to in-process ConPTY when the host won't start).
+        recovery: bool,
         /// Terminal background (surface clear) color.
         bg: [u8; 3],
         /// Terminal background alpha (0 = transparent → blur-through, 1 = opaque).
@@ -590,11 +659,15 @@ mod imp {
                 },
                 PaneKind::Terminal => {
                     if sid == NO_SESSION {
+                        dbglog(&format!("render_pane: pane {idx} has NO_SESSION"));
                         return;
                     }
                     match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
                         Some(s) => s.terminal.frame(),
-                        None => return,
+                        None => {
+                            dbglog(&format!("render_pane: pane {idx} sid={sid} gone"));
+                            return;
+                        }
                     }
                 }
             };
@@ -616,6 +689,7 @@ mod imp {
                 return;
             };
             if pane.backbuffers.is_empty() {
+                dbglog(&format!("render_pane: pane {idx} has no backbuffers (never sized)"));
                 return;
             }
             if pane.force_full {
@@ -723,6 +797,9 @@ mod imp {
                 let Some(Some(p)) = self.panes.get_mut(idx) else {
                     return;
                 };
+                if (p.width, p.height) != (w, h) {
+                    dbglog(&format!("resize_pane: pane={idx} {w}x{h}px (sid={})", p.session));
+                }
                 p.apply_size(&self.device, w, h, dpi);
                 let (cols, rows) = p.recompute_grid(&self.font, dpi);
                 p.glide_mute_until = std::time::Instant::now() + GLIDE_MUTE_AFTER_RESIZE;
@@ -739,10 +816,15 @@ mod imp {
         fn bind(&mut self, idx: usize, sid: usize) {
             let dims = {
                 let Some(Some(p)) = self.panes.get_mut(idx) else {
+                    dbglog(&format!("bind: pane {idx} MISSING (sid={sid})"));
                     return;
                 };
                 p.session = sid;
                 p.force_full = true;
+                dbglog(&format!(
+                    "bind: pane={idx} sid={sid} grid={}x{} px={}x{} backbuffers={}",
+                    p.cols, p.rows, p.width, p.height, p.backbuffers.len()
+                ));
                 (p.cols, p.rows)
             };
             if sid != NO_SESSION {
@@ -1127,11 +1209,79 @@ mod imp {
             let (cols, rows) = self.pane_cols_rows(self.focused_pane).unwrap_or((80, 24));
 
             let inbox = Arc::new(Mutex::new(Vec::<u8>::new()));
-            let reader_inbox = inbox.clone();
             let wakeup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let reader_wakeup_pending = wakeup_pending.clone();
-            let hwnd_val = self.wakeup_hwnd.0 as isize;
-            let on_event = move |ev: pty_win::PtyEvent| {
+            let on_event = Self::make_on_event(
+                id,
+                inbox.clone(),
+                wakeup_pending.clone(),
+                self.wakeup_hwnd.0 as isize,
+            );
+            dbglog(&format!("spawn_session: id={id}, shell={}, {cols}x{rows}", self.shell));
+            let pty = if self.recovery {
+                match crate::host_client::spawn_remote(&self.shell, cols, rows, on_event) {
+                    Ok(r) => PtyHandle::Remote(r),
+                    Err(e) => {
+                        dbglog(&format!("spawn_session: host spawn failed ({e}); using local pty"));
+                        let ev2 = Self::make_on_event(
+                            id,
+                            inbox.clone(),
+                            wakeup_pending.clone(),
+                            self.wakeup_hwnd.0 as isize,
+                        );
+                        PtyHandle::Local(pty_win::spawn(&self.shell, cols, rows, ev2)?)
+                    }
+                }
+            } else {
+                PtyHandle::Local(match pty_win::spawn(&self.shell, cols, rows, on_event) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        dbglog(&format!("spawn_session: pty spawn FAILED: {e}"));
+                        return Err(e);
+                    }
+                })
+            };
+            self.install_session(id, pty, inbox, wakeup_pending, cols, rows);
+            Ok(id as u32)
+        }
+
+        /// Reattach to a session still alive in velo-pty-host (from a previous
+        /// run). The host replays its output ring so the screen repopulates.
+        fn adopt_session(&mut self, host_id: u32) -> Result<u32> {
+            let id = self
+                .sessions
+                .iter()
+                .position(|s| s.is_none())
+                .unwrap_or(self.sessions.len());
+            let (cols, rows) = self.pane_cols_rows(self.focused_pane).unwrap_or((80, 24));
+            let inbox = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let wakeup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let on_event = Self::make_on_event(
+                id,
+                inbox.clone(),
+                wakeup_pending.clone(),
+                self.wakeup_hwnd.0 as isize,
+            );
+            dbglog(&format!("adopt_session: id={id}, host_id={host_id}"));
+            let remote = match crate::host_client::attach_remote(host_id, on_event) {
+                Ok(r) => r,
+                Err(e) => {
+                    dbglog(&format!("adopt_session: attach host_id={host_id} FAILED: {e}"));
+                    return Err(e);
+                }
+            };
+            let _ = remote.resize(cols, rows);
+            self.install_session(id, PtyHandle::Remote(remote), inbox, wakeup_pending, cols, rows);
+            Ok(id as u32)
+        }
+
+        /// Reader-thread event sink: append to the inbox and poke the UI loop.
+        fn make_on_event(
+            id: usize,
+            reader_inbox: Arc<Mutex<Vec<u8>>>,
+            reader_wakeup_pending: Arc<std::sync::atomic::AtomicBool>,
+            hwnd_val: isize,
+        ) -> impl FnMut(pty_win::PtyEvent) + Send + 'static {
+            move |ev: pty_win::PtyEvent| {
                 let hwnd = HWND(hwnd_val as *mut c_void);
                 match ev {
                     pty_win::PtyEvent::Data(b) => {
@@ -1150,15 +1300,18 @@ mod imp {
                         let _ = PostMessageW(Some(hwnd), MSG_PTY_EOF, WPARAM(id), LPARAM(0));
                     },
                 }
-            };
-            dbglog(&format!("spawn_session: id={id}, shell={}, {cols}x{rows}", self.shell));
-            let pty = match pty_win::spawn(&self.shell, cols, rows, on_event) {
-                Ok(p) => p,
-                Err(e) => {
-                    dbglog(&format!("spawn_session: pty spawn FAILED: {e}"));
-                    return Err(e);
-                }
-            };
+            }
+        }
+
+        fn install_session(
+            &mut self,
+            id: usize,
+            pty: PtyHandle,
+            inbox: Arc<Mutex<Vec<u8>>>,
+            wakeup_pending: Arc<std::sync::atomic::AtomicBool>,
+            cols: u16,
+            rows: u16,
+        ) {
             let writer = pty.writer();
             let terminal = term_core::Terminal::new(
                 cols,
@@ -1180,7 +1333,6 @@ mod imp {
                 self.sessions[id] = Some(session);
             }
             self.tab_order.push(id);
-            Ok(id as u32)
         }
 
         /// Close a session: drop it (its `Pty::drop` joins the reader), remove its
@@ -1191,6 +1343,11 @@ mod imp {
                 return self.tab_order.is_empty();
             };
             if let Some(slot) = self.sessions.get_mut(id) {
+                // Remote sessions detach on drop — a user close must really
+                // end the child, so tell the host first.
+                if let Some(s) = slot.as_deref() {
+                    s.pty.kill();
+                }
                 *slot = None;
             }
             self.tab_order.remove(index);
@@ -1209,6 +1366,8 @@ mod imp {
                 let idx = self.focused_pane;
                 self.bind(idx, id);
                 self.render_pane(idx);
+            } else {
+                dbglog(&format!("set_active: session {id} MISSING (bind skipped)"));
             }
         }
 
@@ -1265,7 +1424,13 @@ mod imp {
                     s.wakeup_pending.store(false, std::sync::atomic::Ordering::Release);
                     std::mem::take(&mut *s.inbox.lock())
                 }
-                None => return,
+                None => {
+                    // No session for this wakeup: its wakeup_pending Arc (shared
+                    // with the reader) would stay true forever and silence every
+                    // future post. Nothing to clear from here — just log it.
+                    dbglog(&format!("on_pty_data: session {id} missing (wakeup dropped)"));
+                    return;
+                }
             };
             if bytes.is_empty() {
                 return;
@@ -1913,6 +2078,7 @@ mod imp {
             dpi_scale: scale,
             font_pt: FONT_SIZE_PT,
             shell: "powershell.exe".to_string(),
+            recovery: false,
             bg,
             bg_a,
             ligatures: true,
@@ -2048,6 +2214,45 @@ mod imp {
             Some(e) => e.spawn_session().unwrap_or(u32::MAX),
             None => u32::MAX,
         }
+    }
+
+    /// Enable/disable session recovery: new tabs spawn inside the detached
+    /// velo-pty-host process and survive the app closing.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_recovery(eng: *mut Engine, on: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.recovery = on != 0;
+        }
+    }
+
+    /// Reattach a tab to host session `host_id` from a previous run. Returns
+    /// the new tab id, or u32::MAX when the session no longer exists.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_tab_adopt(eng: *mut Engine, host_id: u32) -> u32 {
+        match eng.as_mut() {
+            Some(e) => e.adopt_session(host_id).unwrap_or(u32::MAX),
+            None => u32::MAX,
+        }
+    }
+
+    /// Host session id backing tab `id` (u32::MAX when local / no such tab).
+    /// C# persists this so the next launch can `velo_tab_adopt`.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_tab_host_id(eng: *mut Engine, id: u32) -> u32 {
+        eng.as_ref()
+            .and_then(|e| e.sessions.get(id as usize))
+            .and_then(|o| o.as_ref())
+            .and_then(|s| s.pty.host_id())
+            .unwrap_or(u32::MAX)
     }
 
     /// Close the tab with stable id `id`. Returns 1 when no tabs remain.

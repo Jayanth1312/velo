@@ -41,6 +41,14 @@
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true"
           Condition="Exists('$(VeloCoreDll)')" />
+    <!-- Session-recovery daemon (cargo release build of pty-host). -->
+    <PropertyGroup>
+      <VeloPtyHost>$(MSBuildThisFileDirectory)..\..\target\release\velo-pty-host.exe</VeloPtyHost>
+    </PropertyGroup>
+    <Copy SourceFiles="$(VeloPtyHost)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(VeloPtyHost)')" />
   </Target>
 
 </Project>
