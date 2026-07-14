@@ -37,8 +37,8 @@ mod imp {
     use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe,
+        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
 
     /// Replay buffer cap per session (screen + recent scrollback approximation).
@@ -227,20 +227,6 @@ mod imp {
                 hlog(&format!("out-{id}: waiting for client"));
                 if unsafe { ConnectNamedPipe(h.0, None) }.is_err() { /* already connected */ }
                 let mut f = h.into_file();
-                // A quiet shell gives this thread nothing to write, so a client
-                // disconnect would go unnoticed and the pipe never recycles.
-                // Probe: a blocking read on a cloned handle EOFs on disconnect.
-                let gone = Arc::new(AtomicBool::new(false));
-                if let Ok(mut probe) = f.try_clone() {
-                    let gone2 = gone.clone();
-                    let cv = buf.clone();
-                    std::thread::spawn(move || {
-                        let mut b = [0u8; 1];
-                        let _ = probe.read(&mut b); // clients never write: blocks until gone
-                        gone2.store(true, Ordering::Release);
-                        cv.1.notify_all();
-                    });
-                }
                 // Atomic replay handoff: snapshot ring, drop pending live bytes
                 // (they are already inside the ring snapshot).
                 let replay: Vec<u8> = {
@@ -248,16 +234,28 @@ mod imp {
                     g.live.clear();
                     g.ring.iter().copied().collect()
                 };
+                hlog(&format!("out-{id}: client connected, replaying {} bytes", replay.len()));
                 let mut broken = f.write_all(&replay).is_err();
-                while !broken && !gone.load(Ordering::Acquire) {
+                if broken {
+                    hlog(&format!("out-{id}: replay write FAILED"));
+                }
+                // NO blocking read may ever park on this handle: synchronous
+                // pipe I/O serializes per instance, so a parked reader blocks
+                // every write below (the "one chunk then silence" bug). A quiet
+                // shell still needs client-gone detection, so on each idle wait
+                // timeout poll PeekNamedPipe — it errors once the client closed.
+                'client: while !broken {
                     let chunk = {
                         let mut g = buf.0.lock().unwrap();
-                        while g.live.is_empty() && !g.eof && !gone.load(Ordering::Acquire) {
-                            let (ng, _t) = buf
+                        while g.live.is_empty() && !g.eof {
+                            let (ng, t) = buf
                                 .1
                                 .wait_timeout(g, Duration::from_millis(500))
                                 .unwrap();
                             g = ng;
+                            if t.timed_out() && client_gone(&f) {
+                                break 'client;
+                            }
                         }
                         if g.live.is_empty() && g.eof {
                             return; // session over: closing the pipe EOFs the client
@@ -267,6 +265,7 @@ mod imp {
                     broken = f.write_all(&chunk).is_err();
                 }
                 // Client went away (UI closed). Loop for the next attach.
+                hlog(&format!("out-{id}: client disconnected"));
                 disconnect(&f);
                 drop(f);
                 if !alive.load(Ordering::Acquire) {
@@ -283,6 +282,7 @@ mod imp {
             loop {
                 let Some(h) = pipe_instance(&name) else { return };
                 if unsafe { ConnectNamedPipe(h.0, None) }.is_err() { /* already connected */ }
+                hlog(&format!("in-{id}: client connected"));
                 let mut f = h.into_file();
                 let mut b = [0u8; 4096];
                 loop {
@@ -290,11 +290,13 @@ mod imp {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             if writer.write_all(&b[..n]).is_err() {
+                                hlog(&format!("in-{id}: pty stdin write FAILED"));
                                 break;
                             }
                         }
                     }
                 }
+                hlog(&format!("in-{id}: client disconnected"));
                 disconnect(&f);
                 drop(f);
                 if !alive.load(Ordering::Acquire) {
@@ -302,6 +304,13 @@ mod imp {
                 }
             }
         });
+    }
+
+    /// True once the client end of a connected pipe has closed. Non-blocking
+    /// (unlike a read, which would serialize against writes on this handle).
+    fn client_gone(f: &File) -> bool {
+        let h = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(f) as _);
+        unsafe { PeekNamedPipe(h, None, 0, None, None, None) }.is_err()
     }
 
     fn exit_if_empty(sessions: &Sessions) {

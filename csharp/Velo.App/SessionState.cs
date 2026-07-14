@@ -33,6 +33,9 @@ public sealed class SessionState
     public List<AgentMsg> AgentChat { get; set; } = new();
     public string AgentName { get; set; } = "";
     public bool AgentContinue { get; set; }
+    /// Question in flight when the app closed; re-asked on restore so the
+    /// answer isn't lost (the agent process dies with the app).
+    public string AgentPending { get; set; } = "";
 
     private static string Path => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

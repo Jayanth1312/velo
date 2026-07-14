@@ -7,21 +7,79 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
 const CTL: &str = r"\\.\pipe\velo-pty-host-ctl";
 
+/// Same velo-debug.log the rest of the app appends to (see lib.rs dbglog).
+fn hclog(msg: &str) {
+    use std::io::Write as _;
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("velo-debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[host_client] {msg}");
+    }
+}
+
 /// A session owned by the host process. Dropping this DETACHES (the child
 /// keeps running); call [`RemotePty::kill`] to actually end it.
 pub struct RemotePty {
     pub id: u32,
     stdin: Arc<Mutex<File>>,
+    /// Latest-wins resize mailbox drained by a worker thread: each ctl
+    /// roundtrip opens a fresh pipe connection (blocking, serialized in the
+    /// host), so resize storms during layout must never run on the UI thread.
+    resize_box: Arc<(Mutex<Option<(u16, u16)>>, Condvar)>,
+}
+
+/// Mailbox sentinel telling the resize worker to exit (0×0 is never a real size).
+const EXIT: (u16, u16) = (0, 0);
+
+impl Drop for RemotePty {
+    fn drop(&mut self) {
+        *self.resize_box.0.lock().unwrap() = Some(EXIT);
+        self.resize_box.1.notify_one();
+    }
 }
 
 impl RemotePty {
+    fn new(id: u32, stdin: File) -> Self {
+        let resize_box: Arc<(Mutex<Option<(u16, u16)>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let mb = resize_box.clone();
+        std::thread::spawn(move || {
+            let mut last = None;
+            loop {
+                let want = {
+                    let mut g = mb.0.lock().unwrap();
+                    while g.is_none() {
+                        g = mb.1.wait(g).unwrap();
+                    }
+                    g.take().unwrap()
+                };
+                if want == EXIT {
+                    return;
+                }
+                if Some(want) == last {
+                    continue;
+                }
+                let mut req = vec![3u8];
+                req.extend_from_slice(&id.to_le_bytes());
+                req.extend_from_slice(&want.0.to_le_bytes());
+                req.extend_from_slice(&want.1.to_le_bytes());
+                if ctl_roundtrip(&req, 1).is_err() {
+                    return; // host gone; further resizes are moot
+                }
+                last = Some(want);
+            }
+        });
+        RemotePty { id, stdin: Arc::new(Mutex::new(stdin)), resize_box }
+    }
+
     pub fn write_all(&self, b: &[u8]) -> std::io::Result<()> {
         let mut f = self.stdin.lock().expect("remote stdin mutex poisoned");
         f.write_all(b)?;
@@ -32,19 +90,25 @@ impl RemotePty {
         self.stdin.clone()
     }
 
+    /// Non-blocking: queues the size for the worker (latest wins).
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let mut req = vec![3u8];
-        req.extend_from_slice(&self.id.to_le_bytes());
-        req.extend_from_slice(&cols.to_le_bytes());
-        req.extend_from_slice(&rows.to_le_bytes());
-        let _ = ctl_roundtrip(&req, 1)?;
+        if (cols, rows) == EXIT {
+            return Ok(()); // 0×0 is the worker's exit sentinel, never a real grid
+        }
+        *self.resize_box.0.lock().unwrap() = Some((cols, rows));
+        self.resize_box.1.notify_one();
         Ok(())
     }
 
+    /// Fire-and-forget: the roundtrip can block for seconds when the ctl
+    /// pipe is busy — never worth stalling a tab close over.
     pub fn kill(&self) {
-        let mut req = vec![4u8];
-        req.extend_from_slice(&self.id.to_le_bytes());
-        let _ = ctl_roundtrip(&req, 1);
+        let id = self.id;
+        std::thread::spawn(move || {
+            let mut req = vec![4u8];
+            req.extend_from_slice(&id.to_le_bytes());
+            let _ = ctl_roundtrip(&req, 1);
+        });
     }
 }
 
@@ -75,6 +139,7 @@ pub fn attach_remote(
     on_event: impl FnMut(pty_win::PtyEvent) + Send + 'static,
 ) -> Result<RemotePty> {
     if !list_remote()?.contains(&id) {
+        hclog(&format!("attach_remote: host session {id} no longer exists"));
         bail!("host session {id} no longer exists");
     }
     open_session(id, on_event)
@@ -101,21 +166,33 @@ fn open_session(
     id: u32,
     mut on_event: impl FnMut(pty_win::PtyEvent) + Send + 'static,
 ) -> Result<RemotePty> {
-    let stdin = connect_retry(&format!(r"\\.\pipe\velo-pty-in-{id}"))?;
-    let mut out = connect_retry(&format!(r"\\.\pipe\velo-pty-out-{id}"))?;
+    let t = std::time::Instant::now();
+    let stdin = connect_retry(&format!(r"\\.\pipe\velo-pty-in-{id}"))
+        .inspect_err(|e| hclog(&format!("open_session {id}: stdin connect FAILED: {e}")))?;
+    let mut out = connect_retry(&format!(r"\\.\pipe\velo-pty-out-{id}"))
+        .inspect_err(|e| hclog(&format!("open_session {id}: out connect FAILED: {e}")))?;
+    hclog(&format!("open_session {id}: pipes connected in {:?}", t.elapsed()));
     std::thread::spawn(move || {
         let mut buf = [0u8; 65536];
+        let mut first = true;
         loop {
             match out.read(&mut buf) {
                 Ok(0) | Err(_) => {
+                    hclog(&format!("open_session {id}: out pipe EOF"));
                     on_event(pty_win::PtyEvent::Eof);
                     break;
                 }
-                Ok(n) => on_event(pty_win::PtyEvent::Data(buf[..n].to_vec())),
+                Ok(n) => {
+                    if first {
+                        hclog(&format!("open_session {id}: first output chunk {n} bytes"));
+                        first = false;
+                    }
+                    on_event(pty_win::PtyEvent::Data(buf[..n].to_vec()));
+                }
             }
         }
     });
-    Ok(RemotePty { id, stdin: Arc::new(Mutex::new(stdin)) })
+    Ok(RemotePty::new(id, stdin))
 }
 
 /// One request/response over a fresh control connection.

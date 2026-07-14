@@ -313,14 +313,14 @@ public sealed partial class MainWindow : Window
                 Log.Write($"RestoreSession: adopt host={t.HostId} -> {tid}");
                 if (tid != uint.MaxValue)
                 {
-                    vm = new TabVM(tid, "Shell") { LaunchCmd = t.Cmd, Cwd = t.Cwd };
+                    vm = new TabVM(tid, ShellDisplayName(t.Cmd)) { LaunchCmd = t.Cmd, Cwd = t.Cwd };
                     ApplyShellKind(vm, t.Cmd);
                 }
             }
             if (vm is null)
             {
                 var run = ShouldRerun(t.Running) ? t.Running : null;
-                vm = SpawnTab(new ShellProfile("Shell", CmdWithCwd(t.Cmd, t.Cwd, run), "powershell.svg"));
+                vm = SpawnTab(new ShellProfile(ShellDisplayName(t.Cmd), CmdWithCwd(t.Cmd, t.Cwd, run), "powershell.svg"));
                 if (vm is null)
                     continue;
                 vm.LaunchCmd = t.Cmd;   // unwrapped: re-saving must not nest the cd
@@ -391,6 +391,7 @@ public sealed partial class MainWindow : Window
                 session.AgentChat.Add(new SessionState.AgentMsg { Text = m.Text, User = m.User });
             session.AgentName = _agentSel?.Name ?? "";
             session.AgentContinue = _agentContinue;
+            session.AgentPending = _agentPendingPrompt ?? "";
         }
         session.Save();
         if (_engine != IntPtr.Zero)
@@ -1989,10 +1990,32 @@ public sealed partial class MainWindow : Window
             Log.Write("SpawnTab: ABORT, velo_tab_new returned uint.MaxValue (shell spawn failed?)");
             return null;
         }
-        var vm = new TabVM(id, profile?.Name ?? "PowerShell");
+        var vm = new TabVM(id, profile?.Name ?? ShellDisplayName(_settings.Shell));
         vm.LaunchCmd = profile?.Command ?? _settings.Shell;
         ApplyShellKind(vm, profile?.Command ?? _settings.Shell);
         return vm;
+    }
+
+    /// Human tab name for a launch command ("wsl.exe -d Ubuntu" -> "Ubuntu").
+    private static string ShellDisplayName(string cmd)
+    {
+        if (cmd.Contains("pwsh", StringComparison.OrdinalIgnoreCase) ||
+            cmd.Contains("powershell", StringComparison.OrdinalIgnoreCase))
+            return "PowerShell";
+        if (cmd.Contains("cmd", StringComparison.OrdinalIgnoreCase))
+            return "Command Prompt";
+        if (cmd.Contains("wsl", StringComparison.OrdinalIgnoreCase))
+        {
+            var d = cmd.IndexOf("-d ", StringComparison.OrdinalIgnoreCase);
+            if (d >= 0)
+            {
+                var distro = cmd[(d + 3)..].Trim().Split(' ')[0];
+                if (distro.Length > 0)
+                    return distro;
+            }
+            return "WSL";
+        }
+        return "Shell";
     }
 
     /// Sets the row's shell-kind label, derived from the launch command. For WSL
@@ -2013,10 +2036,11 @@ public sealed partial class MainWindow : Window
             vm.IconFile = "cmd.svg";
             return;
         }
-        var dIdx = command.IndexOf("-d ", StringComparison.OrdinalIgnoreCase);
-        if (dIdx < 0)
+        if (!command.Contains("wsl", StringComparison.OrdinalIgnoreCase))
             return;
-        var distro = command[(dIdx + 3)..].Trim();
+        var dIdx = command.IndexOf("-d ", StringComparison.OrdinalIgnoreCase);
+        // Plain `wsl.exe` (no -d): default distro — probe with an empty name.
+        var distro = dIdx < 0 ? "" : command[(dIdx + 3)..].Trim().Split(' ')[0];
         vm.IconFile = distro.Contains("ubuntu", StringComparison.OrdinalIgnoreCase)
             ? "ubuntu.svg" : "linux.svg";
         _ = ShellProfiles.DefaultShellForAsync(distro).ContinueWith(t =>
@@ -4415,6 +4439,9 @@ public sealed partial class MainWindow : Window
     private Process? _agentProc;
     private bool _agentContinue;
     private string _agentCwd = "";
+    /// Prompt currently being processed (null = idle). Saved at close so the
+    /// question survives the app exiting mid-answer.
+    private string? _agentPendingPrompt;
 
     private AgentProfile? _agentSel;
 
@@ -4462,6 +4489,14 @@ public sealed partial class MainWindow : Window
                 AppendAgentMsg(m.Text, m.User);
             _agentContinue = _restored.AgentContinue && def.Name == _restored.AgentName;
             _restored.AgentChat.Clear();
+            // A question was mid-flight at close: re-ask it (--continue agents
+            // resume their session; the user bubble is already in the history).
+            if (_restored.AgentPending.Length > 0 && def.Name == _restored.AgentName)
+            {
+                var pending = _restored.AgentPending;
+                _restored.AgentPending = "";
+                _ = AgentSendAsync(pending);
+            }
         }
         _ = UpdateAgentGreetingAsync();
     }
@@ -4479,6 +4514,17 @@ public sealed partial class MainWindow : Window
                   : h < 17 ? "Good afternoon" : h < 21 ? "Good evening" : "Good night";
         var name = _agentSel?.Distro is string d ? await WslUserAsync(d) : Environment.UserName;
         AgentGreetText.Text = $"{greet}, {name}";
+    }
+
+    /// Example-prompt chip under the greeting: insert its text into the input.
+    private void AgentExample_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button b && b.Content is string text)
+        {
+            AgentInput.Text = text;
+            AgentInput.Focus(FocusState.Programmatic);
+            AgentInput.SelectionStart = text.Length;
+        }
     }
 
     private static readonly Dictionary<string, string> _wslUserCache = new(StringComparer.OrdinalIgnoreCase);
@@ -4546,9 +4592,11 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task AgentSendAsync()
+    /// `resend` re-asks a restored pending question: the user bubble is already
+    /// in the replayed history, so it is not appended again.
+    private async Task AgentSendAsync(string? resend = null)
     {
-        var prompt = AgentInput.Text.Trim();
+        var prompt = resend ?? AgentInput.Text.Trim();
         if (prompt.Length == 0 || _agentProc is not null || _agentSel is not AgentProfile p)
             return;
         var cwd = CurrentCwd();
@@ -4558,9 +4606,13 @@ public sealed partial class MainWindow : Window
             _agentContinue = false; // agent sessions are per-directory
         }
         AgentCwd.Text = cwd;
-        AgentInput.Text = "";
         AgentGreeting.Visibility = Visibility.Collapsed;
-        AppendAgentMsg(prompt, user: true);
+        if (resend is null)
+        {
+            AgentInput.Text = "";
+            AppendAgentMsg(prompt, user: true);
+        }
+        _agentPendingPrompt = prompt;
         ShowAgentThinking();
         var sw = Stopwatch.StartNew();
         try
@@ -4592,6 +4644,7 @@ public sealed partial class MainWindow : Window
         finally
         {
             _agentProc = null;
+            _agentPendingPrompt = null;
             HideAgentThinking();
         }
     }

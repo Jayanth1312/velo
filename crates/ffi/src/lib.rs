@@ -180,8 +180,11 @@ mod imp {
                 HandleWriter::Remote(f) => {
                     use std::io::Write;
                     let mut g = f.lock().expect("remote stdin mutex poisoned");
-                    g.write_all(b)?;
-                    g.flush()
+                    let r = g.write_all(b).and_then(|_| g.flush());
+                    if let Err(e) = &r {
+                        dbglog(&format!("remote stdin write FAILED: {e}"));
+                    }
+                    r
                 }
             }
         }
@@ -656,11 +659,15 @@ mod imp {
                 },
                 PaneKind::Terminal => {
                     if sid == NO_SESSION {
+                        dbglog(&format!("render_pane: pane {idx} has NO_SESSION"));
                         return;
                     }
                     match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
                         Some(s) => s.terminal.frame(),
-                        None => return,
+                        None => {
+                            dbglog(&format!("render_pane: pane {idx} sid={sid} gone"));
+                            return;
+                        }
                     }
                 }
             };
@@ -682,6 +689,7 @@ mod imp {
                 return;
             };
             if pane.backbuffers.is_empty() {
+                dbglog(&format!("render_pane: pane {idx} has no backbuffers (never sized)"));
                 return;
             }
             if pane.force_full {
@@ -789,6 +797,9 @@ mod imp {
                 let Some(Some(p)) = self.panes.get_mut(idx) else {
                     return;
                 };
+                if (p.width, p.height) != (w, h) {
+                    dbglog(&format!("resize_pane: pane={idx} {w}x{h}px (sid={})", p.session));
+                }
                 p.apply_size(&self.device, w, h, dpi);
                 let (cols, rows) = p.recompute_grid(&self.font, dpi);
                 p.glide_mute_until = std::time::Instant::now() + GLIDE_MUTE_AFTER_RESIZE;
@@ -805,10 +816,15 @@ mod imp {
         fn bind(&mut self, idx: usize, sid: usize) {
             let dims = {
                 let Some(Some(p)) = self.panes.get_mut(idx) else {
+                    dbglog(&format!("bind: pane {idx} MISSING (sid={sid})"));
                     return;
                 };
                 p.session = sid;
                 p.force_full = true;
+                dbglog(&format!(
+                    "bind: pane={idx} sid={sid} grid={}x{} px={}x{} backbuffers={}",
+                    p.cols, p.rows, p.width, p.height, p.backbuffers.len()
+                ));
                 (p.cols, p.rows)
             };
             if sid != NO_SESSION {
@@ -1246,7 +1262,13 @@ mod imp {
                 self.wakeup_hwnd.0 as isize,
             );
             dbglog(&format!("adopt_session: id={id}, host_id={host_id}"));
-            let remote = crate::host_client::attach_remote(host_id, on_event)?;
+            let remote = match crate::host_client::attach_remote(host_id, on_event) {
+                Ok(r) => r,
+                Err(e) => {
+                    dbglog(&format!("adopt_session: attach host_id={host_id} FAILED: {e}"));
+                    return Err(e);
+                }
+            };
             let _ = remote.resize(cols, rows);
             self.install_session(id, PtyHandle::Remote(remote), inbox, wakeup_pending, cols, rows);
             Ok(id as u32)
@@ -1344,6 +1366,8 @@ mod imp {
                 let idx = self.focused_pane;
                 self.bind(idx, id);
                 self.render_pane(idx);
+            } else {
+                dbglog(&format!("set_active: session {id} MISSING (bind skipped)"));
             }
         }
 
@@ -1400,7 +1424,13 @@ mod imp {
                     s.wakeup_pending.store(false, std::sync::atomic::Ordering::Release);
                     std::mem::take(&mut *s.inbox.lock())
                 }
-                None => return,
+                None => {
+                    // No session for this wakeup: its wakeup_pending Arc (shared
+                    // with the reader) would stay true forever and silence every
+                    // future post. Nothing to clear from here — just log it.
+                    dbglog(&format!("on_pty_data: session {id} missing (wakeup dropped)"));
+                    return;
+                }
             };
             if bytes.is_empty() {
                 return;
