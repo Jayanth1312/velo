@@ -1185,6 +1185,58 @@
                 </Grid>
             </Grid>
         </Border>
+
+        <!-- Edge hover triggers: thin full-height strips at the window's left/right
+             edges. While the matching sidebar is CLOSED, hovering here reveals it as
+             a floating overlay (RevealOverlay). ZIndex sits below the overlay hosts
+             so a shown overlay takes over hit-testing. IsHitTestVisible is gated to
+             the closed state so a docked panel's left/right edge stays clickable. -->
+        <Rectangle x:Name="DetailsEdge" Grid.Column="0" Grid.ColumnSpan="3"
+                   Width="8" HorizontalAlignment="Left" VerticalAlignment="Stretch"
+                   Fill="Transparent" Canvas.ZIndex="39"
+                   PointerEntered="DetailsEdge_PointerEntered"
+                   PointerExited="OverlayEdge_PointerExited" />
+        <Rectangle x:Name="TabsEdge" Grid.Column="0" Grid.ColumnSpan="3"
+                   Width="8" HorizontalAlignment="Right" VerticalAlignment="Stretch"
+                   Fill="Transparent" Canvas.ZIndex="39" IsHitTestVisible="False"
+                   PointerEntered="TabsEdge_PointerEntered"
+                   PointerExited="OverlayEdge_PointerExited" />
+
+        <!-- Floating overlay sidebars (Zen-style). A full-height transparent hit
+             region slides in from the edge; the inner Border carries the inset
+             margin, rounded corners and (opaque) tint so the panel reads as a
+             separate floating component. The live sidebar content is reparented
+             into the inner Border on reveal and back to its docked surface on
+             retract. Background/tint is set in UpdatePanelTint. -->
+        <Grid x:Name="DetailsOverlayHost" Grid.Column="0" Grid.ColumnSpan="3"
+              HorizontalAlignment="Left" VerticalAlignment="Stretch"
+              Visibility="Collapsed" Canvas.ZIndex="40"
+              Background="Transparent"
+              PointerExited="Overlay_PointerExited">
+            <Grid.RenderTransform>
+                <TranslateTransform x:Name="DetailsOverlayXform" X="-500" />
+            </Grid.RenderTransform>
+            <Border x:Name="DetailsOverlayPanel"
+                    HorizontalAlignment="Left" VerticalAlignment="Stretch"
+                    Margin="8" CornerRadius="10"
+                    BorderThickness="1"
+                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}" />
+        </Grid>
+
+        <Grid x:Name="TabsOverlayHost" Grid.Column="0" Grid.ColumnSpan="3"
+              HorizontalAlignment="Right" VerticalAlignment="Stretch"
+              Visibility="Collapsed" Canvas.ZIndex="40"
+              Background="Transparent"
+              PointerExited="Overlay_PointerExited">
+            <Grid.RenderTransform>
+                <TranslateTransform x:Name="TabsOverlayXform" X="500" />
+            </Grid.RenderTransform>
+            <Border x:Name="TabsOverlayPanel"
+                    HorizontalAlignment="Right" VerticalAlignment="Stretch"
+                    Margin="8" CornerRadius="10"
+                    BorderThickness="1"
+                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}" />
+        </Grid>
         <!-- Command palette: full-window dim overlay + centered card. Light-dismiss
              by tapping the dim area; Esc closes. Opened with Ctrl+P / Ctrl+Shift+P. -->
         <Grid x:Name="PaletteOverlay"

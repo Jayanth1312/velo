@@ -614,6 +614,7 @@ public sealed partial class MainWindow : Window
     /// one container, real push, no overlay/slide desync.
     private void SetSidebar(bool open)
     {
+        DropOverlay(false);   // if shown as an overlay, dock it from a clean state
         _sidebarOpen = open;
         AnimateWidth(ToggleBar, open ? BarOpen : BarClosed);
         // Animate the column width instead of an instant jump: a 280px one-frame jump
@@ -633,6 +634,7 @@ public sealed partial class MainWindow : Window
             _suppressPaneResize = false;
             FlushPendingResizes();
         });
+        UpdateEdgeTriggers();
         FocusTerminal();
     }
 
@@ -650,6 +652,154 @@ public sealed partial class MainWindow : Window
         };
         Storyboard.SetTarget(anim, el);
         Storyboard.SetTargetProperty(anim, "Width");
+        sb.Children.Add(anim);
+        if (completed is not null)
+            sb.Completed += (_, _) => completed();
+        sb.Begin();
+    }
+
+    // ---- Floating overlay sidebars (Zen-style edge-hover) -----------------
+    //
+    // Closed sidebar + hover the window edge -> the sidebar reveals as a panel
+    // floating over the terminal (a separate component from the docked column).
+    // The live content subtree is reparented into the overlay host on reveal and
+    // back to its docked surface on retract, so there is ONE instance of each
+    // panel (its named controls + code-behind bindings stay intact). Retracts on
+    // pointer-leave; clicking the in-panel toggle promotes it to docked.
+    private bool _detailsOverlay, _tabsOverlay;
+    private const double OverlayHidden = 500;   // off-screen slide distance (px)
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _revealTimer;
+
+    private void DetailsEdge_PointerEntered(object sender, PointerRoutedEventArgs e)
+        => ArmReveal(left: true);
+
+    private void TabsEdge_PointerEntered(object sender, PointerRoutedEventArgs e)
+        => ArmReveal(left: false);
+
+    // 150ms dwell before revealing, so a fast cursor sweep past the edge does not
+    // flash the overlay.
+    private void ArmReveal(bool left)
+    {
+        if (left ? (_detailsOpen || _detailsOverlay) : (_sidebarOpen || _tabsOverlay))
+            return;
+        _revealTimer?.Stop();
+        _revealTimer = DispatcherQueue.CreateTimer();
+        _revealTimer.Interval = TimeSpan.FromMilliseconds(150);
+        _revealTimer.IsRepeating = false;
+        _revealTimer.Tick += (_, _) => RevealOverlay(left);
+        _revealTimer.Start();
+    }
+
+    // Cursor left the edge strip before the dwell elapsed: cancel a pending reveal.
+    private void OverlayEdge_PointerExited(object sender, PointerRoutedEventArgs e)
+        => _revealTimer?.Stop();
+
+    private void RevealOverlay(bool left)
+    {
+        _revealTimer?.Stop();
+        if (left)
+        {
+            if (_detailsOpen || _detailsOverlay) return;
+            _detailsOverlay = true;
+            DetailsContent.Width = DetailsWidth;
+            DetailsSurface.Child = null;
+            DetailsOverlayPanel.Child = DetailsContent;
+            DetailsOverlayHost.Visibility = Visibility.Visible;
+            EnsureDetailsRealized();
+            AnimateTranslateX(DetailsOverlayXform, 0);
+        }
+        else
+        {
+            if (_sidebarOpen || _tabsOverlay) return;
+            _tabsOverlay = true;
+            Sidebar.Width = TabsWidth;
+            SidebarSurface.Child = null;
+            TabsOverlayPanel.Child = Sidebar;
+            TabsOverlayHost.Visibility = Visibility.Visible;
+            AnimateTranslateX(TabsOverlayXform, 0);
+        }
+    }
+
+    private void Overlay_PointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        // PointerExited bubbles up from children too; only retract when the pointer
+        // is genuinely outside the host bounds.
+        var host = (FrameworkElement)sender;
+        var p = e.GetCurrentPoint(host).Position;
+        if (p.X >= 0 && p.Y >= 0 && p.X <= host.ActualWidth && p.Y <= host.ActualHeight)
+            return;
+        RetractOverlay(ReferenceEquals(sender, DetailsOverlayHost));
+    }
+
+    private void RetractOverlay(bool left)
+    {
+        if (left)
+        {
+            if (!_detailsOverlay) return;
+            AnimateTranslateX(DetailsOverlayXform, -OverlayHidden, () =>
+            {
+                DetailsOverlayHost.Visibility = Visibility.Collapsed;
+                DetailsOverlayPanel.Child = null;
+                DetailsSurface.Child = DetailsContent;
+                _detailsOverlay = false;
+            });
+        }
+        else
+        {
+            if (!_tabsOverlay) return;
+            AnimateTranslateX(TabsOverlayXform, OverlayHidden, () =>
+            {
+                TabsOverlayHost.Visibility = Visibility.Collapsed;
+                TabsOverlayPanel.Child = null;
+                SidebarSurface.Child = Sidebar;
+                _tabsOverlay = false;
+            });
+        }
+    }
+
+    // Reparent content back to the docked surface immediately (no slide) — used
+    // when promoting an overlay to docked so SetDetails/SetSidebar can animate the
+    // real column width from a consistent starting point.
+    private void DropOverlay(bool left)
+    {
+        _revealTimer?.Stop();
+        if (left && _detailsOverlay)
+        {
+            DetailsOverlayHost.Visibility = Visibility.Collapsed;
+            DetailsOverlayXform.X = -OverlayHidden;
+            DetailsOverlayPanel.Child = null;
+            DetailsSurface.Child = DetailsContent;
+            _detailsOverlay = false;
+        }
+        else if (!left && _tabsOverlay)
+        {
+            TabsOverlayHost.Visibility = Visibility.Collapsed;
+            TabsOverlayXform.X = OverlayHidden;
+            TabsOverlayPanel.Child = null;
+            SidebarSurface.Child = Sidebar;
+            _tabsOverlay = false;
+        }
+    }
+
+    // Docked panels own their edge; disable the closed-state hover trigger there so
+    // the panel's outer edge stays clickable.
+    private void UpdateEdgeTriggers()
+    {
+        DetailsEdge.IsHitTestVisible = !_detailsOpen;
+        TabsEdge.IsHitTestVisible = !_sidebarOpen;
+    }
+
+    private static void AnimateTranslateX(TranslateTransform t, double to, Action? completed = null)
+    {
+        var sb = new Storyboard();
+        var anim = new DoubleAnimation
+        {
+            To = to,
+            Duration = new Duration(TimeSpan.FromMilliseconds(200)),
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        };
+        Storyboard.SetTarget(anim, t);
+        Storyboard.SetTargetProperty(anim, "X");
         sb.Children.Add(anim);
         if (completed is not null)
             sb.Completed += (_, _) => completed();
@@ -675,6 +825,7 @@ public sealed partial class MainWindow : Window
     /// Mirror of SetSidebar for the LEFT details column.
     private void SetDetails(bool open)
     {
+        DropOverlay(true);    // if shown as an overlay, dock it from a clean state
         Log.Write($"SetDetails: open={open} tab={_activeDetailsTab} realized={_detailsRealized}");
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
@@ -688,6 +839,7 @@ public sealed partial class MainWindow : Window
         });
         if (open)
             EnsureDetailsRealized();   // build + fill the panels on first open
+        UpdateEdgeTriggers();
         FocusTerminal();
     }
 
@@ -695,7 +847,7 @@ public sealed partial class MainWindow : Window
     {
         if (sender is Button b)
             SelectDetailsTab(b);
-        if (!_detailsOpen)
+        if (!_detailsOpen && !_detailsOverlay)
             SetDetails(true);
         // Files button doubles as the editor-mode toggle: first click opens the
         // tree + editor surface, clicking again returns to the terminal.
@@ -3601,6 +3753,12 @@ public sealed partial class MainWindow : Window
         // readable over the dim overlay at very low opacity settings.
         byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
         PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
+        // Floating overlay panels sit over the TERMINAL (not the backdrop), so they
+        // must be near-opaque or terminal text bleeds through. Floor high.
+        byte oa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.97) * 255);
+        var overlaySurface = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(oa, r, g, b));
+        DetailsOverlayPanel.Background = overlaySurface;
+        TabsOverlayPanel.Background = overlaySurface;
     }
 
     /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
