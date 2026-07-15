@@ -1520,11 +1520,10 @@ mod imp {
                 self.swallow_next_char = true;
                 return true;
             }
-            if ctrl && !shift && vk == 0x56 {
-                self.paste();
-                self.swallow_next_char = true;
-                return true;
-            }
+            // NB: plain Ctrl+V is NOT grabbed for paste — it's forwarded to the PTY
+            // (as 0x16) so CLI apps that bind Ctrl+V (Claude Code image paste,
+            // PSReadLine's own clipboard paste, readline quoted-insert) receive it.
+            // Terminal paste is Ctrl+Shift+V (handled above).
 
             // Shift+PgUp/PgDn scrolls scrollback a page instead of sending a
             // byte sequence, unless the alt screen (vim/less) is active —

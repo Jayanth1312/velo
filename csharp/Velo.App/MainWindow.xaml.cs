@@ -53,7 +53,6 @@ public sealed partial class MainWindow : Window
     private bool _suppressSelection;
     private bool _sidebarOpen = true;
     private bool _detailsOpen = false;
-    private int _titleHover;            // # of chrome regions currently hovered
     private readonly Settings _settings = Settings.Load();
 
     // Manual title-bar drag: the whole bar is a passthrough hover strip (so it
@@ -304,6 +303,17 @@ public sealed partial class MainWindow : Window
         _restored = s;   // agent chat replays when the panel first opens
         foreach (var t in s.Tabs)
         {
+            if (t.Browser)
+            {
+                _layout.Add(new TabVM(_nextBrowserId++, "New Tab")
+                {
+                    IsBrowser = true,
+                    ShellKind = "web",
+                    IconFile = "web.svg",
+                    BrowserUrl = string.IsNullOrWhiteSpace(t.Url) ? "https://www.google.com/" : t.Url,
+                });
+                continue;
+            }
             if (string.IsNullOrWhiteSpace(t.Cmd))
                 continue;
             TabVM? vm = null;
@@ -377,6 +387,12 @@ public sealed partial class MainWindow : Window
         // Snapshot tabs (command + cwd + host session) for RestoreSession.
         var session = new SessionState();
         foreach (var t in Tabs)
+        {
+            if (t.IsBrowser)
+            {
+                session.Tabs.Add(new SessionState.TabInfo { Browser = true, Url = t.BrowserUrl });
+                continue;
+            }
             if (t.LaunchCmd.Length > 0)
                 session.Tabs.Add(new SessionState.TabInfo
                 {
@@ -385,6 +401,7 @@ public sealed partial class MainWindow : Window
                     HostId = _engine != IntPtr.Zero ? Native.velo_tab_host_id(_engine, t.Id) : uint.MaxValue,
                     Running = t.RunningCommand,
                 });
+        }
         if (_settings.RestoreAgentChat)
         {
             foreach (var m in _agentHistory)
@@ -549,11 +566,11 @@ public sealed partial class MainWindow : Window
 
     // ---- Frameless chrome -------------------------------------------------
 
+    // Chrome bars (sidebar top rows) recompute the drag/passthrough strip on resize.
     private void TitleBar_SizeChanged(object sender, SizeChangedEventArgs e) => UpdateDragRegions();
-
     /// Make the whole top strip Passthrough (client) so XAML — not the OS caption —
-    /// owns it: that lets TitleBarHover reveal the toggles on hover anywhere along
-    /// the bar and start window drag by hand (see TitleBarHover_PointerPressed).
+    /// owns it: the terminal handles its own first-row pointer/selection, and the
+    /// sidebar chrome starts window drag by hand (see TitleBarHover_PointerPressed).
     private void UpdateDragRegions()
     {
         if (_nonClient is null || Content is not UIElement content)
@@ -1316,27 +1333,6 @@ public sealed partial class MainWindow : Window
         return null;
     }
 
-    // Toggles are hidden at rest; hovering anywhere on the title bar (or any chrome
-    // region in it) fades BOTH toggles in. Reference-counted so moving between the
-    // hover strip and a button doesn't flicker them off.
-    private void Chrome_PointerEntered(object sender, PointerRoutedEventArgs e)
-    {
-        _titleHover++;
-        ShowToggles(true);
-    }
-
-    private void Chrome_PointerExited(object sender, PointerRoutedEventArgs e)
-    {
-        _titleHover = Math.Max(0, _titleHover - 1);
-        if (_titleHover == 0)
-            ShowToggles(false);
-    }
-
-    private void ShowToggles(bool visible)
-    {
-        AnimateOpacity(ToggleHost, visible ? 1 : 0);
-        AnimateOpacity(ToggleHostLeft, visible ? 1 : 0);
-    }
 
     // Arm a drag on press; only hand off to the OS move loop once the pointer
     // actually moves past a small threshold. A simple click never enters the loop,
@@ -1377,21 +1373,6 @@ public sealed partial class MainWindow : Window
 
     private void TitleBarHover_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
         => MaximizeRestore_Click(sender, e);
-
-    private static void AnimateOpacity(FrameworkElement el, double to)
-    {
-        var sb = new Storyboard();
-        var anim = new DoubleAnimation
-        {
-            To = to,
-            Duration = new Duration(TimeSpan.FromMilliseconds(120)),
-            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
-        };
-        Storyboard.SetTarget(anim, el);
-        Storyboard.SetTargetProperty(anim, "Opacity");
-        sb.Children.Add(anim);
-        sb.Begin();
-    }
 
     /// Return keyboard focus to the terminal. Chrome/sidebar interactions steal it;
     /// without this the user "can type at first, then can't".
@@ -1723,7 +1704,7 @@ public sealed partial class MainWindow : Window
         // (suppressed selection: no ShowView relayout, the view is already up).
         if (_slotTab[i] != InvalidId && (TabList.SelectedItem as TabVM)?.Id != _slotTab[i])
         {
-            Native.velo_tab_set_active(_engine, _slotTab[i]);
+            SetActiveTab(_slotTab[i]);
             SelectById(_slotTab[i]);
         }
         _mousePane = i;
@@ -1845,7 +1826,7 @@ public sealed partial class MainWindow : Window
         // ponytail: hidden core panes keep their old bindings until the next
         // split re-binds them. Add an unbind FFI call if idle renders of hidden
         // panes ever show up in profiles.
-        Native.velo_tab_set_active(_engine, keep);
+        SetActiveTab(keep);
         ShowView(keep);
         RefreshTabList();              // pill row shrinks (or dissolves back to rows)
         SelectById(keep);
@@ -1957,6 +1938,107 @@ public sealed partial class MainWindow : Window
         FocusTerminal();
     }
 
+    // ---- Browser tabs -----------------------------------------------------
+    // Browser tabs live entirely C#-side (no core session). Synthetic ids start
+    // high so they never collide with core tab ids (small sequential uints).
+    private uint _nextBrowserId = 0x8000_0000u;
+
+    /// Append a browser tab and select it (SelectionChanged overlays its WebView2).
+    private void AddBrowserTab(string? url = null)
+    {
+        var vm = new TabVM(_nextBrowserId++, "New Tab")
+        {
+            IsBrowser = true,
+            ShellKind = "web",
+            IconFile = "web.svg",
+            BrowserUrl = string.IsNullOrWhiteSpace(url) ? "https://www.google.com/" : url,
+        };
+        _layout.Add(vm);
+        RefreshTabList();
+        TabList.SelectedItem = vm;
+    }
+
+    private TabVM? TabById(uint id)
+    {
+        if (id == InvalidId)
+            return null;
+        foreach (var t in Tabs)
+            if (t.Id == id)
+                return t;
+        return null;
+    }
+
+    /// velo_tab_set_active, skipping browser tabs (they have no core session).
+    private void SetActiveTab(uint id)
+    {
+        if (_engine == IntPtr.Zero || TabById(id) is { IsBrowser: true })
+            return;
+        Native.velo_tab_set_active(_engine, id);
+    }
+
+    /// Overlay each browser tab's WebView2 pane onto its slot's rect (collapsing that
+    /// slot's terminal SwapChainPanel), and collapse any browser view not shown. Call
+    /// after BuildLayout so the slot rects (_slotX/Y/W/H) are current.
+    private void SyncBrowserPanes()
+    {
+        int overlayAt = PaneHost.Children.IndexOf(SplitOverlay); // keep drop overlay/ring on top
+        var shown = new HashSet<uint>();
+        for (int i = 0; i < _paneCount; i++)
+        {
+            var tab = TabById(_slotTab[i]);
+            bool isBrowser = tab is { IsBrowser: true };
+            if (isBrowser)
+                _panels[i].Visibility = Visibility.Collapsed;
+            if (!isBrowser)
+                continue;
+            shown.Add(tab!.Id);
+            var view = tab.View ??= new BrowserView(
+                tab, () => CloseTab(tab.Id), () => MaximizeBrowserTab(tab), tab.BrowserUrl);
+            Grid.SetRow(view, 0);
+            Grid.SetColumn(view, 0);
+            if (_paneCount <= 1)
+            {
+                view.HorizontalAlignment = HorizontalAlignment.Stretch;
+                view.VerticalAlignment = VerticalAlignment.Stretch;
+                view.Width = double.NaN;
+                view.Height = double.NaN;
+                view.Margin = new Thickness(0);
+            }
+            else
+            {
+                view.HorizontalAlignment = HorizontalAlignment.Left;
+                view.VerticalAlignment = VerticalAlignment.Top;
+                view.Width = Math.Max(1, _slotW[i]);
+                view.Height = Math.Max(1, _slotH[i]);
+                view.Margin = new Thickness(_slotX[i], _slotY[i], 0, 0);
+            }
+            if (view.Parent is null)
+                PaneHost.Children.Insert(overlayAt < 0 ? PaneHost.Children.Count : overlayAt, view);
+            view.Visibility = Visibility.Visible;
+        }
+        foreach (var t in Tabs)
+            if (t.IsBrowser && t.View is not null && !shown.Contains(t.Id))
+                t.View.Visibility = Visibility.Collapsed;
+    }
+
+    /// Pop a browser out of its split so it fills the body (the split's other panes
+    /// promote to their own view).
+    private void MaximizeBrowserTab(TabVM tab)
+    {
+        if (RootContaining(tab.Id) is PaneNode root)
+        {
+            var promoted = PaneTree.Remove(root, tab.Id);
+            int oi = _trees.IndexOf(root);
+            if (promoted is null or Leaf) { if (oi >= 0) _trees.RemoveAt(oi); }
+            else if (oi >= 0) _trees[oi] = promoted;
+        }
+        ShowView(tab.Id);
+        RefreshTabList();
+        SelectById(tab.Id);
+        DispatcherQueue.TryEnqueue(
+            Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () => tab.View?.FocusWeb());
+    }
+
     /// New empty group holding one fresh default-shell tab.
     private void NewGroupWithTab()
     {
@@ -2064,6 +2146,10 @@ public sealed partial class MainWindow : Window
             flyout.Items.Add(item);
         }
         flyout.Items.Add(new MenuFlyoutSeparator());
+        var browser = new MenuFlyoutItem { Text = "Browser", Icon = ShellIcon("web.svg") };
+        browser.Click += (_, _) => AddBrowserTab();
+        flyout.Items.Add(browser);
+        flyout.Items.Add(new MenuFlyoutSeparator());
         Add(flyout, "New group", NewGroupWithTab);
         flyout.ShowAt(fe);
     }
@@ -2112,6 +2198,13 @@ public sealed partial class MainWindow : Window
     {
         if (_engine == IntPtr.Zero)
             return;
+        if (TabById(id) is { IsBrowser: true } b)
+        {
+            if (b.View is not null) { PaneHost.Children.Remove(b.View); b.View.Dispose(); b.View = null; }
+            Log.Write($"CloseTab: browser id={id}");
+            HandleTabGone(id);
+            return;
+        }
         Native.velo_tab_close(_engine, id);   // core frees the session + unbinds panes
         Log.Write($"CloseTab: id={id}, remaining={Tabs.Count - 1}");
         HandleTabGone(id);
@@ -2154,7 +2247,7 @@ public sealed partial class MainWindow : Window
             show = Tabs.Count > 0 ? Tabs[0].Id : InvalidId;
         if (show == InvalidId)
             return;
-        Native.velo_tab_set_active(_engine, show);
+        SetActiveTab(show);
         ShowView(show);
         SelectById(show);
     }
@@ -2183,16 +2276,20 @@ public sealed partial class MainWindow : Window
             return;
         if (TabList.SelectedItem is TabVM t)
         {
-            // Picking a terminal tab leaves editor mode (workspace state
-            // survives in the engine; re-entering shows the same files).
+            // Picking a tab leaves editor mode (workspace state survives in the
+            // engine; re-entering shows the same files).
             SetEditorMode(false);
-            Native.velo_tab_set_active(_engine, t.Id);
+            SetActiveTab(t.Id);          // no-op for browser tabs (no core session)
             // Browser-style: show this tab's whole view (its split group, or the
             // tab alone) instead of swapping it into the focused pane.
             ShowView(t.Id);
             _filesDir = null;            // Files panel follows the new tab's cwd
             if (_detailsOpen) RefreshDetails();
-            FocusTerminal();
+            if (t.IsBrowser)
+                DispatcherQueue.TryEnqueue(
+                    Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () => t.View?.FocusWeb());
+            else
+                FocusTerminal();
         }
         else if (TabList.SelectedItem is TabGroup or SplitRowVM)
         {
@@ -2262,7 +2359,8 @@ public sealed partial class MainWindow : Window
         for (int i = 1; i < _paneCount; i++)
             BindSwapchain(i);               // no-op once bound
         for (int i = 0; i < _paneCount; i++)
-            if (_slotTab[i] != InvalidId && _slotCore[i] != InvalidId)
+            if (_slotTab[i] != InvalidId && _slotCore[i] != InvalidId
+                && TabById(_slotTab[i]) is not { IsBrowser: true })
                 Native.velo_pane_bind(_engine, _slotCore[i], _slotTab[i]);
         Native.velo_pane_focus(_engine, _slotCore[_focusedPane]);
     }
@@ -2276,7 +2374,7 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         SetEditorMode(false);
-        Native.velo_tab_set_active(_engine, t.Id);
+        SetActiveTab(t.Id);
         ShowView(t.Id);
         SelectById(t.Id);          // split branch: clears row selection, sets IsActive
         _filesDir = null;
@@ -2469,7 +2567,7 @@ public sealed partial class MainWindow : Window
         int ri = _trees.IndexOf(root);
         if (ri >= 0) _trees[ri] = newRoot; else _trees.Add(newRoot);
 
-        Native.velo_tab_set_active(_engine, dropped.Id);
+        SetActiveTab(dropped.Id);
         ShowView(dropped.Id);
         RefreshTabList();              // members collapse into their pill row
         SelectById(dropped.Id);        // suppressed handler: no double ShowView
@@ -2508,7 +2606,7 @@ public sealed partial class MainWindow : Window
             }
         }
         _trees.Add(PaneTree.Columns(members));
-        Native.velo_tab_set_active(_engine, members[0]);
+        SetActiveTab(members[0]);
         ShowView(members[0]);
         RefreshTabList();
         SelectById(members[0]);
@@ -2524,7 +2622,7 @@ public sealed partial class MainWindow : Window
         _trees.Remove(root);
         if (first != InvalidId)
         {
-            Native.velo_tab_set_active(_engine, first);
+            SetActiveTab(first);
             ShowView(first);
             SelectById(first);
         }
@@ -2650,6 +2748,7 @@ public sealed partial class MainWindow : Window
             PaneHost.UpdateLayout();
             PushPaneSize(p);
             UpdatePaneFocusRing();
+            SyncBrowserPanes();
             return;
         }
 
@@ -2662,6 +2761,7 @@ public sealed partial class MainWindow : Window
         for (int i = 0; i < _paneCount; i++)
             PushPaneSize(_panels[i]);
         UpdatePaneFocusRing();
+        SyncBrowserPanes();
     }
 
     /// Accent outline over the focused pane's rect; hidden outside split mode.
@@ -3488,7 +3588,6 @@ public sealed partial class MainWindow : Window
         var (r, g, b) = _settings.BackgroundRgb();
         byte a = (byte)Math.Round(_settings.BackgroundOpacity * 255);
         var surface = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(a, r, g, b));
-        TitleBar.Background = surface;
         SidebarSurface.Background = surface;
         DetailsSurface.Background = surface;
         // Editor tab strip composites like the rest of the chrome, and its
@@ -3498,7 +3597,6 @@ public sealed partial class MainWindow : Window
         var fgBrush = new SolidColorBrush(
             Microsoft.UI.ColorHelper.FromArgb(0xFF, fg.R, fg.G, fg.B));
         EditorTabs.Foreground = fgBrush;
-        TitleBarTitle.Foreground = fgBrush;
         // Palette card: same tint as the chrome, but floored so text stays
         // readable over the dim overlay at very low opacity settings.
         byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
@@ -4870,9 +4968,9 @@ public sealed partial class MainWindow : Window
         });
     }
 
-    /// Mirror the active tab's title into the title-bar center.
+    /// Mirror the active tab's title into the window (taskbar / alt-tab) title.
     private void UpdateTitleBarTitle()
-        => TitleBarTitle.Text = CurrentTab()?.Title ?? "";
+        => Title = CurrentTab()?.Title ?? "Velo";
 
     [UnmanagedCallersOnly]
     private static void OnTabClosed(IntPtr ctx, uint id)

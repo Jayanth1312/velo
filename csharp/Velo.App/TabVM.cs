@@ -26,6 +26,17 @@ public sealed class TabVM : INotifyPropertyChanged
 {
     public uint Id { get; }
 
+    /// <summary>True for a browser tab (WebView2 pane) instead of a terminal session.
+    /// Browser tabs have no core session; <see cref="Id"/> is a synthetic C#-side id.</summary>
+    public bool IsBrowser { get; set; }
+
+    /// <summary>The browser pane (chrome + WebView2), created on first display and kept
+    /// alive (collapsed) while off-screen so the page persists across tab switches.</summary>
+    public BrowserView? View { get; set; }
+
+    /// <summary>Current page URL, tracked for session save/restore.</summary>
+    public string BrowserUrl { get; set; } = "https://www.google.com/";
+
     private string _title;
     public string Title
     {

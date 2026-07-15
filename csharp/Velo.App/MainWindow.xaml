@@ -195,30 +195,15 @@
             <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
-        <!-- Center column: titlebar + terminal. Background stays TRANSPARENT so the
-             terminal swapchain composites directly over the window backdrop (a single
-             tint layer). If ContentRoot itself were tinted, the swapchain would stack
-             a second layer over it → terminal darker than the panels + opacity barely
-             responding. The thin title bar gets the surface tint on its own. -->
+        <!-- Center column: terminal / browser body, full height. Background stays
+             TRANSPARENT so the swapchain composites directly over the window backdrop
+             (a single tint layer). No body title bar — the active tab name lives in the
+             sidebar list, and window drag / double-click-maximize are handled by the
+             sidebar top chrome. -->
         <Grid x:Name="ContentRoot" Grid.Column="1" Background="Transparent">
             <Grid.RowDefinitions>
-                <RowDefinition Height="34" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
-
-            <!-- Thin title bar: just tall enough for the toggle icons + small
-                 padding. No title text (drag + double-click-maximize only). -->
-            <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent"
-                  SizeChanged="TitleBar_SizeChanged">
-                <TextBlock x:Name="TitleBarTitle"
-                           HorizontalAlignment="Center"
-                           VerticalAlignment="Center"
-                           FontSize="12"
-                           MaxWidth="420"
-                           TextTrimming="CharacterEllipsis"
-                           IsHitTestVisible="False"
-                           Opacity="0.8" />
-            </Grid>
 
             <!-- Pane host: a 2x2 grid holding up to 4 terminal panes.
                  ponytail: background is Transparent (shows ContentRoot's terminal-
@@ -230,7 +215,7 @@
             <!-- PaneHost is the keyboard target: SwapChainPanel can't take focus
                  (no Background / not hit-testable), but this transparent Grid can. -->
             <Grid x:Name="PaneHost"
-                  Grid.Row="1"
+                  Grid.Row="0"
                   Background="Transparent"
                   IsTabStop="True"
                   ColumnSpacing="1"
@@ -357,7 +342,7 @@
                  place of PaneHost while editor mode is on; terminal panes stay
                  alive underneath (hidden, not destroyed). -->
             <Grid x:Name="EditorHost"
-                  Grid.Row="1"
+                  Grid.Row="0"
                   Visibility="Collapsed"
                   Background="Transparent">
                 <Grid.RowDefinitions>
@@ -468,21 +453,6 @@
             </Grid>
         </Grid>
 
-        <!-- Title-bar hover/drag strip: full-width, transparent, above the terminal
-             but below the chrome buttons. Drives window drag (manual, so the whole
-             strip is draggable) + double-click maximize, and reveals the toggles on
-             hover anywhere along the bar. -->
-        <Border x:Name="TitleBarHover"
-                Grid.Column="1"
-                VerticalAlignment="Top"
-                Height="34"
-                Background="Transparent"
-                PointerEntered="Chrome_PointerEntered"
-                PointerExited="Chrome_PointerExited"
-                PointerPressed="TitleBarHover_PointerPressed"
-                PointerMoved="TitleBarHover_PointerMoved"
-                PointerReleased="TitleBarHover_PointerReleased"
-                DoubleTapped="TitleBarHover_DoubleTapped" />
 
         <!-- Sidebar drag-resize grips: thin invisible strips on the terminal
              column's edges, over the seams to the left/right panels. -->
@@ -524,24 +494,41 @@
                      the buttons keep their own clicks. -->
                 <Border Grid.Row="0"
                         Background="Transparent"
-                        PointerEntered="Chrome_PointerEntered"
-                        PointerExited="Chrome_PointerExited"
                         PointerPressed="TitleBarHover_PointerPressed"
                         PointerMoved="TitleBarHover_PointerMoved"
                         PointerReleased="TitleBarHover_PointerReleased"
                         DoubleTapped="TitleBarHover_DoubleTapped" />
 
-                <!-- Row 0: detail-section icon row (hover-only chrome). Each button
-                     shows its icon always; the selected one also reveals its text
-                     label. -->
+                <!-- Row 0: permanent details toggle (far left) + detail-section
+                     icon row shifted right of the toggle with a gap. -->
+                <Button x:Name="DetailsToggle"
+                        Grid.Row="0"
+                        VerticalAlignment="Center"
+                        HorizontalAlignment="Left"
+                        Margin="8,0,0,0"
+                        Style="{StaticResource IconButtonStyle}"
+                        Click="DetailsToggle_Click"
+                        ToolTipService.ToolTip="Toggle details (Ctrl+Shift+B)">
+                    <Grid Width="16" Height="16">
+                        <Rectangle Width="15" Height="12" RadiusX="3.5" RadiusY="3.5"
+                                   Stroke="{ThemeResource TextFillColorSecondaryBrush}"
+                                   StrokeThickness="1.4"
+                                   Fill="Transparent"
+                                   VerticalAlignment="Center" />
+                        <Rectangle x:Name="DetailsToggleBar"
+                                   Width="2" Height="7" RadiusX="1" RadiusY="1"
+                                   Fill="{ThemeResource TextFillColorSecondaryBrush}"
+                                   HorizontalAlignment="Left" VerticalAlignment="Center"
+                                   Margin="3.5,0,0,0" />
+                    </Grid>
+                </Button>
                 <StackPanel x:Name="DetailsIconRow"
                             Grid.Row="0"
                             Orientation="Horizontal"
                             VerticalAlignment="Center"
-                            HorizontalAlignment="Center"
+                            HorizontalAlignment="Left"
+                            Margin="44,0,0,0"
                             Spacing="2"
-                            PointerEntered="Chrome_PointerEntered"
-                            PointerExited="Chrome_PointerExited"
                             SizeChanged="TitleBar_SizeChanged">
                     <Button x:Name="InfoTabButton" Style="{StaticResource SectionButtonStyle}"
                             Tag="Info" Click="DetailsTab_Click" ToolTipService.ToolTip="Info">
@@ -959,18 +946,34 @@
                      their own clicks. -->
                 <Grid Grid.Row="0"
                       Background="Transparent"
-                      PointerEntered="Chrome_PointerEntered"
-                      PointerExited="Chrome_PointerExited"
                       PointerPressed="TitleBarHover_PointerPressed"
                       PointerMoved="TitleBarHover_PointerMoved"
                       PointerReleased="TitleBarHover_PointerReleased"
                       DoubleTapped="TitleBarHover_DoubleTapped">
+                    <Button x:Name="PaneToggle"
+                            VerticalAlignment="Center"
+                            HorizontalAlignment="Left"
+                            Margin="8,0,0,0"
+                            Style="{StaticResource IconButtonStyle}"
+                            Click="PaneToggle_Click"
+                            ToolTipService.ToolTip="Toggle sidebar (Ctrl+B)">
+                        <Grid Width="16" Height="16">
+                            <Rectangle Width="15" Height="12" RadiusX="3.5" RadiusY="3.5"
+                                       Stroke="{ThemeResource TextFillColorSecondaryBrush}"
+                                       StrokeThickness="1.4"
+                                       Fill="Transparent"
+                                       VerticalAlignment="Center" />
+                            <Rectangle x:Name="ToggleBar"
+                                       Width="5" Height="7" RadiusX="1" RadiusY="1"
+                                       Fill="{ThemeResource TextFillColorSecondaryBrush}"
+                                       HorizontalAlignment="Right" VerticalAlignment="Center"
+                                       Margin="0,0,3.5,0" />
+                        </Grid>
+                    </Button>
                     <StackPanel x:Name="WindowControls"
                                 Orientation="Horizontal"
                                 HorizontalAlignment="Right"
                                 VerticalAlignment="Stretch"
-                                PointerEntered="Chrome_PointerEntered"
-                                PointerExited="Chrome_PointerExited"
                                 SizeChanged="TitleBar_SizeChanged">
                         <Button x:Name="MinButton" Click="Minimize_Click"
                                 Style="{StaticResource CaptionButtonStyle}"
@@ -1182,74 +1185,6 @@
                 </Grid>
             </Grid>
         </Border>
-
-        <!-- Tabs toggle: lives in the terminal column (col 1), anchored to its right
-             edge, so it tracks the panel boundary automatically as the column
-             resizes — no manual transform needed. -->
-        <Grid x:Name="ToggleHost"
-              Grid.Column="1"
-              HorizontalAlignment="Right"
-              VerticalAlignment="Top"
-              Height="34"
-              Width="40"
-              Opacity="0"
-              PointerEntered="Chrome_PointerEntered"
-              PointerExited="Chrome_PointerExited">
-            <Button x:Name="PaneToggle"
-                    VerticalAlignment="Center"
-                    HorizontalAlignment="Right"
-                    Margin="0,0,4,0"
-                    Style="{StaticResource IconButtonStyle}"
-                    Click="PaneToggle_Click"
-                    ToolTipService.ToolTip="Toggle sidebar (Ctrl+B)">
-                <Grid Width="16" Height="16">
-                    <Rectangle Width="15" Height="12" RadiusX="3.5" RadiusY="3.5"
-                               Stroke="{ThemeResource TextFillColorSecondaryBrush}"
-                               StrokeThickness="1.4"
-                               Fill="Transparent"
-                               VerticalAlignment="Center" />
-                    <Rectangle x:Name="ToggleBar"
-                               Width="5" Height="7" RadiusX="1" RadiusY="1"
-                               Fill="{ThemeResource TextFillColorSecondaryBrush}"
-                               HorizontalAlignment="Right" VerticalAlignment="Center"
-                               Margin="0,0,3.5,0" />
-                </Grid>
-            </Button>
-        </Grid>
-
-        <!-- Details toggle: in the terminal column (col 1), anchored to its LEFT
-             edge, so it tracks the details-panel boundary as the column resizes. -->
-        <Grid x:Name="ToggleHostLeft"
-              Grid.Column="1"
-              HorizontalAlignment="Left"
-              VerticalAlignment="Top"
-              Height="34"
-              Width="40"
-              Opacity="0"
-              PointerEntered="Chrome_PointerEntered"
-              PointerExited="Chrome_PointerExited">
-            <Button x:Name="DetailsToggle"
-                    VerticalAlignment="Center"
-                    HorizontalAlignment="Left"
-                    Margin="4,0,0,0"
-                    Style="{StaticResource IconButtonStyle}"
-                    Click="DetailsToggle_Click"
-                    ToolTipService.ToolTip="Toggle details (Ctrl+Shift+B)">
-                <Grid Width="16" Height="16">
-                    <Rectangle Width="15" Height="12" RadiusX="3.5" RadiusY="3.5"
-                               Stroke="{ThemeResource TextFillColorSecondaryBrush}"
-                               StrokeThickness="1.4"
-                               Fill="Transparent"
-                               VerticalAlignment="Center" />
-                    <Rectangle x:Name="DetailsToggleBar"
-                               Width="2" Height="7" RadiusX="1" RadiusY="1"
-                               Fill="{ThemeResource TextFillColorSecondaryBrush}"
-                               HorizontalAlignment="Left" VerticalAlignment="Center"
-                               Margin="3.5,0,0,0" />
-                </Grid>
-            </Button>
-        </Grid>
-
         <!-- Command palette: full-window dim overlay + centered card. Light-dismiss
              by tapping the dim area; Esc closes. Opened with Ctrl+P / Ctrl+Shift+P. -->
         <Grid x:Name="PaletteOverlay"
