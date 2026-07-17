@@ -80,6 +80,10 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_set_recovery(IntPtr eng, byte on);
 
+    /// Copy-on-select: finishing a mouse selection copies it to the clipboard.
+    [LibraryImport(Core)]
+    internal static partial void velo_set_copy_on_select(IntPtr eng, byte on);
+
     /// Reattach to a surviving host session; uint.MaxValue when it's gone.
     [LibraryImport(Core)]
     internal static partial uint velo_tab_adopt(IntPtr eng, uint hostId);
@@ -162,6 +166,11 @@ internal static unsafe partial class Native
 
     [LibraryImport(Core)]
     internal static partial void velo_free_utf16(ushort* ptr, nuint len);
+
+    /// Tab `id`'s last finished command output (OSC 133 C→D, ANSI-scrubbed).
+    /// Null when empty/unknown; free with velo_free_utf16.
+    [LibraryImport(Core)]
+    internal static partial ushort* velo_last_output(IntPtr eng, uint id, nuint* outLen);
 
     [LibraryImport(Core)]
     internal static partial void velo_set_bg(IntPtr eng, byte r, byte g, byte b);

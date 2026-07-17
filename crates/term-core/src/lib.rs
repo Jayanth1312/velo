@@ -108,9 +108,14 @@ struct OscTee {
 }
 
 impl OscTee {
-    /// Feed raw bytes; push each completed OSC payload into `out`.
-    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
+    /// Feed raw bytes; push each completed OSC payload into `out`. `cap`
+    /// records the raw byte stream between the 133;C and 133;D marks (the tee
+    /// walks every byte anyway) so the last command's output is retrievable.
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Vec<u8>>, cap: &mut CmdCapture) {
         for &b in bytes {
+            if cap.on {
+                cap.push(b);
+            }
             if !self.in_osc {
                 if self.esc {
                     self.esc = false;
@@ -125,11 +130,13 @@ impl OscTee {
                 self.st = false;
                 self.in_osc = false;
                 if b == b'\\' {
+                    cap.mark(&self.buf);
                     out.push(std::mem::take(&mut self.buf)); // ST terminator
                 }
                 self.buf.clear(); // ESC + other: abort
             } else if b == 0x07 {
                 self.in_osc = false;
+                cap.mark(&self.buf);
                 out.push(std::mem::take(&mut self.buf)); // BEL terminator
             } else if b == 0x1b {
                 self.st = true;
@@ -138,6 +145,87 @@ impl OscTee {
             }
         }
     }
+}
+
+/// Raw output bytes of the current/last command, delimited by the OSC 133;C /
+/// 133;D marks. Kept raw (still contains CSI/SGR + the trailing D-mark intro);
+/// [`strip_ansi`] scrubs on read. Tail-capped so a flooding command can't grow
+/// memory unbounded.
+#[derive(Default)]
+struct CmdCapture {
+    on: bool,
+    buf: Vec<u8>,
+    last: Vec<u8>,
+}
+
+/// 1 MiB tail per command — plenty for piping through an output tool.
+const CAPTURE_CAP: usize = 1 << 20;
+
+impl CmdCapture {
+    fn push(&mut self, b: u8) {
+        if self.buf.len() >= CAPTURE_CAP {
+            self.buf.drain(..CAPTURE_CAP / 4); // keep the tail, amortized
+        }
+        self.buf.push(b);
+    }
+
+    /// Toggle on the command marks as their OSC payload completes.
+    fn mark(&mut self, payload: &[u8]) {
+        if payload.starts_with(b"133;C") {
+            self.buf.clear();
+            self.on = true;
+        } else if payload.starts_with(b"133;D") && self.on {
+            self.on = false;
+            self.last = std::mem::take(&mut self.buf);
+        }
+    }
+}
+
+/// Printable text from raw PTY bytes: CSI / OSC / two-byte ESC sequences and
+/// C0 controls (except `\n`, `\t`) removed; `\r` dropped (`\r\n` → `\n`).
+pub fn strip_ansi(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b == 0x1b {
+            i += 1;
+            match raw.get(i) {
+                Some(b'[') => {
+                    // CSI: parameter/intermediate bytes until a final 0x40-0x7e.
+                    i += 1;
+                    while i < raw.len() && !(0x40..=0x7e).contains(&raw[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                Some(b']') => {
+                    // OSC: until BEL or ESC \. An unterminated tail eats the
+                    // rest — the capture ends mid-D-mark by construction.
+                    i += 1;
+                    while i < raw.len() {
+                        if raw[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if raw[i] == 0x1b && raw.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(_) => i += 1, // two-byte ESC sequence: skip the second byte
+                None => {}
+            }
+            continue;
+        }
+        if b == b'\n' || b == b'\t' || b >= 0x20 {
+            out.push(b);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex(c: u8) -> Option<u8> {
@@ -221,6 +309,14 @@ pub struct Terminal {
     osc: OscTee,
     pending_shell: Vec<ShellEvent>,
     cmd_start: Option<std::time::Instant>,
+    /// Last finished command's raw output (OSC 133 C→D), for output tools.
+    capture: CmdCapture,
+    /// Cell count of the last frame, to pre-size the next frame's Vec.
+    last_cells: usize,
+    /// Resolve the next frame with full damage + every row's cells (host-side
+    /// repaint: theme change, pane rebind, blink flip). Set via
+    /// [`Terminal::request_full_frame`], consumed by [`Terminal::frame`].
+    force_full: bool,
 }
 
 impl Terminal {
@@ -253,7 +349,18 @@ impl Terminal {
             osc: OscTee::default(),
             pending_shell: Vec::new(),
             cmd_start: None,
+            capture: CmdCapture::default(),
+            last_cells: 0,
+            force_full: false,
         }
+    }
+
+    /// Make the next [`Terminal::frame`] resolve with `FrameDamage::Full` and
+    /// cells for every row. Hosts call this when *they* invalidated the target
+    /// (theme change, pane rebind, cursor blink) — the grid itself has no
+    /// damage, but the renderer needs every row's cells to rebuild.
+    pub fn request_full_frame(&mut self) {
+        self.force_full = true;
     }
 
     /// Latest OSC window title (None = shell reset to default).
@@ -270,10 +377,16 @@ impl Terminal {
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         let mut oscs = Vec::new();
-        self.osc.feed(bytes, &mut oscs);
+        self.osc.feed(bytes, &mut oscs, &mut self.capture);
         for osc in oscs {
             self.handle_osc(&osc);
         }
+    }
+
+    /// Scrubbed text of the last FINISHED command's output (OSC 133 C→D).
+    /// Empty until shell integration has completed one command.
+    pub fn last_command_output(&self) -> String {
+        strip_ansi(&self.capture.last)
     }
 
     /// Decode one OSC payload into a shell event (OSC 7 cwd / OSC 133 marks).
@@ -457,6 +570,11 @@ impl Terminal {
         let selection = content.selection;
         let display_offset = content.display_offset;
 
+        // Host-side invalidation (theme/bind/blink): everything repaints.
+        if self.force_full {
+            self.force_full = false;
+            base_damage = FrameDamage::Full;
+        }
         // Selection isn't part of damage; a change repaints everything.
         if selection != self.last_selection {
             base_damage = FrameDamage::Full;
@@ -467,7 +585,32 @@ impl Terminal {
             base_damage = FrameDamage::Full;
         }
 
-        let mut cells = Vec::new();
+        // Damage rows dilated by ±1: a tall glyph (emoji, some icons) rasterizes
+        // past its cell into the neighbor row, so the renderer repaints touching
+        // rows too — they need cells here. This is the single source of dilation
+        // (the renderer consumes the row set as-is). `None` = full damage.
+        let dirty_mask: Option<Vec<bool>> = match &base_damage {
+            FrameDamage::Full => None,
+            FrameDamage::Rows(damaged) => {
+                let mut mask = vec![false; rows as usize];
+                for &r in damaged {
+                    for rr in r.saturating_sub(1)..=(r + 1).min(rows.saturating_sub(1)) {
+                        mask[rr as usize] = true;
+                    }
+                }
+                Some(mask)
+            }
+        };
+        if let Some(mask) = &dirty_mask {
+            base_damage = FrameDamage::Rows(
+                mask.iter()
+                    .enumerate()
+                    .filter_map(|(i, &d)| d.then_some(i as u16))
+                    .collect(),
+            );
+        }
+
+        let mut cells = Vec::with_capacity(self.last_cells);
         for indexed in content.display_iter {
             // Grid lines are relative to the live screen bottom (0 = bottom-most
             // live row, negative = scrollback); shift by the display offset to
@@ -478,6 +621,12 @@ impl Terminal {
                 continue;
             }
             let row = line as u16;
+            // Undamaged rows keep their GPU bytes; skip materializing them.
+            if let Some(mask) = &dirty_mask {
+                if !mask[row as usize] {
+                    continue;
+                }
+            }
             let col = indexed.point.column.0 as u16;
             let cell = indexed.cell;
             let flags = cell.flags;
@@ -587,6 +736,7 @@ impl Terminal {
         self.last_display_offset = display_offset;
         self.last_history = history;
         self.last_alt = alt;
+        self.last_cells = cells.len().max(self.last_cells / 2);
         Frame {
             cols,
             rows,
@@ -662,7 +812,8 @@ impl Terminal {
 pub enum FrameDamage {
     /// Repaint every row.
     Full,
-    /// Only these viewport rows changed.
+    /// Only these viewport rows changed (already dilated ±1 for tall-glyph
+    /// bleed; sorted ascending, deduped).
     Rows(Vec<u16>),
 }
 
@@ -670,7 +821,9 @@ pub enum FrameDamage {
 pub struct Frame {
     pub cols: u16,
     pub rows: u16,
-    /// Only cells that draw something (glyph, non-default bg, or selection).
+    /// Only cells that draw something (glyph, non-default bg, or selection),
+    /// and only for rows in `damage` (all rows when damage is `Full`) — the
+    /// renderer keeps undamaged rows' GPU bytes, so their cells are never read.
     pub cells: Vec<RenderCell>,
     pub cursor_col: u16,
     pub cursor_row: u16,
@@ -984,6 +1137,19 @@ mod tests {
     }
 
     #[test]
+    fn osc133_output_capture_scrubbed() {
+        let mut t = term();
+        t.advance(b"\x1b]133;C;ls\x07");
+        t.advance(b"file1\r\n\x1b[31mfile2\x1b[0m\r\n");
+        t.advance(b"\x1b]133;D;0\x07");
+        assert_eq!(t.last_command_output(), "file1\nfile2\n");
+        // Next command replaces, split marks across reads still delimit.
+        t.advance(b"\x1b]133;C;echo hi\x07hi\r\n\x1b]133;");
+        t.advance(b"D;0\x07prompt> ");
+        assert_eq!(t.last_command_output(), "hi\n");
+    }
+
+    #[test]
     fn osc7_powershell_style_backslash_path() {
         // Real PowerShell emitter: file://HOST + /C:\Users\me (backslashes).
         let mut t = term();
@@ -1065,12 +1231,32 @@ mod tests {
         t.advance(b"hi");
         let _ = t.frame(); // first frame is fully damaged
         // No new input -> next frame is incremental (alacritty always re-damages
-        // the cursor row for blink, so expect at most one dirty row, never Full).
+        // the cursor row for blink; damage is ±1-dilated, so expect at most the
+        // cursor row and its neighbors, never Full).
         match t.frame().damage {
             FrameDamage::Rows(rows) => {
-                assert!(rows.len() <= 1, "idle => only the cursor row, got {rows:?}");
+                assert!(rows.len() <= 3, "idle => cursor row ±1 only, got {rows:?}");
             }
             FrameDamage::Full => panic!("idle frame must not be fully damaged"),
+        }
+    }
+
+    #[test]
+    fn idle_frame_damage_always_contains_cursor_row() {
+        // The host's cursor-blink repaint relies on this: alacritty re-damages
+        // the cursor row every frame, so a blink flip only needs a plain
+        // render, never request_full_frame().
+        let mut t = term();
+        t.advance(b"hi");
+        let _ = t.frame();
+        for _ in 0..3 {
+            let f = t.frame();
+            match f.damage {
+                FrameDamage::Rows(rows) => {
+                    assert!(rows.contains(&f.cursor_row), "cursor row must stay damaged");
+                }
+                FrameDamage::Full => {}
+            }
         }
     }
 

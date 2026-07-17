@@ -15,10 +15,10 @@ public sealed class Settings
     public string Shell { get; set; } = "powershell.exe";
     /// "#RRGGBB" terminal background (surface clear color / tint).
     public string BackgroundHex { get; set; } = "#1E1E1E";
-    /// Terminal background opacity: 0 = fully transparent (Mica/acrylic blurs
-    /// through the terminal), 1 = opaque. Values in between tint the blur.
-    public double BackgroundOpacity { get; set; } = 1.0;
-    /// One of: Mica, MicaAlt, Acrylic, None.
+    /// One of: Mica, MicaAlt, Acrylic (backdrop mode — the material owns every
+    /// surface, transparent chrome/terminal) or None (theme mode — the theme
+    /// owns every surface, opaque). Old BackgroundOpacity keys in settings.json
+    /// are ignored on load.
     public string Backdrop { get; set; } = "Mica";
     /// Programming ligatures (=> != ->) in the terminal grid.
     public bool Ligatures { get; set; } = true;
@@ -26,6 +26,8 @@ public sealed class Settings
     public string CursorStyle { get; set; } = "Default";
     /// Blink the terminal cursor.
     public bool CursorBlink { get; set; } = false;
+    /// Finishing a mouse selection (drag / double-click) copies it to the clipboard.
+    public bool CopyOnSelect { get; set; } = true;
     /// Active color theme name (see Themes.All). Drives the ANSI palette + the
     /// terminal/chrome background.
     public string ThemeName { get; set; } = "Velo Dark";

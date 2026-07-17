@@ -36,6 +36,9 @@ const PAD_LOGICAL_PX: f32 = 10.0;
 mod host_client;
 
 #[cfg(windows)]
+mod shell_integration;
+
+#[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
     use std::sync::Arc;
@@ -416,6 +419,8 @@ mod imp {
         /// Spawn sessions in the detached velo-pty-host so they survive app
         /// close (falls back to in-process ConPTY when the host won't start).
         recovery: bool,
+        /// Finishing a local selection gesture copies the text to the clipboard.
+        copy_on_select: bool,
         /// Terminal background (surface clear) color.
         bg: [u8; 3],
         /// Terminal background alpha (0 = transparent → blur-through, 1 = opaque).
@@ -636,8 +641,8 @@ mod imp {
         /// Draw the session bound to pane `idx` into that pane's swapchain and
         /// present it. No-op for an empty/unsized pane.
         fn render_pane(&mut self, idx: usize) {
-            let (kind, sid, dims) = match self.panes.get(idx) {
-                Some(Some(p)) => (p.kind, p.session, (p.cols, p.rows)),
+            let (kind, sid, dims, force_full) = match self.panes.get(idx) {
+                Some(Some(p)) => (p.kind, p.session, (p.cols, p.rows), p.force_full),
                 _ => return,
             };
             // Snapshot the frame first (ends the session/workspace borrow before
@@ -663,7 +668,14 @@ mod imp {
                         return;
                     }
                     match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
-                        Some(s) => s.terminal.frame(),
+                        Some(s) => {
+                            // Host-side invalidation: frame() must resolve every
+                            // row's cells, not just damaged rows.
+                            if force_full {
+                                s.terminal.request_full_frame();
+                            }
+                            s.terminal.frame()
+                        }
                         None => {
                             dbglog(&format!("render_pane: pane {idx} sid={sid} gone"));
                             return;
@@ -1208,6 +1220,10 @@ mod imp {
             // New shells size to the focused pane's grid (fallback 80x24).
             let (cols, rows) = self.pane_cols_rows(self.focused_pane).unwrap_or((80, 24));
 
+            // Inject OSC 133 shell integration for WSL bash/zsh (drives the
+            // Outline); returns the shell unchanged for every other shell.
+            let cmdline = crate::shell_integration::prepare(&self.shell);
+
             let inbox = Arc::new(Mutex::new(Vec::<u8>::new()));
             let wakeup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let on_event = Self::make_on_event(
@@ -1218,7 +1234,7 @@ mod imp {
             );
             dbglog(&format!("spawn_session: id={id}, shell={}, {cols}x{rows}", self.shell));
             let pty = if self.recovery {
-                match crate::host_client::spawn_remote(&self.shell, cols, rows, on_event) {
+                match crate::host_client::spawn_remote(&cmdline, cols, rows, on_event) {
                     Ok(r) => PtyHandle::Remote(r),
                     Err(e) => {
                         dbglog(&format!("spawn_session: host spawn failed ({e}); using local pty"));
@@ -1228,11 +1244,11 @@ mod imp {
                             wakeup_pending.clone(),
                             self.wakeup_hwnd.0 as isize,
                         );
-                        PtyHandle::Local(pty_win::spawn(&self.shell, cols, rows, ev2)?)
+                        PtyHandle::Local(pty_win::spawn(&cmdline, cols, rows, ev2)?)
                     }
                 }
             } else {
-                PtyHandle::Local(match pty_win::spawn(&self.shell, cols, rows, on_event) {
+                PtyHandle::Local(match pty_win::spawn(&cmdline, cols, rows, on_event) {
                     Ok(p) => p,
                     Err(e) => {
                         dbglog(&format!("spawn_session: pty spawn FAILED: {e}"));
@@ -1520,11 +1536,10 @@ mod imp {
                 self.swallow_next_char = true;
                 return true;
             }
-            if ctrl && !shift && vk == 0x56 {
-                self.paste();
-                self.swallow_next_char = true;
-                return true;
-            }
+            // NB: plain Ctrl+V is NOT grabbed for paste — it's forwarded to the PTY
+            // (as 0x16) so CLI apps that bind Ctrl+V (Claude Code image paste,
+            // PSReadLine's own clipboard paste, readline quoted-insert) receive it.
+            // Terminal paste is Ctrl+Shift+V (handled above).
 
             // Shift+PgUp/PgDn scrolls scrollback a page instead of sending a
             // byte sequence, unless the alt screen (vim/less) is active —
@@ -1767,6 +1782,22 @@ mod imp {
                     }
                     self.press_pos = None;
                     self.mouse_down = false;
+                    // Copy-on-select: releasing a selection gesture (drag or
+                    // double-click word select) lands the text straight on the
+                    // clipboard. A plain click has no selection → no-op, so the
+                    // clipboard isn't clobbered.
+                    if self.copy_on_select {
+                        let text = self
+                            .sessions
+                            .get(sid)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|s| s.terminal.selection_text());
+                        if let Some(t) = text {
+                            if !t.is_empty() {
+                                clipboard_set_text(self.wakeup_hwnd, &t);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1914,12 +1945,11 @@ mod imp {
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
-                // ponytail: full repaint per blink tick; damage just the cursor
-                // row if this ever shows up in profiles.
+                // No force_full: alacritty re-damages the cursor row every
+                // frame (pinned by term-core's
+                // idle_frame_damage_always_contains_cursor_row), so a plain
+                // render repaints exactly the cursor row instead of the grid.
                 eng.blink_on = !eng.blink_on;
-                for p in eng.panes.iter_mut().flatten() {
-                    p.force_full = true;
-                }
                 eng.render_all();
                 LRESULT(0)
             }
@@ -2079,6 +2109,7 @@ mod imp {
             font_pt: FONT_SIZE_PT,
             shell: "powershell.exe".to_string(),
             recovery: false,
+            copy_on_select: false,
             bg,
             bg_a,
             ligatures: true,
@@ -2225,6 +2256,18 @@ mod imp {
     pub unsafe extern "C" fn velo_set_recovery(eng: *mut Engine, on: u8) {
         if let Some(e) = eng.as_mut() {
             e.recovery = on != 0;
+        }
+    }
+
+    /// Enable/disable copy-on-select: finishing a mouse selection copies the
+    /// selected text to the clipboard.
+    ///
+    /// # Safety
+    /// `eng` must be a live handle from `velo_attach`.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_set_copy_on_select(eng: *mut Engine, on: u8) {
+        if let Some(e) = eng.as_mut() {
+            e.copy_on_select = on != 0;
         }
     }
 
@@ -2650,10 +2693,42 @@ mod imp {
         Box::into_raw(utf16.into_boxed_slice()) as *mut u16
     }
 
-    /// Free a buffer returned by [`velo_list_fonts`].
+    /// UTF-16 text of tab `id`'s last FINISHED command output (OSC 133 C→D,
+    /// ANSI-scrubbed; needs shell integration). Null + `*out_len = 0` when
+    /// empty/unknown. Caller frees with [`velo_free_utf16`].
     ///
     /// # Safety
-    /// `ptr`/`len` must be exactly what `velo_list_fonts` returned, freed once.
+    /// `eng` must be a live handle from `velo_attach`; `out_len` non-null.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_last_output(
+        eng: *mut Engine,
+        id: u32,
+        out_len: *mut usize,
+    ) -> *mut u16 {
+        if out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        *out_len = 0;
+        let text = match eng
+            .as_ref()
+            .and_then(|e| e.sessions.get(id as usize))
+            .and_then(|o| o.as_ref())
+        {
+            Some(s) => s.terminal.last_command_output(),
+            None => return std::ptr::null_mut(),
+        };
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        if utf16.is_empty() {
+            return std::ptr::null_mut();
+        }
+        *out_len = utf16.len();
+        Box::into_raw(utf16.into_boxed_slice()) as *mut u16
+    }
+
+    /// Free a buffer returned by [`velo_list_fonts`] / [`velo_last_output`].
+    ///
+    /// # Safety
+    /// `ptr`/`len` must be exactly what the producer returned, freed once.
     #[no_mangle]
     pub unsafe extern "C" fn velo_free_utf16(ptr: *mut u16, len: usize) {
         if !ptr.is_null() && len > 0 {

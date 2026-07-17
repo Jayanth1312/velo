@@ -13,6 +13,7 @@ const VK_PRIOR: u16 = 0x21; // Page Up
 const VK_NEXT: u16 = 0x22; // Page Down
 const VK_INSERT: u16 = 0x2D;
 const VK_DELETE: u16 = 0x2E;
+const VK_TAB: u16 = 0x09;
 const VK_F1: u16 = 0x70;
 const VK_F12: u16 = 0x7B;
 
@@ -27,6 +28,13 @@ fn mod_param(ctrl: bool, shift: bool, alt: bool) -> u8 {
 pub fn key_seq(vk: u16, ctrl: bool, shift: bool, alt: bool, app_cursor: bool) -> Option<Vec<u8>> {
     let any_mod = ctrl || shift || alt;
     let m = mod_param(ctrl, shift, alt);
+
+    // Shift+Tab -> CBT / back-tab. Plain Tab emits a WM_CHAR (0x09) so only the
+    // shifted form needs encoding here; Ctrl+Tab is consumed as a tab-switch
+    // chord before this is ever reached.
+    if vk == VK_TAB {
+        return (shift && !ctrl).then(|| b"\x1b[Z".to_vec());
+    }
 
     // F1-F4: ESC O P..S unmodified, CSI 1;m P..S with modifiers.
     if (VK_F1..=VK_F1 + 3).contains(&vk) {
@@ -102,6 +110,17 @@ mod tests {
     #[test]
     fn f1_unmodified() {
         assert_eq!(key_seq(VK_F1, false, false, false, false), Some(b"\x1bOP".to_vec()));
+    }
+    #[test]
+    fn shift_tab_backtab() {
+        // Shift+Tab -> CBT (back-tab).
+        assert_eq!(key_seq(VK_TAB, false, true, false, false), Some(b"\x1b[Z".to_vec()));
+    }
+
+    #[test]
+    fn plain_tab_none() {
+        // Plain Tab arrives via WM_CHAR (0x09); key_seq must not double-encode it.
+        assert_eq!(key_seq(VK_TAB, false, false, false, false), None);
     }
 
     #[test]

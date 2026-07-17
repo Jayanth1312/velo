@@ -8,6 +8,37 @@
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
             </ResourceDictionary.MergedDictionaries>
 
+            <!-- Apple-style text inputs, app-wide: soft rounded fill, no border,
+                 no focus underline. The theme brushes kill the Fluent border +
+                 accent underline; the implicit TextBox style rounds the pill. -->
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Default">
+                    <SolidColorBrush x:Key="TextControlBackground" Color="#15FFFFFF" />
+                    <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="#1FFFFFFF" />
+                    <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#26FFFFFF" />
+                    <SolidColorBrush x:Key="TextControlBorderBrush" Color="Transparent" />
+                    <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="Transparent" />
+                    <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="Transparent" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="TextControlBackground" Color="#0D000000" />
+                    <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="#14000000" />
+                    <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#1A000000" />
+                    <SolidColorBrush x:Key="TextControlBorderBrush" Color="Transparent" />
+                    <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="Transparent" />
+                    <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="Transparent" />
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+
+            <Thickness x:Key="TextControlBorderThemeThickness">0</Thickness>
+            <Thickness x:Key="TextControlBorderThemeThicknessFocused">0</Thickness>
+
+            <Style TargetType="TextBox">
+                <Setter Property="CornerRadius" Value="9" />
+                <Setter Property="Padding" Value="12,7,12,8" />
+                <Setter Property="BorderThickness" Value="0" />
+            </Style>
+
             <!-- Custom (frameless) window caption buttons. Flat, glyph-only,
                  standard Windows hover feedback; close button reddens on hover. -->
             <Style x:Key="CaptionButtonStyle" TargetType="Button">

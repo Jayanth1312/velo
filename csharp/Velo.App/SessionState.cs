@@ -19,6 +19,10 @@ public sealed class SessionState
         public uint HostId { get; set; } = uint.MaxValue;
         /// Command running at close (OSC 133), for opt-in re-run on restore.
         public string Running { get; set; } = "";
+        /// True when this tab is a browser tab (WebView2) instead of a shell.
+        public bool Browser { get; set; }
+        /// Browser tab's last URL, restored on launch.
+        public string Url { get; set; } = "";
     }
 
     public sealed class AgentMsg
