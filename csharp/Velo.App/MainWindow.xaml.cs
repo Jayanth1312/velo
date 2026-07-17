@@ -670,33 +670,42 @@ public sealed partial class MainWindow : Window
     {
         if (open && _tabsOverlay) { DockFromOverlay(false); return; }
         DropOverlay(false);   // no-op unless mid-overlay; keeps closes clean
-        // Also dismiss the OPPOSITE hover overlay (details/left) if it's showing: while
-        // it's open, ContentRoot_SizeChanged recomputes its clip on every layout pass
-        // this column's width Storyboard produces, racing the DComp present and
-        // flickering the terminal↔sidebar seam. A toggle click is a mode switch —
-        // keeping an unrelated hover overlay alive through it has no UX value, so drop
-        // it instantly (no slide-out) rather than animate: an animated retract would
-        // still race the clip for most of the width animation's duration.
+        // Dismiss the OPPOSITE hover overlay (details/left) instantly: a toggle
+        // click is a mode switch, and keeping an unrelated hover overlay alive
+        // through it has no UX value.
         DropOverlay(true);
-        _sidebarOpen = open;
         AnimateWidth(ToggleBar, open ? BarOpen : BarClosed);
-        // Animate the column width instead of an instant jump: a 280px one-frame jump
-        // exposes a misaligned strip at the terminal↔sidebar seam (the swapchain's
-        // DComp present lags the XAML column commit by a frame → the color flash). At
-        // ~a few px per frame that desync is sub-pixel and reads as motion, not a flash.
-        // Native resizes stay muted while the storyboard runs (one push at the end):
-        // a swapchain resize per animation frame stalls the GPU + rewraps scrollback
-        // and dragged the whole animation to slideshow speed.
-        _suppressPaneResize = true;
-        // Closing → the terminal column GROWS: pre-size the panes to their final
-        // width so the reveal shows rendered terminal, not a background strip.
-        Sidebar.Width = TabsWidth;
-        PreGrowPaneSizes(SidebarSurface.ActualWidth - (open ? TabsWidth : 0));
-        AnimateWidth(SidebarSurface, open ? TabsWidth : 0, () =>
+        // NO per-frame column-width animation in either direction: a Storyboard
+        // driving the grid column reflows layout every frame, and the swapchain's
+        // DComp present lags the XAML commit — the terminal↔sidebar seam flickers
+        // for the whole 220ms. Instead reuse the hover-overlay machinery, which
+        // is already flicker-free: a composition transform slides the panel while
+        // UpdateTerminalClip tracks its edge from the same render tick, and the
+        // real grid layout changes in exactly ONE commit.
+        if (open)
         {
-            _suppressPaneResize = false;
-            FlushPendingResizes();
-        });
+            // Slide in as an overlay, then promote to docked in one commit.
+            // DockFromOverlay sets _sidebarOpen/widths/triggers/focus itself.
+            RevealOverlay(left: false, () => DockFromOverlay(false));
+            return;
+        }
+        _sidebarOpen = false;
+        // Close: pre-render the panes at their post-close width so the widened
+        // column reveals already-rendered terminal (the swapchain buffer is
+        // grown BEFORE the layout jump — nothing to present-lag against), then
+        // collapse the column in one commit, hand the sidebar to the overlay
+        // host at X=0, and slide it out with the clip tracking its edge.
+        PreGrowPaneSizes(SidebarSurface.ActualWidth);
+        SidebarSurface.Child = null;
+        SidebarSurface.Width = 0;
+        Sidebar.Width = TabsWidth;
+        TabsOverlayPanel.Child = Sidebar;
+        TabsOverlayHost.Width = TabsWidth;
+        TabsOverlayXform.X = 0;
+        TabsOverlayHost.Visibility = Visibility.Visible;
+        _tabsOverlay = true;
+        UpdateTerminalClip();
+        RetractOverlay(left: false);
         UpdateEdgeTriggers();
         FocusTerminal();
     }
@@ -738,7 +747,7 @@ public sealed partial class MainWindow : Window
     private void TabsEdge_PointerEntered(object sender, PointerRoutedEventArgs e)
         => RevealOverlay(left: false);
 
-    private void RevealOverlay(bool left)
+    private void RevealOverlay(bool left, Action? completed = null)
     {
         if (left)
         {
@@ -750,7 +759,7 @@ public sealed partial class MainWindow : Window
             DetailsOverlayHost.Width = DetailsWidth;   // panel fills the host, flush to the edge
             DetailsOverlayHost.Visibility = Visibility.Visible;
             EnsureDetailsRealized();
-            AnimateOverlay(left: true, 0);
+            AnimateOverlay(left: true, 0, completed);
         }
         else
         {
@@ -761,7 +770,7 @@ public sealed partial class MainWindow : Window
             TabsOverlayPanel.Child = Sidebar;
             TabsOverlayHost.Width = TabsWidth;   // panel fills the host, flush to the edge
             TabsOverlayHost.Visibility = Visibility.Visible;
-            AnimateOverlay(left: false, 0);
+            AnimateOverlay(left: false, 0, completed);
         }
     }
 
@@ -985,7 +994,7 @@ public sealed partial class MainWindow : Window
         Log.Write($"SetDetails: open={open} tab={_activeDetailsTab} realized={_detailsRealized}");
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
-        _suppressPaneResize = true;                              // see SetSidebar
+        _suppressPaneResize = true;   // mute per-frame swapchain resizes; flush on Completed
         DetailsContent.Width = DetailsWidth;
         PreGrowPaneSizes(DetailsSurface.ActualWidth - (open ? DetailsWidth : 0));
         AnimateWidth(DetailsSurface, open ? DetailsWidth : 0, () =>
@@ -1138,7 +1147,7 @@ public sealed partial class MainWindow : Window
         DetailsContent.Width = DetailsWidth;
         if (!_detailsOpen || Math.Abs(DetailsSurface.ActualWidth - DetailsWidth) < 0.5)
             return;
-        _suppressPaneResize = true;                              // see SetSidebar
+        _suppressPaneResize = true;   // mute per-frame swapchain resizes; flush on Completed
         PreGrowPaneSizes(DetailsSurface.ActualWidth - DetailsWidth);
         AnimateWidth(DetailsSurface, DetailsWidth, () =>
         {
