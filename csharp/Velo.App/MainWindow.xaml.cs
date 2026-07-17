@@ -4396,8 +4396,18 @@ public sealed partial class MainWindow : Window
         navSearch.TextChanged += (_, _) => FillNav();
         FillNav();
 
-        var sidebar = new StackPanel { Width = 190 };
-        sidebar.Children.Add(SearchField(navSearch));
+        // Fixed height matching the content ScrollViewer: the dialog must be the
+        // same size on every page and while search filters the nav list. A Grid
+        // (not StackPanel) so the ListView gets a bounded * row and scrolls
+        // internally instead of growing the card.
+        var sidebar = new Grid { Width = 190, Height = 480 };
+        sidebar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        sidebar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        var searchField = SearchField(navSearch);
+        Grid.SetRow(searchField, 0);
+        sidebar.Children.Add(searchField);
+        Grid.SetRow(nav, 1);
+        nav.VerticalAlignment = VerticalAlignment.Top;
         sidebar.Children.Add(nav);
 
         var body = new Grid { ColumnSpacing = 20 };
