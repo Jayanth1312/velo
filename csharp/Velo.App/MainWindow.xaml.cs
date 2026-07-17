@@ -130,6 +130,21 @@ public sealed partial class MainWindow : Window
         // the ctor depends on it completing.
         Task.Run(() => ShellIntegration.Ensure(_settings));
         Log.Write("ctor: ShellIntegration dispatched");
+        // Pre-warm the session-recovery host off-thread: RestoreSession's first
+        // ctl connect otherwise cold-starts it ON the UI thread (spawn + up to
+        // ~2s of connect polling inside velo_core's ensure_host). The host is
+        // single-instance safe — a second copy exits when the ctl pipe exists.
+        if (_settings.SessionRecovery)
+            Task.Run(() =>
+            {
+                try
+                {
+                    var exe = System.IO.Path.Combine(AppContext.BaseDirectory, "velo-pty-host.exe");
+                    if (System.IO.File.Exists(exe))
+                        Process.Start(new ProcessStartInfo(exe) { CreateNoWindow = true, UseShellExecute = false });
+                }
+                catch (Exception ex) { Log.Write($"host prewarm failed: {ex.Message}"); }
+            });
         SelectDetailsTab(InfoTabButton);   // default section, shown when panel opens
         Log.Write("ctor: SelectDetailsTab done");
         // Warm the agent scan (PATH + WSL probes take seconds) so the Agent
@@ -235,11 +250,30 @@ public sealed partial class MainWindow : Window
 
     // ---- Lifecycle --------------------------------------------------------
 
+    /// Deferred-init state: the engine used to spin up inside this Loaded
+    /// handler, which runs BEFORE the first XAML frame presents — DX12 device
+    /// init + font load + session restore all sat inside the "black window"
+    /// phase on launch. Now Loaded only queues InitEngine at Low priority, so
+    /// the chrome (backdrop, sidebar, tab strip) paints first and the terminal
+    /// fills in a beat later.
+    private bool _initQueued;
+    private bool _windowClosed;
+
     private void TerminalPanel_Loaded(object sender, RoutedEventArgs e)
     {
         Log.Write($"Loaded: enter. engine={_engine}, scaleX={TerminalPanel.CompositionScaleX}, " +
                   $"size={TerminalPanel.ActualWidth}x{TerminalPanel.ActualHeight}");
-        if (_engine != IntPtr.Zero)
+        if (_engine != IntPtr.Zero || _initQueued)
+            return;
+        _initQueued = true;
+        DispatcherQueue.TryEnqueue(
+            Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, InitEngine);
+    }
+
+    private void InitEngine()
+    {
+        Log.Write("InitEngine: enter");
+        if (_engine != IntPtr.Zero || _windowClosed)
             return;
 
         // Each SwapChainPanel carries its core pane id in Tag. Slot 0 = core pane 0
@@ -281,13 +315,23 @@ public sealed partial class MainWindow : Window
             TerminalPanel.CompositionScaleChanged += OnCompositionScaleChanged;
 
             UpdateMaxGlyph();
-            RestoreSession();
-            FocusTerminal();
-            Log.Write("Loaded: complete");
+            // Session restore is the slowest launch phase (pty-host cold start,
+            // pipe connect retries, one ConPTY spawn per tab — can be seconds).
+            // Queue it behind this frame so the cleared terminal presents first.
+            DispatcherQueue.TryEnqueue(
+                Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+            {
+                if (_windowClosed || _engine == IntPtr.Zero)
+                    return;
+                Log.Write("InitEngine: restoring session");
+                RestoreSession();
+                FocusTerminal();
+                Log.Write("InitEngine: complete");
+            });
         }
         catch (Exception ex)
         {
-            Log.Ex("TerminalPanel_Loaded", ex);
+            Log.Ex("InitEngine", ex);
             throw;
         }
     }
@@ -383,6 +427,7 @@ public sealed partial class MainWindow : Window
 
     private void OnClosed(object sender, WindowEventArgs e)
     {
+        _windowClosed = true;   // cancels any still-queued deferred init
         Log.Write($"OnClosed: window closing. Tabs={Tabs.Count}\n{Environment.StackTrace}");
         // Snapshot tabs (command + cwd + host session) for RestoreSession.
         var session = new SessionState();
