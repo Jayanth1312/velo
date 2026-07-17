@@ -3996,12 +3996,12 @@ public sealed partial class MainWindow : Window
         // whole app went black whenever the hover panel was on screen).
         DetailsOverlayPanel.Background = surface;
         TabsOverlayPanel.Background = surface;
-        // Settings card: EXACT same surface tint as the docked panels. Safe to
-        // be fully translucent because Settings_Click zeroes PaneHost.Opacity
-        // while the dialog is open — no terminal/browser pixels under the card,
-        // so it composites over the raw window backdrop like the chrome does.
+        // Settings card: same backdrop tint as the panels, +30% opacity so the
+        // dialog reads as a raised surface (and the terminal behind stays
+        // visible around it — panes are NOT hidden while Settings is open).
         if (_settingsCard != null)
-            _settingsCard.Background = surface;
+            _settingsCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(
+                (byte)Math.Round(Math.Min(1.0, _settings.BackgroundOpacity + 0.30) * 255), r, g, b));
     }
 
     /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
@@ -4471,12 +4471,11 @@ public sealed partial class MainWindow : Window
         cardInner.Children.Add(header);
         cardInner.Children.Add(body);
 
-        // Card bg: EXACT same surface tint as the docked panels (UpdatePanelTint)
-        // so the card is the same backdrop material as the rest of the chrome.
-        // PaneHost is faded out below, so nothing bleeds through from behind.
-        // Set once for the initial paint; UpdatePanelTint re-tints live.
+        // Card bg: same backdrop tint as the docked panels but +30% opacity, so
+        // the dialog reads as a raised surface over the (still visible)
+        // terminal. Set once for the initial paint; UpdatePanelTint re-tints live.
         var (br, bgr, bbl) = _settings.BackgroundRgb();
-        byte cardA0 = (byte)Math.Round(_settings.BackgroundOpacity * 255);
+        byte cardA0 = (byte)Math.Round(Math.Min(1.0, _settings.BackgroundOpacity + 0.30) * 255);
         var card = new Border
         {
             Child = cardInner,
@@ -4542,7 +4541,6 @@ public sealed partial class MainWindow : Window
             RootGrid.Children.Remove(overlay);
             _settingsOverlay = null;
             _settingsCard = null;
-            PaneHost.Opacity = 1;
             FocusTerminal();
         }
         fontBox.ValueChanged += (_, _) => Apply();
@@ -4597,11 +4595,6 @@ public sealed partial class MainWindow : Window
 
         _settingsOverlay = overlay;
         _settingsCard = card;
-        // Fade the pane content (terminals/browser) out so the translucent card
-        // sits over the raw window backdrop — the whole dialog reads as the same
-        // Mica/Acrylic material as the app chrome, with no text bleed-through.
-        // Opacity, not Visibility: keeps layout stable (no swapchain resize churn).
-        PaneHost.Opacity = 0;
         RootGrid.Children.Add(overlay);
         navSearch.Focus(FocusState.Programmatic);
     }
