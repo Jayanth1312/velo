@@ -1772,9 +1772,217 @@ public sealed partial class MainWindow : Window
         new PaletteItem { Label = "Toggle Copy on Select", Checked = _settings.CopyOnSelect, Action = () => TogglePaletteSetting(v => _settings.CopyOnSelect = v, _settings.CopyOnSelect) },
         new PaletteItem { Label = "Toggle Session Recovery", Checked = _settings.SessionRecovery, Action = () => TogglePaletteSetting(v => _settings.SessionRecovery = v, _settings.SessionRecovery) },
         new PaletteItem { Label = "Toggle Restore Agent Chat", Checked = _settings.RestoreAgentChat, Action = () => TogglePaletteSetting(v => _settings.RestoreAgentChat = v, _settings.RestoreAgentChat) },
+        new PaletteItem { Label = "Tools…", KeepOpen = true, Action = ShowPaletteTools },
         new PaletteItem { Label = "Clear Screen", Action = ClearScreen },
         new PaletteItem { Label = "Open Settings", Action = () => Settings_Click(this, new RoutedEventArgs()) },
     });
+
+    // ---- Output tools -----------------------------------------------------
+    //
+    // Any script/executable in %APPDATA%\velo\tools becomes a palette entry.
+    // Running one pipes the active tab's last finished command output (OSC 133
+    // C→D, from shell integration) to its stdin and shows stdout in a card.
+    // Language-agnostic by design: .py/.ps1/.js get their interpreter, anything
+    // else runs directly — no embedded runtime.
+
+    private static string ToolsDir => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "velo", "tools");
+
+    private void ShowPaletteTools()
+    {
+        string[] files;
+        try
+        {
+            Directory.CreateDirectory(ToolsDir);
+            files = Directory.GetFiles(ToolsDir);
+        }
+        catch (Exception ex)
+        {
+            Log.Ex("ShowPaletteTools", ex);
+            files = Array.Empty<string>();
+        }
+        if (files.Length == 0)
+        {
+            SetPalettePage(new[] { new PaletteItem
+            {
+                Label = $"No tools yet — drop scripts into {ToolsDir}",
+                Action = () => { },
+            } });
+            return;
+        }
+        SetPalettePage(files.Select(f => new PaletteItem
+        {
+            Label = $"Tool: {System.IO.Path.GetFileName(f)}",
+            Action = () => RunTool(f),
+        }));
+    }
+
+    /// The active tab's last finished command output from the core.
+    private unsafe string LastCommandOutput()
+    {
+        if (_engine == IntPtr.Zero || TabList.SelectedItem is not TabVM t || t.IsBrowser)
+            return "";
+        nuint len = 0;
+        ushort* p = Native.velo_last_output(_engine, t.Id, &len);
+        if (p == null || len == 0)
+            return "";
+        var s = new string((char*)p, 0, (int)len);
+        Native.velo_free_utf16(p, len);
+        return s;
+    }
+
+    private static ProcessStartInfo ToolPsi(string file)
+    {
+        var psi = System.IO.Path.GetExtension(file).ToLowerInvariant() switch
+        {
+            ".py" => new ProcessStartInfo("python", $"\"{file}\""),
+            ".ps1" => new ProcessStartInfo("powershell",
+                $"-NoProfile -ExecutionPolicy Bypass -File \"{file}\""),
+            ".js" => new ProcessStartInfo("node", $"\"{file}\""),
+            _ => new ProcessStartInfo(file),
+        };
+        psi.UseShellExecute = false;
+        psi.RedirectStandardInput = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.CreateNoWindow = true;
+        return psi;
+    }
+
+    /// Start the tool; .py falls back to the Windows `py` launcher when
+    /// `python` isn't on PATH.
+    private static Process StartTool(string file)
+    {
+        try { return Process.Start(ToolPsi(file))!; }
+        catch (System.ComponentModel.Win32Exception) when (
+            System.IO.Path.GetExtension(file).Equals(".py", StringComparison.OrdinalIgnoreCase))
+        {
+            var psi = ToolPsi(file);
+            psi.FileName = "py";
+            return Process.Start(psi)!;
+        }
+    }
+
+    private async void RunTool(string file)
+    {
+        string name = System.IO.Path.GetFileName(file);
+        string input = LastCommandOutput();
+        string result;
+        try
+        {
+            using var p = StartTool(file);
+            await p.StandardInput.WriteAsync(input);
+            p.StandardInput.Close();
+            var so = p.StandardOutput.ReadToEndAsync();
+            var se = p.StandardError.ReadToEndAsync();
+            var done = Task.WhenAll(so, se, p.WaitForExitAsync());
+            if (await Task.WhenAny(done, Task.Delay(30_000)) != done)
+            {
+                try { p.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                result = "(tool timed out after 30s)";
+            }
+            else
+            {
+                result = (await so).TrimEnd();
+                var err = (await se).TrimEnd();
+                if (result.Length == 0)
+                    result = err.Length > 0 ? err : "(no output)";
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Ex($"RunTool {name}", ex);
+            result = ex.Message;
+        }
+        ShowToolResult(name, input.Length == 0
+            ? result + "\n\n(note: no captured command output — shell integration off, or no command finished yet)"
+            : result);
+    }
+
+    /// Monospace read-only result card over the terminal; Esc / ✕ / outside
+    /// click closes. Selectable text stands in for a copy button.
+    private void ShowToolResult(string title, string text)
+    {
+        var (r, g, b) = _settings.BackgroundRgb();
+        var body = new TextBox
+        {
+            Text = text,
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.NoWrap,
+            FontFamily = new FontFamily(_settings.FontFamily is { Length: > 0 } f ? f : "Consolas"),
+            FontSize = 13,
+            BorderThickness = new Thickness(0),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+        };
+        var scroll = new ScrollViewer
+        {
+            Content = body,
+            Height = 420,
+            Width = 660,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+        };
+        var closeBtn = new Button
+        {
+            Content = "",
+            FontFamily = new FontFamily("Segoe MDL2 Assets"),
+            FontSize = 12,
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(8),
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(new TextBlock
+        {
+            Text = title,
+            FontSize = 16,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        Grid.SetColumn(closeBtn, 1);
+        header.Children.Add(closeBtn);
+        var inner = new StackPanel { Spacing = 12 };
+        inner.Children.Add(header);
+        inner.Children.Add(scroll);
+        var card = new Border
+        {
+            Child = inner,
+            // Same raised-surface treatment as the settings card: panel tint +30%.
+            Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(
+                (byte)Math.Round(Math.Min(1.0, _settings.BackgroundOpacity + 0.30) * 255), r, g, b)),
+            BorderBrush = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 70, 70, 70)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(12),
+            Padding = new Thickness(20),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var overlay = new Grid { Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
+        overlay.Children.Add(card);
+        Grid.SetRowSpan(overlay, Math.Max(1, RootGrid.RowDefinitions.Count));
+        Grid.SetColumnSpan(overlay, Math.Max(1, RootGrid.ColumnDefinitions.Count));
+        Canvas.SetZIndex(overlay, 1001);
+        void Close()
+        {
+            RootGrid.Children.Remove(overlay);
+            FocusTerminal();
+        }
+        closeBtn.Click += (_, _) => Close();
+        overlay.Tapped += (_, args) =>
+        {
+            if (ReferenceEquals(args.OriginalSource, overlay))
+                Close();
+        };
+        var esc = new Microsoft.UI.Xaml.Input.KeyboardAccelerator { Key = Windows.System.VirtualKey.Escape };
+        esc.Invoked += (_, args) => { args.Handled = true; Close(); };
+        card.KeyboardAccelerators.Add(esc);
+        RootGrid.Children.Add(overlay);
+        body.Focus(FocusState.Programmatic);
+    }
 
     /// Flip a boolean setting from the palette: apply + persist in one step.
     private void TogglePaletteSetting(Action<bool> set, bool current)

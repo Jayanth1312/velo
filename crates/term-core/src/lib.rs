@@ -108,9 +108,14 @@ struct OscTee {
 }
 
 impl OscTee {
-    /// Feed raw bytes; push each completed OSC payload into `out`.
-    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
+    /// Feed raw bytes; push each completed OSC payload into `out`. `cap`
+    /// records the raw byte stream between the 133;C and 133;D marks (the tee
+    /// walks every byte anyway) so the last command's output is retrievable.
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Vec<u8>>, cap: &mut CmdCapture) {
         for &b in bytes {
+            if cap.on {
+                cap.push(b);
+            }
             if !self.in_osc {
                 if self.esc {
                     self.esc = false;
@@ -125,11 +130,13 @@ impl OscTee {
                 self.st = false;
                 self.in_osc = false;
                 if b == b'\\' {
+                    cap.mark(&self.buf);
                     out.push(std::mem::take(&mut self.buf)); // ST terminator
                 }
                 self.buf.clear(); // ESC + other: abort
             } else if b == 0x07 {
                 self.in_osc = false;
+                cap.mark(&self.buf);
                 out.push(std::mem::take(&mut self.buf)); // BEL terminator
             } else if b == 0x1b {
                 self.st = true;
@@ -138,6 +145,87 @@ impl OscTee {
             }
         }
     }
+}
+
+/// Raw output bytes of the current/last command, delimited by the OSC 133;C /
+/// 133;D marks. Kept raw (still contains CSI/SGR + the trailing D-mark intro);
+/// [`strip_ansi`] scrubs on read. Tail-capped so a flooding command can't grow
+/// memory unbounded.
+#[derive(Default)]
+struct CmdCapture {
+    on: bool,
+    buf: Vec<u8>,
+    last: Vec<u8>,
+}
+
+/// 1 MiB tail per command — plenty for piping through an output tool.
+const CAPTURE_CAP: usize = 1 << 20;
+
+impl CmdCapture {
+    fn push(&mut self, b: u8) {
+        if self.buf.len() >= CAPTURE_CAP {
+            self.buf.drain(..CAPTURE_CAP / 4); // keep the tail, amortized
+        }
+        self.buf.push(b);
+    }
+
+    /// Toggle on the command marks as their OSC payload completes.
+    fn mark(&mut self, payload: &[u8]) {
+        if payload.starts_with(b"133;C") {
+            self.buf.clear();
+            self.on = true;
+        } else if payload.starts_with(b"133;D") && self.on {
+            self.on = false;
+            self.last = std::mem::take(&mut self.buf);
+        }
+    }
+}
+
+/// Printable text from raw PTY bytes: CSI / OSC / two-byte ESC sequences and
+/// C0 controls (except `\n`, `\t`) removed; `\r` dropped (`\r\n` → `\n`).
+pub fn strip_ansi(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b == 0x1b {
+            i += 1;
+            match raw.get(i) {
+                Some(b'[') => {
+                    // CSI: parameter/intermediate bytes until a final 0x40-0x7e.
+                    i += 1;
+                    while i < raw.len() && !(0x40..=0x7e).contains(&raw[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                Some(b']') => {
+                    // OSC: until BEL or ESC \. An unterminated tail eats the
+                    // rest — the capture ends mid-D-mark by construction.
+                    i += 1;
+                    while i < raw.len() {
+                        if raw[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if raw[i] == 0x1b && raw.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(_) => i += 1, // two-byte ESC sequence: skip the second byte
+                None => {}
+            }
+            continue;
+        }
+        if b == b'\n' || b == b'\t' || b >= 0x20 {
+            out.push(b);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex(c: u8) -> Option<u8> {
@@ -221,6 +309,8 @@ pub struct Terminal {
     osc: OscTee,
     pending_shell: Vec<ShellEvent>,
     cmd_start: Option<std::time::Instant>,
+    /// Last finished command's raw output (OSC 133 C→D), for output tools.
+    capture: CmdCapture,
     /// Cell count of the last frame, to pre-size the next frame's Vec.
     last_cells: usize,
     /// Resolve the next frame with full damage + every row's cells (host-side
@@ -259,6 +349,7 @@ impl Terminal {
             osc: OscTee::default(),
             pending_shell: Vec::new(),
             cmd_start: None,
+            capture: CmdCapture::default(),
             last_cells: 0,
             force_full: false,
         }
@@ -286,10 +377,16 @@ impl Terminal {
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         let mut oscs = Vec::new();
-        self.osc.feed(bytes, &mut oscs);
+        self.osc.feed(bytes, &mut oscs, &mut self.capture);
         for osc in oscs {
             self.handle_osc(&osc);
         }
+    }
+
+    /// Scrubbed text of the last FINISHED command's output (OSC 133 C→D).
+    /// Empty until shell integration has completed one command.
+    pub fn last_command_output(&self) -> String {
+        strip_ansi(&self.capture.last)
     }
 
     /// Decode one OSC payload into a shell event (OSC 7 cwd / OSC 133 marks).
@@ -1037,6 +1134,19 @@ mod tests {
         assert!(matches!(&ev[2], ShellEvent::Command { phase: 2, exit: 3, .. }));
         // Drained.
         assert!(t.take_shell_events().is_empty());
+    }
+
+    #[test]
+    fn osc133_output_capture_scrubbed() {
+        let mut t = term();
+        t.advance(b"\x1b]133;C;ls\x07");
+        t.advance(b"file1\r\n\x1b[31mfile2\x1b[0m\r\n");
+        t.advance(b"\x1b]133;D;0\x07");
+        assert_eq!(t.last_command_output(), "file1\nfile2\n");
+        // Next command replaces, split marks across reads still delimit.
+        t.advance(b"\x1b]133;C;echo hi\x07hi\r\n\x1b]133;");
+        t.advance(b"D;0\x07prompt> ");
+        assert_eq!(t.last_command_output(), "hi\n");
     }
 
     #[test]

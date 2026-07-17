@@ -167,6 +167,11 @@ internal static unsafe partial class Native
     [LibraryImport(Core)]
     internal static partial void velo_free_utf16(ushort* ptr, nuint len);
 
+    /// Tab `id`'s last finished command output (OSC 133 C→D, ANSI-scrubbed).
+    /// Null when empty/unknown; free with velo_free_utf16.
+    [LibraryImport(Core)]
+    internal static partial ushort* velo_last_output(IntPtr eng, uint id, nuint* outLen);
+
     [LibraryImport(Core)]
     internal static partial void velo_set_bg(IntPtr eng, byte r, byte g, byte b);
 

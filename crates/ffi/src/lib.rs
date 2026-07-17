@@ -2693,10 +2693,42 @@ mod imp {
         Box::into_raw(utf16.into_boxed_slice()) as *mut u16
     }
 
-    /// Free a buffer returned by [`velo_list_fonts`].
+    /// UTF-16 text of tab `id`'s last FINISHED command output (OSC 133 C→D,
+    /// ANSI-scrubbed; needs shell integration). Null + `*out_len = 0` when
+    /// empty/unknown. Caller frees with [`velo_free_utf16`].
     ///
     /// # Safety
-    /// `ptr`/`len` must be exactly what `velo_list_fonts` returned, freed once.
+    /// `eng` must be a live handle from `velo_attach`; `out_len` non-null.
+    #[no_mangle]
+    pub unsafe extern "C" fn velo_last_output(
+        eng: *mut Engine,
+        id: u32,
+        out_len: *mut usize,
+    ) -> *mut u16 {
+        if out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        *out_len = 0;
+        let text = match eng
+            .as_ref()
+            .and_then(|e| e.sessions.get(id as usize))
+            .and_then(|o| o.as_ref())
+        {
+            Some(s) => s.terminal.last_command_output(),
+            None => return std::ptr::null_mut(),
+        };
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        if utf16.is_empty() {
+            return std::ptr::null_mut();
+        }
+        *out_len = utf16.len();
+        Box::into_raw(utf16.into_boxed_slice()) as *mut u16
+    }
+
+    /// Free a buffer returned by [`velo_list_fonts`] / [`velo_last_output`].
+    ///
+    /// # Safety
+    /// `ptr`/`len` must be exactly what the producer returned, freed once.
     #[no_mangle]
     pub unsafe extern "C" fn velo_free_utf16(ptr: *mut u16, len: usize) {
         if !ptr.is_null() && len > 0 {
