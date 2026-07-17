@@ -3962,16 +3962,12 @@ public sealed partial class MainWindow : Window
         // whole app went black whenever the hover panel was on screen).
         DetailsOverlayPanel.Background = surface;
         TabsOverlayPanel.Background = surface;
-        // Settings card: same translucent scheme, but with an 0.85 alpha floor
-        // (like PaletteCard's near-opaque lift) so dense settings text stays
-        // readable even at low configured opacity, while still letting the
-        // backdrop material show through instead of a flat opaque slab.
+        // Settings card: EXACT same surface tint as the docked panels. Safe to
+        // be fully translucent because Settings_Click zeroes PaneHost.Opacity
+        // while the dialog is open — no terminal/browser pixels under the card,
+        // so it composites over the raw window backdrop like the chrome does.
         if (_settingsCard != null)
-        {
-            byte cardA = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
-            _settingsCard.Background = new SolidColorBrush(
-                Microsoft.UI.ColorHelper.FromArgb(cardA, LiftCard(r), LiftCard(g), LiftCard(b)));
-        }
+            _settingsCard.Background = surface;
     }
 
     /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
@@ -4431,19 +4427,17 @@ public sealed partial class MainWindow : Window
         cardInner.Children.Add(header);
         cardInner.Children.Add(body);
 
-        // Card bg: same translucent-tint scheme as UpdatePanelTint (theme bg
-        // lifted a touch, 0.85 alpha floor) so the window backdrop shows
-        // through like the docked panels, instead of an opaque slab. Set once
-        // here for the initial paint; UpdatePanelTint re-tints it live via
-        // _settingsCard once registered below.
+        // Card bg: EXACT same surface tint as the docked panels (UpdatePanelTint)
+        // so the card is the same backdrop material as the rest of the chrome.
+        // PaneHost is faded out below, so nothing bleeds through from behind.
+        // Set once for the initial paint; UpdatePanelTint re-tints live.
         var (br, bgr, bbl) = _settings.BackgroundRgb();
-        static byte Lift(byte v) => (byte)Math.Min(255, v + 14);
-        byte cardA0 = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
+        byte cardA0 = (byte)Math.Round(_settings.BackgroundOpacity * 255);
         var card = new Border
         {
             Child = cardInner,
             Background = new SolidColorBrush(
-                Microsoft.UI.ColorHelper.FromArgb(cardA0, Lift(br), Lift(bgr), Lift(bbl))),
+                Microsoft.UI.ColorHelper.FromArgb(cardA0, br, bgr, bbl)),
             BorderBrush = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 70, 70, 70)),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(12),
@@ -4453,9 +4447,12 @@ public sealed partial class MainWindow : Window
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
         };
+        // No dim scrim: the backdrop material must read the same in and around
+        // the card. Transparent (not null) keeps the Grid hit-testable so
+        // tapping outside the card still dismisses.
         var overlay = new Grid
         {
-            Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(0x80, 0, 0, 0)),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
         };
         overlay.Children.Add(card);
         Grid.SetRowSpan(overlay, Math.Max(1, RootGrid.RowDefinitions.Count));
@@ -4501,6 +4498,7 @@ public sealed partial class MainWindow : Window
             RootGrid.Children.Remove(overlay);
             _settingsOverlay = null;
             _settingsCard = null;
+            PaneHost.Opacity = 1;
             FocusTerminal();
         }
         fontBox.ValueChanged += (_, _) => Apply();
@@ -4535,7 +4533,7 @@ public sealed partial class MainWindow : Window
         whitelistBox.LostFocus += (_, _) => Apply();
 
         closeBtn.Click += (_, _) => Close();
-        // Click on the dim scrim (not the card) closes.
+        // Click outside the card closes.
         overlay.Tapped += (_, args) =>
         {
             if (args.OriginalSource == overlay)
@@ -4555,6 +4553,11 @@ public sealed partial class MainWindow : Window
 
         _settingsOverlay = overlay;
         _settingsCard = card;
+        // Fade the pane content (terminals/browser) out so the translucent card
+        // sits over the raw window backdrop — the whole dialog reads as the same
+        // Mica/Acrylic material as the app chrome, with no text bleed-through.
+        // Opacity, not Visibility: keeps layout stable (no swapchain resize churn).
+        PaneHost.Opacity = 0;
         RootGrid.Children.Add(overlay);
         navSearch.Focus(FocusState.Programmatic);
     }
