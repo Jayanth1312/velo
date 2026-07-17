@@ -1920,12 +1920,11 @@ mod imp {
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
-                // ponytail: full repaint per blink tick; damage just the cursor
-                // row if this ever shows up in profiles.
+                // No force_full: alacritty re-damages the cursor row every
+                // frame (pinned by term-core's
+                // idle_frame_damage_always_contains_cursor_row), so a plain
+                // render repaints exactly the cursor row instead of the grid.
                 eng.blink_on = !eng.blink_on;
-                for p in eng.panes.iter_mut().flatten() {
-                    p.force_full = true;
-                }
                 eng.render_all();
                 LRESULT(0)
             }

@@ -1132,6 +1132,25 @@ mod tests {
     }
 
     #[test]
+    fn idle_frame_damage_always_contains_cursor_row() {
+        // The host's cursor-blink repaint relies on this: alacritty re-damages
+        // the cursor row every frame, so a blink flip only needs a plain
+        // render, never request_full_frame().
+        let mut t = term();
+        t.advance(b"hi");
+        let _ = t.frame();
+        for _ in 0..3 {
+            let f = t.frame();
+            match f.damage {
+                FrameDamage::Rows(rows) => {
+                    assert!(rows.contains(&f.cursor_row), "cursor row must stay damaged");
+                }
+                FrameDamage::Full => {}
+            }
+        }
+    }
+
+    #[test]
     fn mouse_mode_tracks_decset() {
         let mut t = term();
         assert_eq!(t.mouse_mode(), MouseMode::default(), "everything off initially");
