@@ -200,7 +200,8 @@
              (a single tint layer). No body title bar — the active tab name lives in the
              sidebar list, and window drag / double-click-maximize are handled by the
              sidebar top chrome. -->
-        <Grid x:Name="ContentRoot" Grid.Column="1" Background="Transparent">
+        <Grid x:Name="ContentRoot" Grid.Column="1" Background="Transparent"
+              SizeChanged="ContentRoot_SizeChanged">
             <Grid.RowDefinitions>
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
@@ -499,13 +500,13 @@
                         PointerReleased="TitleBarHover_PointerReleased"
                         DoubleTapped="TitleBarHover_DoubleTapped" />
 
-                <!-- Row 0: permanent details toggle (far left) + detail-section
-                     icon row shifted right of the toggle with a gap. -->
+                <!-- Row 0: detail-section icon row (left) + permanent details toggle
+                     on the RIGHT (inner edge, mirroring the tabs toggle). -->
                 <Button x:Name="DetailsToggle"
                         Grid.Row="0"
                         VerticalAlignment="Center"
-                        HorizontalAlignment="Left"
-                        Margin="8,0,0,0"
+                        HorizontalAlignment="Right"
+                        Margin="0,0,8,0"
                         Style="{StaticResource IconButtonStyle}"
                         Click="DetailsToggle_Click"
                         ToolTipService.ToolTip="Toggle details (Ctrl+Shift+B)">
@@ -527,7 +528,7 @@
                             Orientation="Horizontal"
                             VerticalAlignment="Center"
                             HorizontalAlignment="Left"
-                            Margin="44,0,0,0"
+                            Margin="8,0,0,0"
                             Spacing="2"
                             SizeChanged="TitleBar_SizeChanged">
                     <Button x:Name="InfoTabButton" Style="{StaticResource SectionButtonStyle}"
@@ -845,18 +846,15 @@
                             </Grid.ColumnDefinitions>
                             <!-- DropDownButton + MenuFlyout, not ComboBox: the ComboBox
                                  popup mispositions when the window is maximized. -->
+                            <!-- Soft filled pill so the picker reads as a control and
+                                 lines up with the cwd path below it. -->
                             <DropDownButton x:Name="AgentPick" Grid.Column="0"
                                             HorizontalAlignment="Left"
-                                            Background="Transparent" BorderThickness="0"
-                                            Content="Scanning for agents…">
-                                <DropDownButton.Resources>
-                                    <!-- No hover/pressed fill: the picker reads as plain text. -->
-                                    <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="Transparent" />
-                                    <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="Transparent" />
-                                    <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="Transparent" />
-                                    <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="Transparent" />
-                                </DropDownButton.Resources>
-                            </DropDownButton>
+                                            Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                            BorderThickness="0"
+                                            CornerRadius="6"
+                                            Padding="10,5,8,6"
+                                            Content="Scanning for agents…" />
                             <Button Grid.Column="1" Style="{StaticResource IconButtonStyle}"
                                     Content="&#xE710;" Click="AgentNew_Click"
                                     ToolTipService.ToolTip="New chat" />
@@ -1194,33 +1192,36 @@
         <Rectangle x:Name="DetailsEdge" Grid.Column="0" Grid.ColumnSpan="3"
                    Width="8" HorizontalAlignment="Left" VerticalAlignment="Stretch"
                    Fill="Transparent" Canvas.ZIndex="39"
-                   PointerEntered="DetailsEdge_PointerEntered"
-                   PointerExited="OverlayEdge_PointerExited" />
+                   PointerEntered="DetailsEdge_PointerEntered" />
         <Rectangle x:Name="TabsEdge" Grid.Column="0" Grid.ColumnSpan="3"
                    Width="8" HorizontalAlignment="Right" VerticalAlignment="Stretch"
                    Fill="Transparent" Canvas.ZIndex="39" IsHitTestVisible="False"
-                   PointerEntered="TabsEdge_PointerEntered"
-                   PointerExited="OverlayEdge_PointerExited" />
+                   PointerEntered="TabsEdge_PointerEntered" />
 
-        <!-- Floating overlay sidebars (Zen-style). A full-height transparent hit
-             region slides in from the edge; the inner Border carries the inset
-             margin, rounded corners and (opaque) tint so the panel reads as a
-             separate floating component. The live sidebar content is reparented
-             into the inner Border on reveal and back to its docked surface on
-             retract. Background/tint is set in UpdatePanelTint. -->
+        <!-- Floating overlay sidebars (Zen-style). In-tree (NOT a Popup: a windowed
+             Popup escapes the app bounds on a small window and breaks hover across the
+             HWND boundary). Structure: an edge-hugging HOST strip (the hover keep-open
+             hit region) wrapping the panel Border. The panel fills the host flush to
+             the window edge (no surrounding gap — the border wraps the whole panel);
+             only the inner corners are rounded. Leaving the host (toward the terminal)
+             retracts; the terminal beside the strip stays interactive. The live sidebar
+             content is reparented into the Border on reveal; a TranslateTransform slides
+             it in. Background matches the docked panels (surface, set in UpdatePanelTint)
+             so it frosts over the window backdrop identically. -->
         <Grid x:Name="DetailsOverlayHost" Grid.Column="0" Grid.ColumnSpan="3"
               HorizontalAlignment="Left" VerticalAlignment="Stretch"
               Visibility="Collapsed" Canvas.ZIndex="40"
               Background="Transparent"
               PointerExited="Overlay_PointerExited">
-            <Grid.RenderTransform>
-                <TranslateTransform x:Name="DetailsOverlayXform" X="-500" />
-            </Grid.RenderTransform>
             <Border x:Name="DetailsOverlayPanel"
-                    HorizontalAlignment="Left" VerticalAlignment="Stretch"
-                    Margin="8" CornerRadius="10"
+                    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                    CornerRadius="0,10,10,0"
                     BorderThickness="1"
-                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}">
+                <Border.RenderTransform>
+                    <TranslateTransform x:Name="DetailsOverlayXform" X="-500" />
+                </Border.RenderTransform>
+            </Border>
         </Grid>
 
         <Grid x:Name="TabsOverlayHost" Grid.Column="0" Grid.ColumnSpan="3"
@@ -1228,14 +1229,15 @@
               Visibility="Collapsed" Canvas.ZIndex="40"
               Background="Transparent"
               PointerExited="Overlay_PointerExited">
-            <Grid.RenderTransform>
-                <TranslateTransform x:Name="TabsOverlayXform" X="500" />
-            </Grid.RenderTransform>
             <Border x:Name="TabsOverlayPanel"
-                    HorizontalAlignment="Right" VerticalAlignment="Stretch"
-                    Margin="8" CornerRadius="10"
+                    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                    CornerRadius="10,0,0,10"
                     BorderThickness="1"
-                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}">
+                <Border.RenderTransform>
+                    <TranslateTransform x:Name="TabsOverlayXform" X="500" />
+                </Border.RenderTransform>
+            </Border>
         </Grid>
         <!-- Command palette: full-window dim overlay + centered card. Light-dismiss
              by tapping the dim area; Esc closes. Opened with Ctrl+P / Ctrl+Shift+P. -->
@@ -1243,14 +1245,14 @@
               Grid.Column="0"
               Grid.ColumnSpan="3"
               Visibility="Collapsed"
-              Background="#66000000"
+              Background="Transparent"
               Tapped="PaletteOverlay_Tapped">
             <Border x:Name="PaletteCard"
                     Width="560"
                     VerticalAlignment="Center"
                     HorizontalAlignment="Center"
                     Margin="0,-48,0,0"
-                    Padding="8"
+                    Padding="0"
                     BorderBrush="#22FFFFFF"
                     BorderThickness="1"
                     CornerRadius="14"
@@ -1259,10 +1261,12 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
-                    <!-- Search row: magnifier glyph + borderless input (otty-style). -->
-                    <Grid Grid.Row="0" Margin="2,2,2,8" ColumnSpacing="8">
+                    <!-- Search row: magnifier glyph + flat borderless input
+                         (Raycast-style); a hairline divider separates the list. -->
+                    <Grid Grid.Row="0" Margin="16,10,16,8" ColumnSpacing="10">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
@@ -1271,7 +1275,6 @@
                                   Glyph="&#xE721;"
                                   FontFamily="Segoe MDL2 Assets"
                                   FontSize="15"
-                                  Margin="6,0,0,0"
                                   VerticalAlignment="Center"
                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <TextBox x:Name="PaletteSearch"
@@ -1279,25 +1282,57 @@
                                  PlaceholderText="Search for commands…"
                                  BorderThickness="0"
                                  Background="Transparent"
+                                 Padding="0,7,0,8"
                                  FontSize="15"
                                  TextChanged="PaletteSearch_TextChanged"
-                                 KeyDown="PaletteSearch_KeyDown" />
+                                 KeyDown="PaletteSearch_KeyDown">
+                            <!-- Stays flat inside the card: the app-wide pill fill
+                                 must not appear on hover/focus here. -->
+                            <TextBox.Resources>
+                                <SolidColorBrush x:Key="TextControlBackground" Color="Transparent" />
+                                <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="Transparent" />
+                                <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="Transparent" />
+                            </TextBox.Resources>
+                        </TextBox>
                     </Grid>
 
+                    <Border Grid.Row="1"
+                            Height="1"
+                            Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
+
                     <ListView x:Name="PaletteList"
-                              Grid.Row="1"
+                              Grid.Row="2"
+                              Margin="0,6,0,8"
                               ItemsSource="{x:Bind PaletteItems}"
                               SelectionMode="Single"
                               IsItemClickEnabled="True"
                               ItemClick="PaletteList_ItemClick"
                               MaxHeight="400">
+                        <!-- Rows keep an 8px inset (scrollbar hugs the card edge);
+                             a custom presenter guarantees the rounded hover /
+                             selection fill. -->
                         <ListView.ItemContainerStyle>
                             <Style TargetType="ListViewItem">
                                 <Setter Property="MinHeight" Value="38" />
-                                <Setter Property="Margin" Value="0,1" />
-                                <Setter Property="Padding" Value="10,0" />
-                                <Setter Property="CornerRadius" Value="8" />
+                                <Setter Property="Margin" Value="8,1" />
+                                <Setter Property="Padding" Value="12,0" />
                                 <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListViewItem">
+                                            <ListViewItemPresenter CornerRadius="8"
+                                                                   ContentMargin="{TemplateBinding Padding}"
+                                                                   HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                                   VerticalContentAlignment="Center"
+                                                                   SelectionCheckMarkVisualEnabled="False"
+                                                                   PointerOverBackground="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                                                   PressedBackground="{ThemeResource SubtleFillColorTertiaryBrush}"
+                                                                   SelectedBackground="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                                                   SelectedPointerOverBackground="{ThemeResource SubtleFillColorTertiaryBrush}"
+                                                                   SelectedPressedBackground="{ThemeResource SubtleFillColorTertiaryBrush}" />
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
                             </Style>
                         </ListView.ItemContainerStyle>
                         <ListView.ItemTemplate>

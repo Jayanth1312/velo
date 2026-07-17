@@ -14,24 +14,25 @@ internal static class ShellIntegration
     private const string Begin = "# >>> velo integration >>>";
     private const string End = "# <<< velo integration <<<";
 
-    /// Inject for whichever shell `settings.Shell` names. Best-effort; failures
+    /// Inject every shell we know how to reach — tabs can launch any profile
+    /// regardless of the default shell in settings, and the blocks are fenced +
+    /// idempotent so an unused profile costs nothing. Best-effort; failures
     /// (no profile dir, locked file) are swallowed — integration just stays off.
+    /// (WSL shells are handled at spawn time by the Rust side; cmd.exe has no
+    /// pre-command hook, so it cannot emit the 133;C mark the Outline needs.)
     public static void Ensure(Settings settings)
     {
         if (!settings.ShellIntegration)
             return;
-        try
-        {
-            var shell = (settings.Shell ?? "").ToLowerInvariant();
-            if (shell.Contains("bash") || shell.Contains("wsl"))
-                InjectBash();
-            else
-                InjectPowerShell(shell.Contains("pwsh"));
-        }
-        catch (Exception ex)
-        {
-            Log.Ex("ShellIntegration.Ensure", ex);
-        }
+        Try(() => InjectPowerShell(pwsh: false));
+        Try(() => InjectPowerShell(pwsh: true));
+        Try(InjectBash);
+    }
+
+    private static void Try(Action inject)
+    {
+        try { inject(); }
+        catch (Exception ex) { Log.Ex("ShellIntegration.Ensure", ex); }
     }
 
     /// Write `block` between the markers in `path`. If a velo block already exists

@@ -26,6 +26,8 @@ public sealed class Settings
     public string CursorStyle { get; set; } = "Default";
     /// Blink the terminal cursor.
     public bool CursorBlink { get; set; } = false;
+    /// Finishing a mouse selection (drag / double-click) copies it to the clipboard.
+    public bool CopyOnSelect { get; set; } = true;
     /// Active color theme name (see Themes.All). Drives the ANSI palette + the
     /// terminal/chrome background.
     public string ThemeName { get; set; } = "Velo Dark";

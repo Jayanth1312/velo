@@ -184,7 +184,16 @@ public sealed partial class MainWindow : Window
             {
                 Log.Write($"Activated: state={args.WindowActivationState}");
                 if (args.WindowActivationState != WindowActivationState.Deactivated)
+                {
                     FocusTerminal();
+                }
+                else
+                {
+                    // Focus left the app (alt-tab, other window): PointerExited
+                    // never fires, so a revealed hover sidebar stays pinned open.
+                    RetractOverlay(left: true);
+                    RetractOverlay(left: false);
+                }
             }
             catch (Exception ex)
             {
@@ -659,7 +668,8 @@ public sealed partial class MainWindow : Window
     /// one container, real push, no overlay/slide desync.
     private void SetSidebar(bool open)
     {
-        DropOverlay(false);   // if shown as an overlay, dock it from a clean state
+        if (open && _tabsOverlay) { DockFromOverlay(false); return; }
+        DropOverlay(false);   // no-op unless mid-overlay; keeps closes clean
         _sidebarOpen = open;
         AnimateWidth(ToggleBar, open ? BarOpen : BarClosed);
         // Animate the column width instead of an instant jump: a 280px one-frame jump
@@ -713,35 +723,15 @@ public sealed partial class MainWindow : Window
     // pointer-leave; clicking the in-panel toggle promotes it to docked.
     private bool _detailsOverlay, _tabsOverlay;
     private const double OverlayHidden = 500;   // off-screen slide distance (px)
-    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _revealTimer;
 
     private void DetailsEdge_PointerEntered(object sender, PointerRoutedEventArgs e)
-        => ArmReveal(left: true);
+        => RevealOverlay(left: true);
 
     private void TabsEdge_PointerEntered(object sender, PointerRoutedEventArgs e)
-        => ArmReveal(left: false);
-
-    // 150ms dwell before revealing, so a fast cursor sweep past the edge does not
-    // flash the overlay.
-    private void ArmReveal(bool left)
-    {
-        if (left ? (_detailsOpen || _detailsOverlay) : (_sidebarOpen || _tabsOverlay))
-            return;
-        _revealTimer?.Stop();
-        _revealTimer = DispatcherQueue.CreateTimer();
-        _revealTimer.Interval = TimeSpan.FromMilliseconds(150);
-        _revealTimer.IsRepeating = false;
-        _revealTimer.Tick += (_, _) => RevealOverlay(left);
-        _revealTimer.Start();
-    }
-
-    // Cursor left the edge strip before the dwell elapsed: cancel a pending reveal.
-    private void OverlayEdge_PointerExited(object sender, PointerRoutedEventArgs e)
-        => _revealTimer?.Stop();
+        => RevealOverlay(left: false);
 
     private void RevealOverlay(bool left)
     {
-        _revealTimer?.Stop();
         if (left)
         {
             if (_detailsOpen || _detailsOverlay) return;
@@ -749,9 +739,10 @@ public sealed partial class MainWindow : Window
             DetailsContent.Width = DetailsWidth;
             DetailsSurface.Child = null;
             DetailsOverlayPanel.Child = DetailsContent;
+            DetailsOverlayHost.Width = DetailsWidth;   // panel fills the host, flush to the edge
             DetailsOverlayHost.Visibility = Visibility.Visible;
             EnsureDetailsRealized();
-            AnimateTranslateX(DetailsOverlayXform, 0);
+            AnimateOverlay(left: true, 0);
         }
         else
         {
@@ -760,15 +751,100 @@ public sealed partial class MainWindow : Window
             Sidebar.Width = TabsWidth;
             SidebarSurface.Child = null;
             TabsOverlayPanel.Child = Sidebar;
+            TabsOverlayHost.Width = TabsWidth;   // panel fills the host, flush to the edge
             TabsOverlayHost.Visibility = Visibility.Visible;
-            AnimateTranslateX(TabsOverlayXform, 0);
+            AnimateOverlay(left: false, 0);
         }
+    }
+
+    // Clip the terminal body out from under a revealed overlay strip: what shows
+    // behind the floating panel is then the raw window backdrop, so the panel's
+    // translucent surface tint composites EXACTLY like the docked panels (no
+    // terminal text bleeding through, no near-opaque floor, no AcrylicBrush — an
+    // in-app backdrop brush kills the window SystemBackdrop → black app). A Clip
+    // is purely visual: the swapchain keeps its size, so no PTY reflow. The
+    // inset follows the panel's slide transform, so the clip edge tracks the
+    // panel edge during reveal/retract instead of exposing the whole bare strip
+    // up front.
+    private void UpdateTerminalClip()
+    {
+        // Overlay hosts hug the window edges; when an overlay is revealed its
+        // panel column is closed (width 0), so window-edge insets equal
+        // ContentRoot-edge insets on that side.
+        double left = _detailsOverlay
+            ? Math.Clamp(DetailsOverlayHost.Width + DetailsOverlayXform.X, 0, DetailsOverlayHost.Width)
+            : 0;
+        double right = _tabsOverlay
+            ? Math.Clamp(TabsOverlayHost.Width - TabsOverlayXform.X, 0, TabsOverlayHost.Width)
+            : 0;
+        ContentRoot.Clip = (left == 0 && right == 0)
+            ? null
+            : new RectangleGeometry
+            {
+                Rect = new Windows.Foundation.Rect(
+                    left, 0,
+                    Math.Max(0, ContentRoot.ActualWidth - left - right),
+                    ContentRoot.ActualHeight),
+            };
+    }
+
+    // Slide an overlay panel and the terminal clip together from one UI-thread
+    // tick. A Storyboard animates the transform on the render thread, where the
+    // clip can't follow — the bare backdrop strip then flashed in a beat before
+    // the panel ("empty overlay first"). Index 0 = details (left), 1 = tabs.
+    private readonly EventHandler<object>?[] _overlayTicks = new EventHandler<object>?[2];
+
+    private void CancelOverlayTick(bool left)
+    {
+        int i = left ? 0 : 1;
+        if (_overlayTicks[i] is { } h)
+        {
+            Microsoft.UI.Xaml.Media.CompositionTarget.Rendering -= h;
+            _overlayTicks[i] = null;
+        }
+    }
+
+    private void AnimateOverlay(bool left, double to, Action? completed = null)
+    {
+        CancelOverlayTick(left);
+        int i = left ? 0 : 1;
+        var xf = left ? DetailsOverlayXform : TabsOverlayXform;
+        double from = xf.X;
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        EventHandler<object> tick = null!;
+        tick = (_, _) =>
+        {
+            double t = Math.Min(1.0,
+                System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds / 200.0);
+            double k = 1 - (1 - t) * (1 - t);   // quadratic ease-out
+            xf.X = from + (to - from) * k;
+            UpdateTerminalClip();
+            if (t >= 1.0)
+            {
+                Microsoft.UI.Xaml.Media.CompositionTarget.Rendering -= tick;
+                if (_overlayTicks[i] == tick)
+                    _overlayTicks[i] = null;
+                completed?.Invoke();
+            }
+        };
+        _overlayTicks[i] = tick;
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += tick;
+    }
+
+    // Keep the clip tracking the body size (maximize/restore while an overlay
+    // is revealed — the window buttons live inside the hover sidebar).
+    private void ContentRoot_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (_detailsOverlay || _tabsOverlay)
+            UpdateTerminalClip();
     }
 
     private void Overlay_PointerExited(object sender, PointerRoutedEventArgs e)
     {
         // PointerExited bubbles up from children too; only retract when the pointer
-        // is genuinely outside the host bounds.
+        // is genuinely outside the host strip — so the overlay stays open while the
+        // cursor is anywhere inside it (panel + the edge gap) and retracts only when
+        // the cursor leaves toward the terminal.
         var host = (FrameworkElement)sender;
         var p = e.GetCurrentPoint(host).Position;
         if (p.X >= 0 && p.Y >= 0 && p.X <= host.ActualWidth && p.Y <= host.ActualHeight)
@@ -781,23 +857,25 @@ public sealed partial class MainWindow : Window
         if (left)
         {
             if (!_detailsOverlay) return;
-            AnimateTranslateX(DetailsOverlayXform, -OverlayHidden, () =>
+            AnimateOverlay(left: true, -OverlayHidden, () =>
             {
                 DetailsOverlayHost.Visibility = Visibility.Collapsed;
                 DetailsOverlayPanel.Child = null;
                 DetailsSurface.Child = DetailsContent;
                 _detailsOverlay = false;
+                UpdateTerminalClip();
             });
         }
         else
         {
             if (!_tabsOverlay) return;
-            AnimateTranslateX(TabsOverlayXform, OverlayHidden, () =>
+            AnimateOverlay(left: false, OverlayHidden, () =>
             {
                 TabsOverlayHost.Visibility = Visibility.Collapsed;
                 TabsOverlayPanel.Child = null;
                 SidebarSurface.Child = Sidebar;
                 _tabsOverlay = false;
+                UpdateTerminalClip();
             });
         }
     }
@@ -807,7 +885,7 @@ public sealed partial class MainWindow : Window
     // real column width from a consistent starting point.
     private void DropOverlay(bool left)
     {
-        _revealTimer?.Stop();
+        CancelOverlayTick(left);   // a mid-slide tick must not resurrect the overlay
         if (left && _detailsOverlay)
         {
             DetailsOverlayHost.Visibility = Visibility.Collapsed;
@@ -824,6 +902,7 @@ public sealed partial class MainWindow : Window
             SidebarSurface.Child = Sidebar;
             _tabsOverlay = false;
         }
+        UpdateTerminalClip();
     }
 
     // Docked panels own their edge; disable the closed-state hover trigger there so
@@ -834,21 +913,43 @@ public sealed partial class MainWindow : Window
         TabsEdge.IsHitTestVisible = !_sidebarOpen;
     }
 
-    private static void AnimateTranslateX(TranslateTransform t, double to, Action? completed = null)
+    // Overlay -> docked, instantly (no animation): reparent the content back to its
+    // docked surface, reset the overlay chrome, and set the column to its docked
+    // width. The layout pass fires the panel SizeChanged that reflows the terminal.
+    private void DockFromOverlay(bool left)
     {
-        var sb = new Storyboard();
-        var anim = new DoubleAnimation
+        CancelOverlayTick(left);   // a mid-slide tick must not resurrect the overlay
+        if (left)
         {
-            To = to,
-            Duration = new Duration(TimeSpan.FromMilliseconds(200)),
-            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
-        };
-        Storyboard.SetTarget(anim, t);
-        Storyboard.SetTargetProperty(anim, "X");
-        sb.Children.Add(anim);
-        if (completed is not null)
-            sb.Completed += (_, _) => completed();
-        sb.Begin();
+            DetailsOverlayPanel.Child = null;
+            DetailsSurface.Child = DetailsContent;
+            DetailsOverlayHost.Visibility = Visibility.Collapsed;
+            DetailsOverlayXform.X = -OverlayHidden;
+            _detailsOverlay = false;
+            UpdateTerminalClip();
+            _detailsOpen = true;
+            DetailsToggleBar.Width = BarOpen;
+            DetailsContent.Width = DetailsWidth;
+            DetailsSurface.Width = DetailsWidth;
+            EnsureDetailsRealized();
+            UpdateEdgeTriggers();
+            FocusTerminal();
+        }
+        else
+        {
+            TabsOverlayPanel.Child = null;
+            SidebarSurface.Child = Sidebar;
+            TabsOverlayHost.Visibility = Visibility.Collapsed;
+            TabsOverlayXform.X = OverlayHidden;
+            _tabsOverlay = false;
+            UpdateTerminalClip();
+            _sidebarOpen = true;
+            ToggleBar.Width = BarOpen;
+            Sidebar.Width = TabsWidth;
+            SidebarSurface.Width = TabsWidth;
+            UpdateEdgeTriggers();
+            FocusTerminal();
+        }
     }
 
     private void PaneToggleAccel_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
@@ -870,7 +971,8 @@ public sealed partial class MainWindow : Window
     /// Mirror of SetSidebar for the LEFT details column.
     private void SetDetails(bool open)
     {
-        DropOverlay(true);    // if shown as an overlay, dock it from a clean state
+        if (open && _detailsOverlay) { DockFromOverlay(true); return; }
+        DropOverlay(true);    // no-op unless mid-overlay; keeps closes clean
         Log.Write($"SetDetails: open={open} tab={_activeDetailsTab} realized={_detailsRealized}");
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
@@ -894,12 +996,16 @@ public sealed partial class MainWindow : Window
             SelectDetailsTab(b);
         if (!_detailsOpen && !_detailsOverlay)
             SetDetails(true);
-        // Files button doubles as the editor-mode toggle: first click opens the
-        // tree + editor surface, clicking again returns to the terminal.
+        // Files section: show the file tree in the sidebar. Only toggle the editor
+        // surface when there is something to show (editor already up, or files are
+        // open) — otherwise flipping to an empty editor just blanks the terminal.
         if (ReferenceEquals(sender, FilesTabButton))
         {
-            SetEditorMode(!_editorMode);
-            return; // SetEditorMode owns focus either way
+            if (_editorMode || EditorFiles.Count > 0)
+                SetEditorMode(!_editorMode);
+            else
+                FocusTerminal();
+            return;
         }
         // The agent panel is a chat: keyboard goes to its input box.
         if (ReferenceEquals(sender, AgentTabButton) && _detailsRealized)
@@ -943,8 +1049,7 @@ public sealed partial class MainWindow : Window
 
     /// Details column target width: user drag wins, else the Agent panel gets
     /// more room than the lists.
-    private const double AgentSidebarWidth = 420;
-    private double DetailsWidth => _detailsUserWidth ?? (_activeDetailsTab == "Agent" ? AgentSidebarWidth : SidebarWidth);
+    private double DetailsWidth => _detailsUserWidth ?? SidebarWidth;
     /// Tabs (right) column target width: user drag wins, else the default.
     private double TabsWidth => _tabsUserWidth ?? SidebarWidth;
 
@@ -1642,8 +1747,38 @@ public sealed partial class MainWindow : Window
         new PaletteItem { Label = "Details: Git", Action = () => OpenDetails("Git") },
         new PaletteItem { Label = "Details: Files", Action = () => OpenDetails("Files") },
         new PaletteItem { Label = "Theme…", KeepOpen = true, Action = ShowPaletteThemes },
+        new PaletteItem { Label = "Backdrop…", KeepOpen = true, Action = ShowPaletteBackdrops },
+        new PaletteItem { Label = "Toggle Ligatures", Checked = _settings.Ligatures, Action = () => TogglePaletteSetting(v => _settings.Ligatures = v, _settings.Ligatures) },
+        new PaletteItem { Label = "Toggle Cursor Blink", Checked = _settings.CursorBlink, Action = () => TogglePaletteSetting(v => _settings.CursorBlink = v, _settings.CursorBlink) },
+        new PaletteItem { Label = "Toggle Shell Integration", Checked = _settings.ShellIntegration, Action = () => TogglePaletteSetting(v => _settings.ShellIntegration = v, _settings.ShellIntegration) },
+        new PaletteItem { Label = "Toggle Copy on Select", Checked = _settings.CopyOnSelect, Action = () => TogglePaletteSetting(v => _settings.CopyOnSelect = v, _settings.CopyOnSelect) },
+        new PaletteItem { Label = "Toggle Session Recovery", Checked = _settings.SessionRecovery, Action = () => TogglePaletteSetting(v => _settings.SessionRecovery = v, _settings.SessionRecovery) },
+        new PaletteItem { Label = "Toggle Restore Agent Chat", Checked = _settings.RestoreAgentChat, Action = () => TogglePaletteSetting(v => _settings.RestoreAgentChat = v, _settings.RestoreAgentChat) },
         new PaletteItem { Label = "Clear Screen", Action = ClearScreen },
+        new PaletteItem { Label = "Open Settings", Action = () => Settings_Click(this, new RoutedEventArgs()) },
     });
+
+    /// Flip a boolean setting from the palette: apply + persist in one step.
+    private void TogglePaletteSetting(Action<bool> set, bool current)
+    {
+        set(!current);
+        ApplySettings();
+        _settings.Save();
+    }
+
+    /// Backdrop-picker page (navigated to from "Backdrop…"; stays open).
+    private void ShowPaletteBackdrops()
+        => SetPalettePage(new[] { "Mica", "MicaAlt", "Acrylic", "None" }.Select(s => new PaletteItem
+        {
+            Label = s,
+            Checked = _settings.Backdrop == s,
+            Action = () =>
+            {
+                _settings.Backdrop = s;
+                ApplyBackdrop();
+                _settings.Save();
+            },
+        }));
 
     /// Theme-picker page (navigated to from "Theme…"; stays open).
     private void ShowPaletteThemes()
@@ -3680,6 +3815,7 @@ public sealed partial class MainWindow : Window
         if (_engine == IntPtr.Zero)
             return;
         Native.velo_set_recovery(_engine, _settings.SessionRecovery ? (byte)1 : (byte)0);
+        Native.velo_set_copy_on_select(_engine, _settings.CopyOnSelect ? (byte)1 : (byte)0);
         Native.velo_set_font_size(_engine, (float)(_settings.FontSize * _zoom));
         // Font family: pushing rebuilds the font + every atlas, so only on change.
         if (_appliedFontFamily != _settings.FontFamily)
@@ -3767,8 +3903,16 @@ public sealed partial class MainWindow : Window
     /// UpdatePanelTint, so the terminal, title bar and both panels all composite the
     /// SAME way (one flat tint over the same raw backdrop) and read consistently —
     /// and Mica vs Mica Alt stay visually distinct.
+    private string _appliedBackdrop = "";
+
     private void ApplyBackdrop()
     {
+        // Only touch SystemBackdrop on a real change: settings-close fires
+        // Apply() unconditionally, and re-assigning a live backdrop tears the
+        // old controller down mid-composition → the window goes black.
+        if (_settings.Backdrop == _appliedBackdrop)
+            return;
+        _appliedBackdrop = _settings.Backdrop;
         SystemBackdrop = _settings.Backdrop switch
         {
             "MicaAlt" => new MicaBackdrop { Kind = Microsoft.UI.Composition.SystemBackdrops.MicaKind.BaseAlt },
@@ -3794,16 +3938,21 @@ public sealed partial class MainWindow : Window
         var fgBrush = new SolidColorBrush(
             Microsoft.UI.ColorHelper.FromArgb(0xFF, fg.R, fg.G, fg.B));
         EditorTabs.Foreground = fgBrush;
-        // Palette card: same tint as the chrome, but floored so text stays
-        // readable over the dim overlay at very low opacity settings.
-        byte pa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
-        PaletteCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(pa, r, g, b));
-        // Floating overlay panels sit over the TERMINAL (not the backdrop), so they
-        // must be near-opaque or terminal text bleeds through. Floor high.
-        byte oa = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.97) * 255);
-        var overlaySurface = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(oa, r, g, b));
-        DetailsOverlayPanel.Background = overlaySurface;
-        TabsOverlayPanel.Background = overlaySurface;
+        // Palette card: opaque, lifted a touch above the terminal bg. There is no
+        // dim scrim behind it anymore, so any translucency would let terminal
+        // text bleed through the card.
+        static byte LiftCard(byte v) => (byte)Math.Min(255, v + 14);
+        PaletteCard.Background = new SolidColorBrush(
+            Microsoft.UI.ColorHelper.FromArgb(255, LiftCard(r), LiftCard(g), LiftCard(b)));
+        // Floating overlay panels use the SAME surface tint as the docked panels.
+        // That works because UpdateTerminalClip() clips the terminal swapchain out
+        // from under a revealed overlay strip, so the panel composites over the raw
+        // window backdrop exactly like the docked chrome — identical in every
+        // theme/backdrop combination. Never use an in-app AcrylicBrush here: an
+        // active composition backdrop brush kills the window SystemBackdrop (the
+        // whole app went black whenever the hover panel was on screen).
+        DetailsOverlayPanel.Background = surface;
+        TabsOverlayPanel.Background = surface;
     }
 
     /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
@@ -3919,6 +4068,11 @@ public sealed partial class MainWindow : Window
             backdropBox.Items.Add(s);
         backdropBox.SelectedItem = _settings.Backdrop;
 
+        var themeBox = new ComboBox { Width = 190 };
+        foreach (var t in Themes.All)
+            themeBox.Items.Add(t.Name);
+        themeBox.SelectedItem = _settings.ThemeName;
+
         var bgBox = new TextBox { Width = 120, Text = _settings.BackgroundHex };
 
         var opacityBox = new Slider
@@ -3942,6 +4096,7 @@ public sealed partial class MainWindow : Window
         };
 
         var blinkBox = new ToggleSwitch { IsOn = _settings.CursorBlink };
+        var copySelBox = new ToggleSwitch { IsOn = _settings.CopyOnSelect };
 
         // Small-caps section headers + dim hint text (Otty-style pages).
         static TextBlock Section(string s) => new()
@@ -4012,8 +4167,30 @@ public sealed partial class MainWindow : Window
             return Card(sp);
         }
 
+        // Apple-search-bar dressing: magnifier glyph laid over the pill's left
+        // inset (the pill itself comes from the app-wide TextBox style).
+        static Grid SearchField(TextBox tb)
+        {
+            var g = new Grid { Margin = tb.Margin };
+            tb.Margin = new Thickness(0);
+            tb.Padding = new Thickness(32, 7, 12, 8);
+            g.Children.Add(tb);
+            g.Children.Add(new FontIcon
+            {
+                Glyph = "",
+                FontFamily = new FontFamily("Segoe MDL2 Assets"),
+                FontSize = 13,
+                Margin = new Thickness(11, 0, 0, 0),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Center,
+                Opacity = 0.6,
+                IsHitTestVisible = false,
+            });
+            return g;
+        }
+
         var fontPick = new StackPanel { Spacing = 8 };
-        fontPick.Children.Add(fontSearch);
+        fontPick.Children.Add(SearchField(fontSearch));
         fontPick.Children.Add(fontList);
 
         var appearance = new StackPanel { Spacing = 8 };
@@ -4026,6 +4203,7 @@ public sealed partial class MainWindow : Window
         appearance.Children.Add(Row("Cursor style", "Default lets the shell control it (DECSCUSR)", cursorBox));
         appearance.Children.Add(Row("Cursor blink", "", blinkBox));
         appearance.Children.Add(Section("Window"));
+        appearance.Children.Add(Row("Theme", "Terminal color scheme (also in the command palette)", themeBox));
         appearance.Children.Add(Row("Backdrop", "Material behind the window (Mica, Acrylic)", backdropBox));
         appearance.Children.Add(Row("Background tint", "Terminal background as #RRGGBB", bgBox));
         appearance.Children.Add(Row("Background opacity", "0 lets the backdrop blur through, 100 is solid", opacityBox));
@@ -4063,6 +4241,9 @@ public sealed partial class MainWindow : Window
         terminal.Children.Add(Row("Shell integration",
             "Injects OSC 7/133 markers into the shell profile for cwd and per-command tracking; applies to new tabs",
             shellIntBox));
+        terminal.Children.Add(Row("Copy on select",
+            "Selecting text with the mouse copies it to the clipboard",
+            copySelBox));
         terminal.Children.Add(Section("Session restore"));
         terminal.Children.Add(Row("Session recovery",
             "Tabs live in a background host process and reattach — with their processes still running — after closing the app",
@@ -4129,11 +4310,13 @@ public sealed partial class MainWindow : Window
             ("Ligatures", 0, ligBox),
             ("Cursor style", 0, cursorBox),
             ("Cursor blink", 0, blinkBox),
+            ("Theme", 0, themeBox),
             ("Backdrop", 0, backdropBox),
             ("Background color", 0, bgBox),
             ("Background opacity", 0, opacityBox),
             ("Shell", 1, shellBox),
             ("Shell integration", 1, shellIntBox),
+            ("Copy on select", 1, copySelBox),
             ("Session recovery", 1, recoveryBox),
             ("Restore agent chat", 1, agentChatBox),
             ("Re-run processes on restore", 1, rerunBox),
@@ -4187,7 +4370,7 @@ public sealed partial class MainWindow : Window
         FillNav();
 
         var sidebar = new StackPanel { Width = 190 };
-        sidebar.Children.Add(navSearch);
+        sidebar.Children.Add(SearchField(navSearch));
         sidebar.Children.Add(nav);
 
         var body = new Grid { ColumnSpacing = 20 };
@@ -4270,6 +4453,7 @@ public sealed partial class MainWindow : Window
                 _ => "Default",
             };
             _settings.CursorBlink = blinkBox.IsOn;
+            _settings.CopyOnSelect = copySelBox.IsOn;
             _settings.Shell = string.IsNullOrWhiteSpace(shellBox.Text) ? _settings.Shell : shellBox.Text;
             _settings.ShellIntegration = shellIntBox.IsOn;
             _settings.CustomAgentCommand = agentCmdBox.Text.Trim();
@@ -4299,7 +4483,19 @@ public sealed partial class MainWindow : Window
         ligBox.Toggled += (_, _) => Apply();
         cursorBox.SelectionChanged += (_, _) => Apply();
         blinkBox.Toggled += (_, _) => Apply();
+        copySelBox.Toggled += (_, _) => Apply();
         backdropBox.SelectionChanged += (_, _) => Apply();
+        // Theme drives the background hex too (like ApplyTheme); update bgBox so
+        // the later Apply() from Close() doesn't write the stale hex back.
+        themeBox.SelectionChanged += (_, _) =>
+        {
+            if (themeBox.SelectedItem is string tn)
+            {
+                _settings.ThemeName = tn;
+                bgBox.Text = Themes.ByName(tn).Bg;
+            }
+            Apply();
+        };
         opacityBox.ValueChanged += (_, _) => Apply();
         bgBox.LostFocus += (_, _) => Apply();
         shellBox.LostFocus += (_, _) => Apply();
