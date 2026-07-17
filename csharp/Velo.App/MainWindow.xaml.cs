@@ -670,6 +670,14 @@ public sealed partial class MainWindow : Window
     {
         if (open && _tabsOverlay) { DockFromOverlay(false); return; }
         DropOverlay(false);   // no-op unless mid-overlay; keeps closes clean
+        // Also dismiss the OPPOSITE hover overlay (details/left) if it's showing: while
+        // it's open, ContentRoot_SizeChanged recomputes its clip on every layout pass
+        // this column's width Storyboard produces, racing the DComp present and
+        // flickering the terminal↔sidebar seam. A toggle click is a mode switch —
+        // keeping an unrelated hover overlay alive through it has no UX value, so drop
+        // it instantly (no slide-out) rather than animate: an animated retract would
+        // still race the clip for most of the width animation's duration.
+        DropOverlay(true);
         _sidebarOpen = open;
         AnimateWidth(ToggleBar, open ? BarOpen : BarClosed);
         // Animate the column width instead of an instant jump: a 280px one-frame jump
@@ -973,6 +981,7 @@ public sealed partial class MainWindow : Window
     {
         if (open && _detailsOverlay) { DockFromOverlay(true); return; }
         DropOverlay(true);    // no-op unless mid-overlay; keeps closes clean
+        DropOverlay(false);   // dismiss the opposite hover overlay too — see SetSidebar
         Log.Write($"SetDetails: open={open} tab={_activeDetailsTab} realized={_detailsRealized}");
         _detailsOpen = open;
         AnimateWidth(DetailsToggleBar, open ? BarOpen : BarClosed);
