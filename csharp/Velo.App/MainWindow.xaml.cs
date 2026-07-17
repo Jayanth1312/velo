@@ -1903,7 +1903,6 @@ public sealed partial class MainWindow : Window
     /// click closes. Selectable text stands in for a copy button.
     private void ShowToolResult(string title, string text)
     {
-        var (r, g, b) = _settings.BackgroundRgb();
         var body = new TextBox
         {
             Text = text,
@@ -1951,9 +1950,7 @@ public sealed partial class MainWindow : Window
         var card = new Border
         {
             Child = inner,
-            // Same raised-surface treatment as the settings card: panel tint +30%.
-            Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(
-                (byte)Math.Round(Math.Min(1.0, _settings.BackgroundOpacity + 0.30) * 255), r, g, b)),
+            Background = CardBrush(),   // same raised surface as palette/settings
             BorderBrush = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 70, 70, 70)),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(12),
@@ -4093,18 +4090,20 @@ public sealed partial class MainWindow : Window
         PushPalette(Themes.ByName(_settings.ThemeName));
         var (r, g, b) = _settings.BackgroundRgb();
         Native.velo_set_bg(_engine, r, g, b);
-        Native.velo_set_bg_alpha(_engine, (float)_settings.BackgroundOpacity);
+        // Backdrop mode: terminal bg fully transparent (the material shows
+        // through, theme only colors the text). Theme mode: fully opaque.
+        Native.velo_set_bg_alpha(_engine, BackdropMode ? 0f : 1f);
 
-        // With an OPAQUE terminal bg, the whole XAML root gets the same solid
-        // color: any hole the swapchain / panels don't cover (sidebar-animation
-        // seam, freshly exposed area on maximize) reads as terminal instead of
-        // the default #2C2C2C window fill. RootGrid, not ContentRoot: the seam
-        // can land on grid areas outside the center column. A translucent
-        // terminal keeps it null — an opaque brush under the swapchain would
-        // kill the backdrop blur-through (see the XAML note on ContentRoot).
-        RootGrid.Background = _settings.BackgroundOpacity >= 0.999
-            ? new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, r, g, b))
-            : null;
+        // With an OPAQUE terminal bg (theme mode), the whole XAML root gets the
+        // same solid color: any hole the swapchain / panels don't cover
+        // (sidebar-animation seam, freshly exposed area on maximize) reads as
+        // terminal instead of the default #2C2C2C window fill. RootGrid, not
+        // ContentRoot: the seam can land on grid areas outside the center
+        // column. Backdrop mode keeps it null — an opaque brush under the
+        // swapchain would kill the blur-through (see the XAML note on ContentRoot).
+        RootGrid.Background = BackdropMode
+            ? null
+            : new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, r, g, b));
 
         // Same color as the Win32 class brush: Windows uses it to pre-fill the
         // region a maximize exposes, killing the black flash before first paint.
@@ -4173,13 +4172,34 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    /// One translucent brush (bg color + opacity) drives the title bar and both
-    /// panels, so they match the terminal's tint over the backdrop.
+    /// Two appearance MODES, decided by the Backdrop setting:
+    ///  - Backdrop mode (Mica/MicaAlt/Acrylic): the material owns every surface.
+    ///    Chrome and terminal bg are fully transparent; theme colors only drive
+    ///    the text palette.
+    ///  - Theme mode (Backdrop = None): the theme owns every surface, opaque.
+    /// No half-way opacity — the two systems never mix.
+    private bool BackdropMode => _settings.Backdrop != "None";
+
+    /// Raised-surface brush for overlay cards (palette / settings / tools),
+    /// following the mode: neutral translucent dim over a backdrop (any theme,
+    /// any material), lifted opaque theme color otherwise.
+    private SolidColorBrush CardBrush()
+    {
+        if (BackdropMode)
+            return new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(0x66, 0, 0, 0));
+        var (r, g, b) = _settings.BackgroundRgb();
+        return new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255,
+            (byte)Math.Min(255, r + 14), (byte)Math.Min(255, g + 14), (byte)Math.Min(255, b + 14)));
+    }
+
+    /// One brush drives the title bar and both panels, so they match the
+    /// terminal over the backdrop (transparent) or the theme (opaque).
     private void UpdatePanelTint()
     {
         var (r, g, b) = _settings.BackgroundRgb();
-        byte a = (byte)Math.Round(_settings.BackgroundOpacity * 255);
-        var surface = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(a, r, g, b));
+        var surface = BackdropMode
+            ? new SolidColorBrush(Microsoft.UI.Colors.Transparent)
+            : new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, r, g, b));
         SidebarSurface.Background = surface;
         DetailsSurface.Background = surface;
         // Editor tab strip composites like the rest of the chrome, and its
@@ -4189,12 +4209,8 @@ public sealed partial class MainWindow : Window
         var fgBrush = new SolidColorBrush(
             Microsoft.UI.ColorHelper.FromArgb(0xFF, fg.R, fg.G, fg.B));
         EditorTabs.Foreground = fgBrush;
-        // Palette card: opaque, lifted a touch above the terminal bg. There is no
-        // dim scrim behind it anymore, so any translucency would let terminal
-        // text bleed through the card.
-        static byte LiftCard(byte v) => (byte)Math.Min(255, v + 14);
-        PaletteCard.Background = new SolidColorBrush(
-            Microsoft.UI.ColorHelper.FromArgb(255, LiftCard(r), LiftCard(g), LiftCard(b)));
+        // Cards follow the mode too (palette + settings + tool results).
+        PaletteCard.Background = CardBrush();
         // Floating overlay panels use the SAME surface tint as the docked panels.
         // That works because UpdateTerminalClip() clips the terminal swapchain out
         // from under a revealed overlay strip, so the panel composites over the raw
@@ -4204,12 +4220,8 @@ public sealed partial class MainWindow : Window
         // whole app went black whenever the hover panel was on screen).
         DetailsOverlayPanel.Background = surface;
         TabsOverlayPanel.Background = surface;
-        // Settings card: same backdrop tint as the panels, +30% opacity so the
-        // dialog reads as a raised surface (and the terminal behind stays
-        // visible around it — panes are NOT hidden while Settings is open).
         if (_settingsCard != null)
-            _settingsCard.Background = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(
-                (byte)Math.Round(Math.Min(1.0, _settings.BackgroundOpacity + 0.30) * 255), r, g, b));
+            _settingsCard.Background = CardBrush();
     }
 
     /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
@@ -4335,15 +4347,6 @@ public sealed partial class MainWindow : Window
 
         var bgBox = new TextBox { Width = 120, Text = _settings.BackgroundHex };
 
-        var opacityBox = new Slider
-        {
-            Minimum = 0,
-            Maximum = 100,
-            Width = 200,
-            Value = _settings.BackgroundOpacity * 100,
-            StepFrequency = 5,
-        };
-
         var cursorBox = new ComboBox { Width = 190 };
         foreach (var s in new[] { "Default (shell-controlled)", "Block", "Bar", "Underline" })
             cursorBox.Items.Add(s);
@@ -4463,10 +4466,20 @@ public sealed partial class MainWindow : Window
         appearance.Children.Add(Row("Cursor style", "Default lets the shell control it (DECSCUSR)", cursorBox));
         appearance.Children.Add(Row("Cursor blink", "", blinkBox));
         appearance.Children.Add(Section("Window"));
+        appearance.Children.Add(Row("Backdrop",
+            "Mica/Acrylic own every surface; None hands the window to the theme",
+            backdropBox));
         appearance.Children.Add(Row("Theme", "Terminal color scheme (also in the command palette)", themeBox));
-        appearance.Children.Add(Row("Backdrop", "Material behind the window (Mica, Acrylic)", backdropBox));
         appearance.Children.Add(Row("Background tint", "Terminal background as #RRGGBB", bgBox));
-        appearance.Children.Add(Row("Background opacity", "0 lets the backdrop blur through, 100 is solid", opacityBox));
+        // Backdrop mode ⇒ the material owns the surfaces: theme bg/tint don't
+        // apply (text palette still follows the theme), so grey the rows out.
+        void SyncWindowRows()
+        {
+            bool themed = (backdropBox.SelectedItem as string ?? _settings.Backdrop) == "None";
+            themeBox.IsEnabled = themed;
+            bgBox.IsEnabled = themed;
+        }
+        SyncWindowRows();
 
         // ---- Terminal page ----------------------------------------------
         var shellBox = new ComboBox
@@ -4570,10 +4583,9 @@ public sealed partial class MainWindow : Window
             ("Ligatures", 0, ligBox),
             ("Cursor style", 0, cursorBox),
             ("Cursor blink", 0, blinkBox),
-            ("Theme", 0, themeBox),
             ("Backdrop", 0, backdropBox),
+            ("Theme", 0, themeBox),
             ("Background color", 0, bgBox),
-            ("Background opacity", 0, opacityBox),
             ("Shell", 1, shellBox),
             ("Shell integration", 1, shellIntBox),
             ("Copy on select", 1, copySelBox),
@@ -4679,16 +4691,12 @@ public sealed partial class MainWindow : Window
         cardInner.Children.Add(header);
         cardInner.Children.Add(body);
 
-        // Card bg: same backdrop tint as the docked panels but +30% opacity, so
-        // the dialog reads as a raised surface over the (still visible)
-        // terminal. Set once for the initial paint; UpdatePanelTint re-tints live.
-        var (br, bgr, bbl) = _settings.BackgroundRgb();
-        byte cardA0 = (byte)Math.Round(Math.Min(1.0, _settings.BackgroundOpacity + 0.30) * 255);
+        // Card bg follows the appearance mode (see CardBrush). Set once for the
+        // initial paint; UpdatePanelTint re-tints live via _settingsCard.
         var card = new Border
         {
             Child = cardInner,
-            Background = new SolidColorBrush(
-                Microsoft.UI.ColorHelper.FromArgb(cardA0, br, bgr, bbl)),
+            Background = CardBrush(),
             BorderBrush = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 70, 70, 70)),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(12),
@@ -4737,7 +4745,6 @@ public sealed partial class MainWindow : Window
             _settings.RerunOnRestore = rerunBox.SelectedItem as string ?? _settings.RerunOnRestore;
             _settings.RerunWhitelist = whitelistBox.Text.Trim();
             _settings.BackgroundHex = bgBox.Text;
-            _settings.BackgroundOpacity = opacityBox.Value / 100.0;
             _settings.Backdrop = backdropBox.SelectedItem as string ?? _settings.Backdrop;
             ApplyBackdrop();
             ApplySettings();
@@ -4759,7 +4766,7 @@ public sealed partial class MainWindow : Window
         cursorBox.SelectionChanged += (_, _) => Apply();
         blinkBox.Toggled += (_, _) => Apply();
         copySelBox.Toggled += (_, _) => Apply();
-        backdropBox.SelectionChanged += (_, _) => Apply();
+        backdropBox.SelectionChanged += (_, _) => { SyncWindowRows(); Apply(); };
         // Theme drives the background hex too (like ApplyTheme); update bgBox so
         // the later Apply() from Close() doesn't write the stale hex back.
         themeBox.SelectionChanged += (_, _) =>
@@ -4771,7 +4778,6 @@ public sealed partial class MainWindow : Window
             }
             Apply();
         };
-        opacityBox.ValueChanged += (_, _) => Apply();
         bgBox.LostFocus += (_, _) => Apply();
         shellBox.LostFocus += (_, _) => Apply();
         shellIntBox.Toggled += (_, _) => Apply();
