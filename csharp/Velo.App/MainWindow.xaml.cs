@@ -3953,6 +3953,16 @@ public sealed partial class MainWindow : Window
         // whole app went black whenever the hover panel was on screen).
         DetailsOverlayPanel.Background = surface;
         TabsOverlayPanel.Background = surface;
+        // Settings card: same translucent scheme, but with an 0.85 alpha floor
+        // (like PaletteCard's near-opaque lift) so dense settings text stays
+        // readable even at low configured opacity, while still letting the
+        // backdrop material show through instead of a flat opaque slab.
+        if (_settingsCard != null)
+        {
+            byte cardA = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
+            _settingsCard.Background = new SolidColorBrush(
+                Microsoft.UI.ColorHelper.FromArgb(cardA, LiftCard(r), LiftCard(g), LiftCard(b)));
+        }
     }
 
     /// Chrome font. Panels (Grid) have no FontFamily and WinUI has no WPF-style
@@ -4009,6 +4019,9 @@ public sealed partial class MainWindow : Window
     /// ContentDialog: needs an X button, Esc/Enter dismissal, and
     /// click-outside-to-close, none of which ContentDialog gives us.
     private Grid? _settingsOverlay;
+    // Settings card surface, tinted live by UpdatePanelTint while the dialog
+    // is open; null when closed so UpdatePanelTint skips it.
+    private Border? _settingsCard;
 
     private void Settings_Click(object sender, RoutedEventArgs e)
     {
@@ -4409,15 +4422,19 @@ public sealed partial class MainWindow : Window
         cardInner.Children.Add(header);
         cardInner.Children.Add(body);
 
-        // Card bg: theme background lifted a touch so it separates from the
-        // terminal behind the dim scrim.
+        // Card bg: same translucent-tint scheme as UpdatePanelTint (theme bg
+        // lifted a touch, 0.85 alpha floor) so the window backdrop shows
+        // through like the docked panels, instead of an opaque slab. Set once
+        // here for the initial paint; UpdatePanelTint re-tints it live via
+        // _settingsCard once registered below.
         var (br, bgr, bbl) = _settings.BackgroundRgb();
         static byte Lift(byte v) => (byte)Math.Min(255, v + 14);
+        byte cardA0 = (byte)Math.Round(Math.Max(_settings.BackgroundOpacity, 0.85) * 255);
         var card = new Border
         {
             Child = cardInner,
             Background = new SolidColorBrush(
-                Microsoft.UI.ColorHelper.FromArgb(255, Lift(br), Lift(bgr), Lift(bbl))),
+                Microsoft.UI.ColorHelper.FromArgb(cardA0, Lift(br), Lift(bgr), Lift(bbl))),
             BorderBrush = new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 70, 70, 70)),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(12),
@@ -4474,6 +4491,7 @@ public sealed partial class MainWindow : Window
             Apply();
             RootGrid.Children.Remove(overlay);
             _settingsOverlay = null;
+            _settingsCard = null;
             FocusTerminal();
         }
         fontBox.ValueChanged += (_, _) => Apply();
@@ -4527,6 +4545,7 @@ public sealed partial class MainWindow : Window
         }
 
         _settingsOverlay = overlay;
+        _settingsCard = card;
         RootGrid.Children.Add(overlay);
         navSearch.Focus(FocusState.Programmatic);
     }
