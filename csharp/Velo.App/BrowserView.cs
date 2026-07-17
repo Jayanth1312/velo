@@ -62,7 +62,8 @@ public sealed class BrowserView : Grid, IDisposable
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "velo", "WebView2");
             var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment
-                .CreateAsync(null, udf);
+                .CreateWithOptionsAsync(null, udf,
+                    new Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions());
             await _web.EnsureCoreWebView2Async(env);
         }
         catch (Exception ex)

@@ -4580,7 +4580,7 @@ public sealed partial class MainWindow : Window
         // Click outside the card closes.
         overlay.Tapped += (_, args) =>
         {
-            if (args.OriginalSource == overlay)
+            if (ReferenceEquals(args.OriginalSource, overlay))
                 Close();
         };
         // Esc/Enter close from anywhere inside the card.
