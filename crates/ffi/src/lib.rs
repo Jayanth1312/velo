@@ -636,8 +636,8 @@ mod imp {
         /// Draw the session bound to pane `idx` into that pane's swapchain and
         /// present it. No-op for an empty/unsized pane.
         fn render_pane(&mut self, idx: usize) {
-            let (kind, sid, dims) = match self.panes.get(idx) {
-                Some(Some(p)) => (p.kind, p.session, (p.cols, p.rows)),
+            let (kind, sid, dims, force_full) = match self.panes.get(idx) {
+                Some(Some(p)) => (p.kind, p.session, (p.cols, p.rows), p.force_full),
                 _ => return,
             };
             // Snapshot the frame first (ends the session/workspace borrow before
@@ -663,7 +663,14 @@ mod imp {
                         return;
                     }
                     match self.sessions.get_mut(sid).and_then(|o| o.as_deref_mut()) {
-                        Some(s) => s.terminal.frame(),
+                        Some(s) => {
+                            // Host-side invalidation: frame() must resolve every
+                            // row's cells, not just damaged rows.
+                            if force_full {
+                                s.terminal.request_full_frame();
+                            }
+                            s.terminal.frame()
+                        }
                         None => {
                             dbglog(&format!("render_pane: pane {idx} sid={sid} gone"));
                             return;

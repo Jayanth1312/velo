@@ -947,19 +947,10 @@ impl Renderer {
         let mut dirty: Vec<u16> = if full {
             (0..self.grid_rows).collect()
         } else if let FrameDamage::Rows(rows) = &frame.damage {
-            // ponytail: dilate damage by ±1 row. A tall glyph (emoji, some icons)
-            // rasterizes past its cell and bleeds into the neighbor row; redrawing
-            // only the changed row leaves that overflow behind (the backspace
-            // "ghost"). Repaint the touching rows too. Upgrade to true per-glyph
-            // bounds tracking if this overdraw ever shows up in profiles.
-            let mut r: Vec<u16> = rows
-                .iter()
-                .flat_map(|&row| [row.saturating_sub(1), row, row + 1])
-                .filter(|&r| r < self.grid_rows)
-                .collect();
-            r.sort_unstable();
-            r.dedup();
-            r
+            // Damage arrives already ±1-dilated (tall-glyph bleed) and sorted
+            // from term_core::Terminal::frame — the single source of dilation;
+            // Frame.cells only carries these rows' cells.
+            rows.iter().copied().filter(|&r| r < self.grid_rows).collect()
         } else {
             Vec::new()
         };

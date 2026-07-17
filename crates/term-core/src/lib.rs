@@ -221,6 +221,12 @@ pub struct Terminal {
     osc: OscTee,
     pending_shell: Vec<ShellEvent>,
     cmd_start: Option<std::time::Instant>,
+    /// Cell count of the last frame, to pre-size the next frame's Vec.
+    last_cells: usize,
+    /// Resolve the next frame with full damage + every row's cells (host-side
+    /// repaint: theme change, pane rebind, blink flip). Set via
+    /// [`Terminal::request_full_frame`], consumed by [`Terminal::frame`].
+    force_full: bool,
 }
 
 impl Terminal {
@@ -253,7 +259,17 @@ impl Terminal {
             osc: OscTee::default(),
             pending_shell: Vec::new(),
             cmd_start: None,
+            last_cells: 0,
+            force_full: false,
         }
+    }
+
+    /// Make the next [`Terminal::frame`] resolve with `FrameDamage::Full` and
+    /// cells for every row. Hosts call this when *they* invalidated the target
+    /// (theme change, pane rebind, cursor blink) — the grid itself has no
+    /// damage, but the renderer needs every row's cells to rebuild.
+    pub fn request_full_frame(&mut self) {
+        self.force_full = true;
     }
 
     /// Latest OSC window title (None = shell reset to default).
@@ -457,6 +473,11 @@ impl Terminal {
         let selection = content.selection;
         let display_offset = content.display_offset;
 
+        // Host-side invalidation (theme/bind/blink): everything repaints.
+        if self.force_full {
+            self.force_full = false;
+            base_damage = FrameDamage::Full;
+        }
         // Selection isn't part of damage; a change repaints everything.
         if selection != self.last_selection {
             base_damage = FrameDamage::Full;
@@ -467,7 +488,32 @@ impl Terminal {
             base_damage = FrameDamage::Full;
         }
 
-        let mut cells = Vec::new();
+        // Damage rows dilated by ±1: a tall glyph (emoji, some icons) rasterizes
+        // past its cell into the neighbor row, so the renderer repaints touching
+        // rows too — they need cells here. This is the single source of dilation
+        // (the renderer consumes the row set as-is). `None` = full damage.
+        let dirty_mask: Option<Vec<bool>> = match &base_damage {
+            FrameDamage::Full => None,
+            FrameDamage::Rows(damaged) => {
+                let mut mask = vec![false; rows as usize];
+                for &r in damaged {
+                    for rr in r.saturating_sub(1)..=(r + 1).min(rows.saturating_sub(1)) {
+                        mask[rr as usize] = true;
+                    }
+                }
+                Some(mask)
+            }
+        };
+        if let Some(mask) = &dirty_mask {
+            base_damage = FrameDamage::Rows(
+                mask.iter()
+                    .enumerate()
+                    .filter_map(|(i, &d)| d.then_some(i as u16))
+                    .collect(),
+            );
+        }
+
+        let mut cells = Vec::with_capacity(self.last_cells);
         for indexed in content.display_iter {
             // Grid lines are relative to the live screen bottom (0 = bottom-most
             // live row, negative = scrollback); shift by the display offset to
@@ -478,6 +524,12 @@ impl Terminal {
                 continue;
             }
             let row = line as u16;
+            // Undamaged rows keep their GPU bytes; skip materializing them.
+            if let Some(mask) = &dirty_mask {
+                if !mask[row as usize] {
+                    continue;
+                }
+            }
             let col = indexed.point.column.0 as u16;
             let cell = indexed.cell;
             let flags = cell.flags;
@@ -587,6 +639,7 @@ impl Terminal {
         self.last_display_offset = display_offset;
         self.last_history = history;
         self.last_alt = alt;
+        self.last_cells = cells.len().max(self.last_cells / 2);
         Frame {
             cols,
             rows,
@@ -662,7 +715,8 @@ impl Terminal {
 pub enum FrameDamage {
     /// Repaint every row.
     Full,
-    /// Only these viewport rows changed.
+    /// Only these viewport rows changed (already dilated ±1 for tall-glyph
+    /// bleed; sorted ascending, deduped).
     Rows(Vec<u16>),
 }
 
@@ -670,7 +724,9 @@ pub enum FrameDamage {
 pub struct Frame {
     pub cols: u16,
     pub rows: u16,
-    /// Only cells that draw something (glyph, non-default bg, or selection).
+    /// Only cells that draw something (glyph, non-default bg, or selection),
+    /// and only for rows in `damage` (all rows when damage is `Full`) — the
+    /// renderer keeps undamaged rows' GPU bytes, so their cells are never read.
     pub cells: Vec<RenderCell>,
     pub cursor_col: u16,
     pub cursor_row: u16,
@@ -1065,10 +1121,11 @@ mod tests {
         t.advance(b"hi");
         let _ = t.frame(); // first frame is fully damaged
         // No new input -> next frame is incremental (alacritty always re-damages
-        // the cursor row for blink, so expect at most one dirty row, never Full).
+        // the cursor row for blink; damage is ±1-dilated, so expect at most the
+        // cursor row and its neighbors, never Full).
         match t.frame().damage {
             FrameDamage::Rows(rows) => {
-                assert!(rows.len() <= 1, "idle => only the cursor row, got {rows:?}");
+                assert!(rows.len() <= 3, "idle => cursor row ±1 only, got {rows:?}");
             }
             FrameDamage::Full => panic!("idle frame must not be fully damaged"),
         }
