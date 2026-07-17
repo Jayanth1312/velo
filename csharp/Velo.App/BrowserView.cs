@@ -47,7 +47,33 @@ public sealed class BrowserView : Grid, IDisposable
         Children.Add(_web);
 
         _web.CoreWebView2Initialized += OnCoreInitialized;
-        _web.Source = new Uri(string.IsNullOrWhiteSpace(initialUrl) ? Home : initialUrl);
+        InitWeb(string.IsNullOrWhiteSpace(initialUrl) ? Home : initialUrl!);
+    }
+
+    /// Init the core with an explicit persistent user-data folder before the
+    /// first navigation. The implicit default lands next to the exe — unwritable
+    /// installs fail init silently and cookies/logins reset between sessions,
+    /// which read as "browser tabs come back reset" on restore.
+    private async void InitWeb(string url)
+    {
+        try
+        {
+            var udf = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "velo", "WebView2");
+            var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment
+                .CreateAsync(null, udf);
+            await _web.EnsureCoreWebView2Async(env);
+        }
+        catch (Exception ex)
+        {
+            Log.Ex("BrowserView.InitWeb", ex);
+            // Fall back to the default environment rather than a dead pane.
+            try { await _web.EnsureCoreWebView2Async(); }
+            catch (Exception ex2) { Log.Ex("BrowserView.InitWeb(default)", ex2); return; }
+        }
+        if (_disposed) return;
+        _web.Source = new Uri(url);
     }
 
     /// Move keyboard focus into the page.
@@ -81,6 +107,20 @@ public sealed class BrowserView : Grid, IDisposable
         {
             if (e.Key == VirtualKey.Enter) { Navigate(_url.Text); e.Handled = true; }
         };
+        // Click/tab into the URL bar selects the whole address (browser UX).
+        // The TextBox places its caret on pointer-release AFTER GotFocus, so
+        // re-select on the first release; later clicks place the caret normally.
+        // ponytail: a click-DRAG on that first click also ends select-all —
+        // per-press drag detection if that ever bothers anyone.
+        bool selectAllOnRelease = false;
+        _url.GotFocus += (_, _) => { _url.SelectAll(); selectAllOnRelease = true; };
+        _url.LostFocus += (_, _) => selectAllOnRelease = false;
+        _url.AddHandler(PointerReleasedEvent, new PointerEventHandler((_, _) =>
+        {
+            if (!selectAllOnRelease) return;
+            selectAllOnRelease = false;
+            _url.SelectAll();
+        }), true);
         SetColumn(_url, 1);
         bar.Children.Add(_url);
 
@@ -150,13 +190,22 @@ public sealed class BrowserView : Grid, IDisposable
     {
         var core = _web.CoreWebView2;
         if (core is null) return;
-        core.SourceChanged += (_, _) => { _url.Text = core.Source; _tab.BrowserUrl = core.Source; RefreshNav(); };
+        core.SourceChanged += (_, _) => { _url.Text = core.Source; TrackUrl(core.Source); RefreshNav(); };
         core.HistoryChanged += (_, _) => RefreshNav();
         core.DocumentTitleChanged += (_, _) =>
             _tab.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? "New Tab" : core.DocumentTitle;
         _url.Text = core.Source;
-        _tab.BrowserUrl = core.Source;
+        TrackUrl(core.Source);
         RefreshNav();
+    }
+
+    /// Session-persisted URL. Only real pages: the core reports about:blank
+    /// during init and failed navigations, and writing that through clobbered
+    /// the restored URL — the tab then "reset" on the next launch.
+    private void TrackUrl(string s)
+    {
+        if (s.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            _tab.BrowserUrl = s;
     }
 
     private void RefreshNav()

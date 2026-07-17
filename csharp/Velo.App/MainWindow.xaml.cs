@@ -1901,6 +1901,27 @@ public sealed partial class MainWindow : Window
     private static bool IsDown(VirtualKey key)
         => InputKeyboardSource.GetKeyStateForCurrentThread(key).HasFlag(CoreVirtualKeyStates.Down);
 
+    /// True when keyboard focus sits in a control that owns its own typing —
+    /// any editable text control (browser URL bar, settings search, rename box,
+    /// palette) or anywhere inside a browser pane (WebView2 page input). While
+    /// true, NOTHING may forward keys to the terminal. This must gate the
+    /// PaneHost-level handlers too: BrowserView is a CHILD of PaneHost, and
+    /// those handlers register with handledEventsToo:true, so URL-bar keys
+    /// bubble into them even though the TextBox already handled the event —
+    /// typed URLs were landing in the shell's command history.
+    private bool FocusOwnsTyping()
+    {
+        var xr = Content?.XamlRoot;
+        if (xr is null) return false;
+        if (FocusManager.GetFocusedElement(xr) is not DependencyObject focused)
+            return false;
+        return Ancestor<TextBox>(focused) is not null
+            || Ancestor<RichEditBox>(focused) is not null
+            || Ancestor<PasswordBox>(focused) is not null
+            || Ancestor<AutoSuggestBox>(focused) is not null
+            || Ancestor<BrowserView>(focused) is not null;
+    }
+
     /// True when keyboard focus is NOT on the terminal and NOT in a text box — i.e.
     /// it drifted somewhere that would otherwise swallow input (the dead-terminal bug).
     private bool ShouldRouteKeysToTerminal()
@@ -1915,7 +1936,7 @@ public sealed partial class MainWindow : Window
         var focused = FocusManager.GetFocusedElement(xr) as DependencyObject;
         if (focused is null) return true;                    // nobody owns focus → terminal
         if (IsWithin(focused, PaneHost)) return false;       // terminal handler already runs
-        if (Ancestor<TextBox>(focused) is not null) return false; // a text box owns its keys
+        if (FocusOwnsTyping()) return false;                 // an editable control owns its keys
         return true;
     }
 
@@ -1948,6 +1969,8 @@ public sealed partial class MainWindow : Window
     private void Panel_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)
+            return;
+        if (FocusOwnsTyping())   // URL bar / web page / any text box — never the shell
             return;
 
         // Route input to the focused split pane (keeps core + slot in sync).
@@ -2016,6 +2039,8 @@ public sealed partial class MainWindow : Window
     private void Panel_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs e)
     {
         if (_engine == IntPtr.Zero)
+            return;
+        if (FocusOwnsTyping())   // URL bar / web page / any text box — never the shell
             return;
         Native.velo_pane_focus(_engine, FocusedCore()); // route to the focused pane
         Native.velo_char(_engine, e.Character, Modifiers());
