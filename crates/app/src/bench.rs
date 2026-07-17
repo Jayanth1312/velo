@@ -166,11 +166,19 @@ fn parse_throughput() {
     let mut term = Terminal::new(COLS, ROWS, Arc::new(|_: &[u8]| {}));
     let start = Instant::now();
     // Feed in 4 KiB chunks like a ConPTY reader would, resolving a frame each
-    // chunk (mirrors the app draining + redrawing).
+    // chunk (mirrors the app draining + redrawing). Time the two phases
+    // separately so we know whether parsing or frame resolution dominates.
     let mut frames = 0usize;
+    let mut t_advance = std::time::Duration::ZERO;
+    let mut t_frame = std::time::Duration::ZERO;
     for chunk in buf.chunks(4096) {
+        let t0 = Instant::now();
         term.advance(chunk);
+        let t1 = Instant::now();
         let _ = term.frame();
+        let t2 = Instant::now();
+        t_advance += t1 - t0;
+        t_frame += t2 - t1;
         frames += 1;
     }
     let dt = start.elapsed();
@@ -183,6 +191,32 @@ fn parse_throughput() {
         secs * 1000.0,
         mib / secs,
         lines as f64 / secs,
+    );
+    println!(
+        "  advance: {:.0} ms ({:.1} MiB/s)   frame: {:.0} ms ({:.3} ms/frame)",
+        t_advance.as_secs_f64() * 1000.0,
+        mib / t_advance.as_secs_f64(),
+        t_frame.as_secs_f64() * 1000.0,
+        t_frame.as_secs_f64() * 1000.0 / frames as f64,
+    );
+
+    // Typing path: one printable char per frame (1-row damage). This is the
+    // keystroke-to-frame CPU cost on an otherwise idle screen.
+    let mut term = Terminal::new(COLS, ROWS, Arc::new(|_: &[u8]| {}));
+    let _ = term.frame();
+    let n = 10_000usize;
+    let start = Instant::now();
+    for i in 0..n {
+        term.advance(&[b'a' + (i % 26) as u8]);
+        if i % (COLS as usize - 2) == 0 {
+            term.advance(b"\r\n");
+        }
+        let _ = term.frame();
+    }
+    let dt = start.elapsed();
+    println!(
+        "[typing] {n} single-char frames: {:.3} ms/frame",
+        dt.as_secs_f64() * 1000.0 / n as f64
     );
 }
 
